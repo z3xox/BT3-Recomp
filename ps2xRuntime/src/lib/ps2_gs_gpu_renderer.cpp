@@ -1224,7 +1224,7 @@ namespace
         // factor ran at ~half the GS strength (measured: the mountain-shading CLUT's alpha-127
         // darkening applied at 0.498 instead of 0.992 -> "light geometry" on scenery; water
         // tints likewise). uABl128 scales the tcc=1 texture path by 255/128.
-        "  float aBlend = clamp((uABl128 > 0.5 && uTcc > 0.5) ? min(c.a * uABl128, 1.0) : c.a, 0.0, 1.0);\n"
+        "  float aBlend = clamp((uABl128 > 0.5 && uTcc > 0.5) ? min(c.a * 1.9921875, 1.0) : c.a, 0.0, 1.0);\n"
         // PS2X_ASPLIT: uAScale (128/255) must apply ONLY to the VERTEX-derived alpha. Our
         // vertex alpha encodes a GS 128 as 255, so it needs the rescale; but the CLUT decode
         // already yields the GS byte directly (measured: a character texture decodes to a
@@ -14098,35 +14098,19 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         // the As-LERP family (0x44 etc.) gets the GS-correct full factor.
                         static const int s_abm = [](){ const char *v = std::getenv("PS2X_ABLEND128"); return v && v[0] ? std::atoi(v) : 0; }();
                         float want128 = 0.0f;
-                        if (s_abm == 1) want128 = 1.9921875f;
-                        else if (s_abm == 2 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u))) want128 = 1.9921875f;
+                        if (s_abm == 1) want128 = 1.0f;
+                        else if (s_abm == 2 && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u))) want128 = 1.0f;
                         else if (s_abm == 3 && c.srcClutTbp >= 11390u && c.srcClutTbp <= 11440u && c.srcClutTbp != 11432u
                                  && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
-                            want128 = 1.9921875f;   // mountain/scenery shading family ONLY (the mount.png pale-tops classes); clouds (11432) + additives untouched
+                            want128 = 1.0f;   // mountain/scenery shading family ONLY (the mount.png pale-tops classes); clouds (11432) + additives untouched
                         else if (s_abm == 4 && c.srcClutTbp == 12992u && (c.srcPsm == 0x13u || c.srcPsm == 0x14u)
                                  && !(c.abe && (c.blendMode == 0x48u || c.blendMode == 0x68u)))
-                            want128 = 1.9921875f;   // TERRAIN family only: the 0x44 As-lerp at full GS strength = pure texture,
+                            want128 = 1.0f;   // TERRAIN family only: the 0x44 As-lerp at full GS strength = pure texture,
                                               // erasing the half-mix underlayer darkening (predicted: dome 131->148, strip 112->127 = console)
                         else if (s_abm == 5 && c.srcClutTbp != 12992u && c.srcClutTbp != 11472u && c.srcClutTbp != 11476u)
-                            want128 = 1.9921875f;   // DENYLIST scope (same-stream metrics GREF2): full GS factor everywhere EXCEPT
+                            want128 = 1.0f;   // DENYLIST scope (same-stream metrics GREF2): full GS factor everywhere EXCEPT
                                               // terrain (12992: half-mix measured CLOSER to console; full = dark blob + darker hills)
                                               // and the HUD gauge palettes (11472/11476). Sky/clouds land at G0.98 with this.
-                        {   // [mcfade] The boot memory-card prompt "clears" the previous frame
-                            // with a full-screen textured quad (CLUT 12354, MODULATE, blend
-                            // (0,1,0,1), vertex alpha ramping 36->29). Read literally that is a
-                            // ~28% lerp, which leaves every earlier height of the box border on
-                            // screen as the box collapses -- the long-standing close ghosting.
-                            // On hardware it erases COMPLETELY: a PCSX2 dump of the identical
-                            // stream (streams verified draw-for-draw identical, no clear on
-                            // either side) renders ONE clean border on black. Matched here by
-                            // saturating this one CLUT's blend factor. Scope is exactly the
-                            // prompt: fight and underwater replays are bit-identical (MAE
-                            // 0.0000). PS2X_MCFADE=0 restores the old behaviour.
-                            static const bool off = [](){ const char *v = std::getenv("PS2X_MCFADE");
-                                                          return v && v[0] == '0'; }();
-                            if (!off && c.srcTbp0 == 12288u && c.srcClutTbp == 12354u)
-                                want128 = 64.0f;   // saturates to a full erase
-                        }
                         static float cur128 = -1.0f;
                         if (g_locABl128 >= 0 && want128 != cur128)
                         { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }

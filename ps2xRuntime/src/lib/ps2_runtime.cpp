@@ -36,6 +36,58 @@ static bool wsTrigActive()
     if (now - s_last > 1.0) { s_last = now; s_on = std::filesystem::exists(s_p); }
     return s_on;
 }
+#include <fstream>   // [wsknob] lever files carry a scale
+// [wslever] rig levers that split the widescreen path in half WHILE THE GAME RUNS, so one
+// live pause can A/B both halves without a rebuild or a second drive: while the file exists,
+// PS2X_WSNOFOV neutralises the GUEST side (the projection/FOV patch: wsScale forced to 1) and
+// PS2X_WSNOHUD neutralises the RENDERER side (the HUD squeeze: g_ps2xWsHudInv forced to 1).
+// Both are inert unless the env names a path, and are polled once a second like PS2X_WSTRIG.
+static bool wsLever(const char *env, double &last, bool &on)
+{
+    const char *p = std::getenv(env);
+    if (!p || !p[0]) return false;
+    const double now = GetTime();
+    if (now - last > 1.0) { last = now; on = std::filesystem::exists(p); }
+    return on;
+}
+static bool wsNoFov()
+{
+    static double s_last = -1.0; static bool s_on = false;
+    return wsLever("PS2X_WSNOFOV", s_last, s_on);
+}
+// [wsknob] per-knob widescreen levers. PS2X_WSNOFOV disables ALL THREE pokes at once (both
+// projection floats AND the sub_00130BA8 lui), which cannot say which one displaces the
+// splitscreen pause text. These name one knob each: while the file exists its scale is
+// overridden -- by the float parsed from the file, or 1.0 (= unpatched) when it is empty --
+// so one live run can sweep a single knob without a rebuild. Returns <0 for "no override".
+static float wsKnobFile(const char *env, double &last, float &cache)
+{
+    const char *p = std::getenv(env);
+    if (!p || !p[0]) return -1.0f;
+    const double now = GetTime();
+    if (now - last > 1.0)
+    {
+        last = now; cache = -1.0f;
+        std::ifstream f(p);
+        if (f)
+        {
+            cache = 1.0f;                        // exists but empty -> unpatched
+            float v = 0.0f;
+            if ((f >> v) && v > 0.05f && v < 8.0f) cache = v;
+        }
+    }
+    return cache;
+}
+static float wsKnob1()   { static double t = -1.0; static float c = -1.0f; return wsKnobFile("PS2X_WSK1",   t, c); }
+static float wsKnob2()   { static double t = -1.0; static float c = -1.0f; return wsKnobFile("PS2X_WSK2",   t, c); }
+static float wsKnobLui() { static double t = -1.0; static float c = -1.0f; return wsKnobFile("PS2X_WSKLUI", t, c); }
+static float wsKnob3()   { static double t = -1.0; static float c = -1.0f; return wsKnobFile("PS2X_WSK3",   t, c); }
+static float wsKnob4()   { static double t = -1.0; static float c = -1.0f; return wsKnobFile("PS2X_WSK4",   t, c); }
+static bool wsNoHud()
+{
+    static double s_last = -1.0; static bool s_on = false;
+    return wsLever("PS2X_WSNOHUD", s_last, s_on);
+}
 // [truews] 0.75/scale for the patched projection lui in sub_00130BA8 (0.75 = disabled).
 float g_ps2xWsLui = 0.75f;
 // [wshud] the widescreen aspect scale itself (1.0 = off), read by the GPU renderer to
@@ -4095,6 +4147,7 @@ void PS2Runtime::run()
                 if (wsScale < 1.0f) wsScale = 1.0f;
                 if (wsScale > 2.5f) wsScale = 2.5f;
             }
+            if (wsNoFov()) wsScale = 1.0f;   // [wslever] guest half off
             if (const char *wsF = std::getenv("PS2X_WSFORCE"))
             {   // [wsforce] rig override: force the scale regardless of toggle/window aspect
                 const float f = (float)std::atof(wsF);
@@ -4104,13 +4157,85 @@ void PS2Runtime::run()
             {
                 float *wp1 = reinterpret_cast<float *>(wsRd + 0x2fe4cc);
                 float *wp2 = reinterpret_cast<float *>(wsRd + 0x2fe594);
+                float *wp3 = reinterpret_cast<float *>(wsRd + 0x2fe58c);   // 149.333 = wp2/2
+                static const uint32_t kK1Sib[] = {0x2c4384u, 0x2fc364u, 0x2fc368u,
+                                                  0x2fcd48u, 0x2fcd60u, 0x2fe59cu, 0x2fe5a0u};
                 if (s_wsOrig1 == 0.0f && *wp1 > 0.5f && *wp1 < 2.0f) s_wsOrig1 = *wp1;
                 if (s_wsOrig2 == 0.0f && *wp2 > 100.0f && *wp2 < 500.0f) s_wsOrig2 = *wp2;
-                if (s_wsOrig1 != 0.0f) *wp1 = s_wsOrig1 * wsScale;
-                if (s_wsOrig2 != 0.0f) *wp2 = s_wsOrig2 * wsScale;
+                static float s_wsOrig3 = 0.0f;
+                if (s_wsOrig3 == 0.0f && *wp3 > 50.0f && *wp3 < 250.0f) s_wsOrig3 = *wp3;
+                static float s_wsOrigSib[7] = {0,0,0,0,0,0,0};
+                {   // [wsfovlog] PS2X_WSFOVLOG=1: what the game holds in the two patched
+                    // projection floats vs what we force -- if the game rewrites them per
+                    // mode (splitscreen), our once-captured originals clobber its value.
+                    static const bool s_lg = [](){ const char *v = std::getenv("PS2X_WSFOVLOG");
+                                                   return v && v[0] && v[0] != '0'; }();
+                    static double s_t = -1.0;
+                    if (s_lg && GetTime() - s_t > 1.0)
+                    {
+                        s_t = GetTime();
+                        std::fprintf(stderr, "[wsfovlog] game=%.6f/%.3f orig=%.6f/%.3f scale=%.4f\n",
+                                     *wp1, *wp2, s_wsOrig1, s_wsOrig2, wsScale);
+                    }
+                }
+                // [wsfov2] @0x2fe594 is the CLIP/CULL extent as well as whatever places the
+                // splitscreen pause menu. Not scaling it fixes the menu but culls geometry to
+                // the old 4:3 window -- terrain at the sides pops in as the camera turns
+                // (user-observed, and my FOV check missed it: it compared a static fight-start
+                // camera, where nothing enters or leaves the frustum). So the default STAYS on
+                // the pnach behaviour and PS2X_WSFOV2=0 is the opt-out.
+                //   Threshold, swept live in a splitscreen pause: items survive up to 1.32 and
+                // are gone from 1.3333 (= 4/3, the pnach's own value) upward -- so clamping at
+                // 4/3 cannot save it either.
+                // Old note kept for the record: scaling it is what threw the SPLITSCREEN menu's
+                // items ~230 game px down, off the bottom of the frame (the box and the
+                // "1P PAUSE" title, which do not go through this path, stayed put -- so the
+                // menu read as "items missing"). Isolated with the per-knob levers in a live
+                // P1-vs-P2 pause, all eight combinations: every state with this float scaled
+                // loses the items, every state without it keeps them, independently of the
+                // other two pokes.
+                //   And it buys nothing. Two scripted runs that enter the fight with
+                // widescreen already armed (it is latched at stage load, so a mid-fight
+                // toggle measures nothing) differ by LESS than their own run-to-run noise:
+                // background MAE 1.34 across the change vs 2.98 / 2.72 within each side, and
+                // the best-fit view scale is kx=1.000 ky=1.000. The widening comes from
+                // @0x2fe4cc and the sub_00130BA8 lui, both of which stay scaled.
+                // PS2X_WSFOV2=1 restores the old both-floats behaviour.
+                // [wsfov2] @0x2fe594 drives BOTH the clip/cull extent and whatever places the
+                // splitscreen pause menu, and the two want different things:
+                //   - the clipper wants the full wsScale (1.3333 at 16:9, 1.37 on a wider
+                //     window); below that, terrain at the sides stops rendering until the
+                //     camera turns toward it (user-observed live at scale 1.0).
+                //   - the pause menu's item lines survive to 1.32 and are thrown ~230 game px
+                //     off the bottom from 1.3333 up -- exactly 4/3, the value the community
+                //     pnach itself uses, so clamping at 4/3 would not help.
+                // 1.32 is the largest value that satisfies both: user-validated live for the
+                // pop-in, rig-validated in a splitscreen pause for the menu. The margin is only
+                // ~1% under the break point and was measured in one scene at one window size,
+                // so if a mode ever loses its menu again, suspect this first.
+                // PS2X_WSFOV2=1 restores the unclamped pnach behaviour.
+                static const bool s_fov2 = [](){ const char *v = std::getenv("PS2X_WSFOV2");
+                                                 return v && v[0] && v[0] != '0'; }();
+                static const float s_k2Max = [](){ const char *v = std::getenv("PS2X_WSFOV2MAX");
+                                                   const float f = v ? (float)std::atof(v) : 1.32f;
+                                                   return (f > 0.5f && f <= 2.5f) ? f : 1.32f; }();
+                const float k1 = wsKnob1(), k2 = wsKnob2();
+                if (s_wsOrig1 != 0.0f) *wp1 = s_wsOrig1 * (k1 >= 0.0f ? k1 : wsScale);
+                const float ws2 = s_fov2 ? wsScale : std::min(wsScale, s_k2Max);
+                if (s_wsOrig2 != 0.0f) *wp2 = s_wsOrig2 * (k2 >= 0.0f ? k2 : ws2);
+                const float k3 = wsKnob3(), k4 = wsKnob4();
+                if (k3 >= 0.0f && s_wsOrig3 != 0.0f) *wp3 = s_wsOrig3 * k3;
+                if (k4 >= 0.0f)
+                    for (int si = 0; si < 7; ++si)
+                    {
+                        float *ws = reinterpret_cast<float *>(wsRd + kK1Sib[si]);
+                        if (s_wsOrigSib[si] == 0.0f && *ws > 0.5f && *ws < 2.0f) s_wsOrigSib[si] = *ws;
+                        if (s_wsOrigSib[si] != 0.0f) *ws = s_wsOrigSib[si] * k4;
+                    }
             }
             extern float g_ps2xWsLui;
-            g_ps2xWsLui = 0.75f / wsScale;
+            const float kl = wsKnobLui();
+            g_ps2xWsLui = 0.75f / (kl >= 0.0f ? kl : wsScale);
             extern float g_ps2xWsScale;
             g_ps2xWsScale = wsScale;
             static float s_wsLast = -1.0f;
@@ -4211,6 +4336,7 @@ void PS2Runtime::run()
             const float vEff = dstHeight / (float)srcHeight;
             float inv = (vEff * s_pixk2) / hEff;
             if (inv < 0.4f) inv = 0.4f; if (inv > 1.0f) inv = 1.0f;
+            if (wsNoHud()) inv = 1.0f;       // [wslever] renderer half off
             g_ps2xWsHudInv = inv;
         }
         else

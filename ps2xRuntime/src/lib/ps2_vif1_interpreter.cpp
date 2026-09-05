@@ -320,6 +320,35 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
         }
     }
 
+    {   // [wsdma] The widescreen projection floats (@0x2fe4cc / @0x2fe58c / @0x2fe594) have NO
+        // EE reader -- gp-relative and lui/addiu searches over every generated function come up
+        // empty -- so they must reach VU1 as DMA'd constant data. PS2X_WSDMA=1 reports each VIF1
+        // transfer whose SOURCE range covers them, which is the only place a per-pass fix could
+        // live: the pause menu needs the unscaled value while the clipper needs the scaled one.
+        static const bool s_wsdma = [](){ const char *v = std::getenv("PS2X_WSDMA");
+                                          return v && v[0] && v[0] != '0'; }();
+        if (s_wsdma)
+        {
+            static const uint32_t kAddrs[3] = {0x2fe4ccu, 0x2fe58cu, 0x2fe594u};
+            static unsigned long s_hits[3] = {0, 0, 0};
+            static unsigned long s_frames = 0;
+            for (int i = 0; i < 3; ++i)
+                if (srcPhys <= kAddrs[i] && kAddrs[i] < srcPhys + sizeBytes)
+                {
+                    ++s_hits[i];
+                    if (s_hits[i] <= 6 || (s_hits[i] % 600) == 0)
+                    {
+                        float v; std::memcpy(&v, m_rdram + kAddrs[i], 4);
+                        std::fprintf(stderr, "[wsdma] 0x%06x carried by VIF1 src=0x%08x size=%u "
+                                     "(+%u) value=%.4f hit#%lu\n",
+                                     kAddrs[i], srcPhys, sizeBytes, kAddrs[i] - srcPhys, v, s_hits[i]);
+                    }
+                }
+            if (++s_frames % 20000 == 0)
+                std::fprintf(stderr, "[wsdma] totals: k1=%lu half=%lu k2=%lu over %lu transfers\n",
+                             s_hits[0], s_hits[1], s_hits[2], s_frames);
+        }
+    }
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 

@@ -142,6 +142,11 @@ public:
         bool depthTest = false;     // GS TEST.ZTE != 0
         uint8_t depthFunc = 1;      // GS TEST.ZTST (default ALWAYS)
         bool depthWrite = false;    // GS ZBUF.ZMSK == 0 (z-write enabled)
+        // [zbufbp] GS ZBUF.ZBP (in PAGES) for this draw. Without it the renderer knows depth is
+        // written but not WHERE, so the Z page could never be marked rendered and a colour-format
+        // read of it could not be recognised. g_zwbBp only ever gets set by the software
+        // rasterizer, so in GPU mode it stays 0 and every check against it is inert.
+        uint32_t zbufBp = 0;
         // GS TEST alpha-test state (ATE/ATST/AREF/AFAIL). The SW rasterizer honors this;
         // the GPU replay must too — BT3's stage detail overlays, foliage cutouts and HUD
         // effects are alpha-keyed, and drawing their fail texels darkens/noises the frame.

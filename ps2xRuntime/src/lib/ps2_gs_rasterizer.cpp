@@ -4540,6 +4540,7 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         cmd.depthTest = zTestEnable;
         cmd.depthFunc = zTestFunc;
         cmd.depthWrite = zWrite;
+        cmd.zbufBp = ctx.zbuf.zbp;   // [zbufbp]
     }
     { extern bool g_recordDepthOnly; cmd.depthOnly = g_recordDepthOnly; }
 

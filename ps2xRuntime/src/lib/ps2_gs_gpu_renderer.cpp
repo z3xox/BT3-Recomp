@@ -7975,6 +7975,42 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             Fbo &f = g_fbos[curRealFbp]; // dimensions of the ACTUAL bound FBO (merged partner has no own entry)
             const bool full = (sx <= 0 && sy <= 0 && sw >= f.w && sh >= f.h);
             const int rsS = f.scale;   // [rscale] GL scissor is raw physical pixels
+            {   // [splitgap] P1-vs-P2 splitscreen scissors the viewports to x 0..254 and 257..511,
+                // so columns 255..256 are written by NEITHER. Before the split the scene is drawn
+                // full width, so those columns keep whatever was last there -- on a live run the
+                // intro close-up, which is why the divider showed Goku's orange gi. Nothing clears
+                // or writes them during the match (verified in both our stream and a PCSX2 dump:
+                // every full-width-scissor draw is a small HUD element, and geometry reaching the
+                // gap is clipped by the viewport scissors). Console inherits its clear colour
+                // there; we inherit stale pixels. Blank the gap once per frame per buffer.
+                static const bool s_sgap = [](){ const char *v = std::getenv("PS2X_SPLITGAP");
+                                                 return !(v && v[0] == '0'); }();   // default ON
+                static std::unordered_map<uint32_t, int>  s_leftEnd;   // realFbp -> right edge of the left viewport
+                static std::unordered_map<uint32_t, uint32_t> s_gapGen; // realFbp -> frame already blanked
+                if (s_sgap && (curRealFbp == 0u || curRealFbp == 112u) && sw > 0 && sh > 0)
+                {
+                    int &le = s_leftEnd[curRealFbp];
+                    uint32_t &gg = s_gapGen[curRealFbp];
+                    if (gg != frameGen) { gg = frameGen; le = -1; }   // new frame: forget last layout
+                    if (sx <= 0) le = sw;                              // left viewport ends here
+                    else if (le > 0 && sx > le)
+                    {
+                        const int gx = le, gw = sx - le;               // the untouched columns
+                        if (gw > 0 && gw <= 16)                        // a divider, not a real gap in coverage
+                        {
+                            rlDrawRenderBatchActive();
+                            rlEnableScissorTest();
+                            rlScissor(gx * rsS, 0, gw * rsS, f.h * rsS);
+                            rlClearColor(0, 0, 0, 255);
+                            rlClearScreenBuffers();
+                            static int sgn = 0;
+                            if (++sgn <= 3)
+                                std::fprintf(stderr, "[splitgap] blanked x %d..%d on fbp%u\n", gx, gx + gw - 1, curRealFbp);
+                        }
+                        le = -1;   // once per frame
+                    }
+                }
+            }
             if (!full && sw > 0 && sh > 0) { rlEnableScissorTest(); rlScissor(sx * rsS, (f.h - (sy + sh)) * rsS, sw * rsS, sh * rsS); }
             else rlDisableScissorTest();
         }

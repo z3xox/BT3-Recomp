@@ -1,4 +1,5 @@
 #include "runtime/ps2_guestprof.h"
+#include "runtime/ps2_texreplace.h"   // [texreplace]
 #include <filesystem>
 #include "runtime/ps2_memory.h"
 #include <iomanip>
@@ -1208,6 +1209,13 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
+        {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
+            // decode, so the overlay's Texture Replacement switch is correctly enabled/disabled
+            // from the moment it opens and the "[texreplace] indexed N" line appears at boot.
+            // (The textures/ folder itself ships in the repo and is staged next to the binary by
+            // CMake; the create-if-absent inside buildIndex is only a fallback for a foreign CWD.)
+            ps2tex::replacementsEnabled();
+        }
         // [barblock] manual pacing: the present thread must service guest barriers every few
         // hundred microseconds, which it cannot do while asleep inside EndDrawing's frame cap.
         // PS2X_BARPACE=0 keeps raylib's frame cap (barrier latency then <= one frame) -- A/B for

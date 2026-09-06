@@ -209,6 +209,7 @@ namespace {
     std::atomic<int> g_uiGpu{-1}, g_uiGlow{-1}, g_uiPostfx{-1}, g_uiGlowFix{-1}, g_uiBilinear{-1},
                      g_uiHalfTexel{-1}, g_uiSkipPost{-1}, g_uiSkipStaleVram{-1};
     std::atomic<int> g_uiRenderScale{-1};
+    std::atomic<int> g_uiTexPack{-1};   // [texreplace]
     bool uiFlag(std::atomic<int> &a, const char *env, bool defOn)
     {
         int v = a.load(std::memory_order_relaxed);
@@ -234,6 +235,21 @@ void GsGpuRenderer::setHalfTexel(bool v)   { g_uiHalfTexel.store(v ? 1 : 0); }
 bool GsGpuRenderer::skipPostEnabled()      { return uiFlag(g_uiSkipPost, "PS2X_SKIPPOST", false); }
 void GsGpuRenderer::setSkipPost(bool v)    { g_uiSkipPost.store(v ? 1 : 0); }
 bool GsGpuRenderer::skipStaleVramEnabled() { return uiFlag(g_uiSkipStaleVram, "PS2X_SKIP_STALE_VRAM", false); }
+bool GsGpuRenderer::texPackEnabled()       { return uiFlag(g_uiTexPack, "PS2X_TEXPACK", true); }
+void GsGpuRenderer::flushTextureCacheForTexPack()
+{   // Same two lines the [verfast] re-decode probe uses: drop every cached decode and bump the
+    // epoch so in-flight lookups miss too. Cheap and rare -- only on a user toggle.
+    std::lock_guard<std::mutex> lk(m_mtx);
+    m_texCache.clear();
+    m_texCacheEpoch.fetch_add(1u, std::memory_order_release);
+}
+void GsGpuRenderer::setTexPack(bool v)
+{   // [texreplace] flush the texture cache so every texture re-decodes through (or around) the
+    // replacement path -- without this the toggle silently does nothing to already-resident textures.
+    if (texPackEnabled() == v) return;
+    g_uiTexPack.store(v ? 1 : 0);
+    ps2GpuRenderer().flushTextureCacheForTexPack();
+}
 void GsGpuRenderer::setSkipStaleVram(bool v) { g_uiSkipStaleVram.store(v ? 1 : 0); }
 int  GsGpuRenderer::renderScale()
 {

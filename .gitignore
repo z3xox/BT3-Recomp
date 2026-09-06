@@ -31,3 +31,7 @@ games/*/work/
 # zip materialises it as a plain file and gen_overlay.py dies with FileExistsError).
 ps2xRuntime/src/runner_overlay
 ps2xRuntime/include/ps2_overlay_functions.h
+
+# Extracted game data + generated sources produced by games/bt3/setup.py. Never commit: it is the
+# user's own ripped disc content, and it is gigabytes.
+games/bt3/work

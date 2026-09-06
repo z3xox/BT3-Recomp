@@ -44,6 +44,12 @@ public:
     static int renderScale();       static void setRenderScale(int s);
     // Cel outline (ink rim + darkener) and character shadow decals, live-toggleable.
     static bool outlineEnabled();   static void setOutline(bool v);
+    // [texreplace] PCSX2-pack texture replacement, live-toggleable. setTexPack() also FLUSHES the
+    // texture cache: cached decodes are keyed by texKey and would otherwise keep serving whichever
+    // version was already resident, so a toggle would appear to do nothing until each texture
+    // happened to be evicted.
+    static bool texPackEnabled();   static void setTexPack(bool v);
+    void flushTextureCacheForTexPack();   // [texreplace] drop all cached decodes
     static bool shadowsEnabled();   static void setShadows(bool v);
     // Depth-of-field blur (the graded far-field mask stamp) + its reach (rawZ at which
     // blur weight reaches 0; larger = blur starts further away). Live-toggleable.

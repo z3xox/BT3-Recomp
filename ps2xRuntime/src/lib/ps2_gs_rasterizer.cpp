@@ -1,5 +1,6 @@
 static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode window of the texture being recorded (0 = whole)
 #include "runtime/ps2_guestprof.h"
+#include "runtime/ps2_texreplace.h"   // [texreplace]
 #include <map>
 #include <array>
 #include <set>
@@ -4189,6 +4190,31 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
         texKey = h ? h : 1ull;
         if (rawAlphaDec) texKey ^= 0x9E3779B97F4A7C15ull;   // [rawmask] raw-alpha decode variant
 
+        {   // [texreplace] PS2X_TEXNAME=1: emit the PCSX2-COMPATIBLE identity for every decoded
+            // texture, one line per unique name. Hooked HERE because this is where TEX0 and TEXA
+            // are both in scope. Validation is exact and needs no game knowledge: compare these
+            // against the 17,398 real PCSX2 dumps for this title in
+            // ~/.config/PCSX2/textures/SLUS-21678/dumps -- a match means our VRAM layout, block
+            // order and hashing all agree with PCSX2's, which is the whole prerequisite for
+            // loading its replacement packs.
+            static const bool s_tn = [](){ const char *v = std::getenv("PS2X_TEXNAME"); return v && v[0] && v[0] != '0'; }();
+            if (s_tn)
+            {
+                ps2tex::TexIdent id;
+                const bool paletted = (ctx.tex0.psm == 19 || ctx.tex0.psm == 20);
+                if (ps2tex::identify(gs->vramData(), ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
+                                     ctx.tex0.tw, ctx.tex0.th,
+                                     paletted ? gs->m_clutCache : nullptr,
+                                     gs->m_texa.ta0, gs->m_texa.aem, gs->m_texa.ta1, id))
+                {
+                    static std::unordered_set<std::string> s_seen;
+                    const std::string nm = id.name();
+                    if (s_seen.insert(nm).second)
+                        std::fprintf(stderr, "[texname] %s\n", nm.c_str());
+                }
+            }
+        }
+
         // PS2X_SKYKICK (record-side): the first SKY-panorama triangle (tbp0=10752 1024x256)
         // dumps its originating VU1 kick — entry PC, TOP, kick addr, full VU data memory and
         // microcode — for offline dissection of the collapsed sky transform.
@@ -4421,7 +4447,40 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             {   // [guestprof] DEC = inline texture decode + the upload hand-off
                 gprof::Scope gpScope(gprof::DEC);
                 decodeTexRGBA(gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
-                r.putTexture(texKey, std::move(rgba), subW, texH, texPageLo, texPageHi);
+                int upW = subW, upH = texH;
+                {   // [texreplace] Swap in a PCSX2-pack replacement if one exists for this texture.
+                    // Sampling is NORMALISED (texture(texture0, uv), not texelFetch), so a 4x
+                    // replacement needs no UV rescaling -- just hand putTexture the bigger buffer
+                    // and its real dimensions.
+                    //
+                    // Only reached on a texture-cache MISS, so the PNG decode happens once per
+                    // texture rather than per draw; no separate PNG cache is needed.
+                    // No RT guard here: a rendered page "cannot be re-decoded -- GPU mode never
+                    // writes rendered pixels to VRAM" (see srcRendered in ps2_gs_gpu_renderer.h),
+                    // so render targets never reach this decode path in the first place. If a
+                    // profile later shows RT hashing burning guest time, add the check then.
+                    if (GsGpuRenderer::texPackEnabled() && ps2tex::replacementsEnabled())
+                    {
+                        ps2tex::TexIdent id;
+                        const bool pal = (ctx.tex0.psm == 19 || ctx.tex0.psm == 20);
+                        if (ps2tex::identify(gs->vramData(), ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
+                                             ctx.tex0.tw, ctx.tex0.th, pal ? gs->m_clutCache : nullptr,
+                                             gs->m_texa.ta0, gs->m_texa.aem, gs->m_texa.ta1, id))
+                        {
+                            std::vector<uint8_t> rep; int rw = 0, rh = 0;
+                            if (ps2tex::loadReplacement(id, rep, rw, rh))
+                            {
+                                rgba = std::move(rep); upW = rw; upH = rh;
+                                static std::atomic<unsigned long> s_hits{0};
+                                const unsigned long k = s_hits.fetch_add(1) + 1ul;
+                                if (k <= 5 || (k % 100ul) == 0ul)
+                                    std::fprintf(stderr, "[texreplace] hit #%lu %s -> %dx%d\n",
+                                                 k, id.name().c_str(), rw, rh);
+                            }
+                        }
+                    }
+                }
+                r.putTexture(texKey, std::move(rgba), upW, upH, texPageLo, texPageHi);
             }
             if (s_dcs)
             {

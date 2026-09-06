@@ -1,3 +1,4 @@
+#include "runtime/ps2_texreplace.h"
 #include "ps2_settings_overlay.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 #include "runtime/ps2_audio.h"
@@ -453,6 +454,8 @@ void PS2SettingsOverlay::loadSettings()
                 }
                 else if (key == "outline")
                 { if (!envUserSet("PS2X_OUTLINE")) m_settings.outline = (val == "1" || val == "true"); }
+                else if (key == "texture_pack")
+                { if (!envUserSet("PS2X_TEXPACK")) m_settings.texPack = (val == "1" || val == "true"); }
                 else if (key == "shadows")
                 { if (!envUserSet("PS2X_SHADOWS")) m_settings.shadows = (val == "1" || val == "true"); }
                 else if (key == "dof_blur")
@@ -590,6 +593,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "skip_stale_vram=" << (m_settings.skipStaleVram ? "1" : "0") << "\n";
     file << "render_scale=" << m_settings.renderScale << "\n";
     file << "outline=" << (m_settings.outline ? "1" : "0") << "\n";
+    file << "texture_pack=" << (m_settings.texPack ? "1" : "0") << "\n";
     file << "shadows=" << (m_settings.shadows ? "1" : "0") << "\n";
     file << "dof_blur=" << (m_settings.dofBlur ? "1" : "0") << "\n";
     file << "dof_zfar=" << m_settings.dofZFar << "\n";
@@ -662,6 +666,7 @@ void PS2SettingsOverlay::syncFromRuntime()
     m_settings.skipStaleVram = GsGpuRenderer::skipStaleVramEnabled();
     m_settings.renderScale = GsGpuRenderer::renderScale();
     m_settings.outline = GsGpuRenderer::outlineEnabled();
+    m_settings.texPack = GsGpuRenderer::texPackEnabled();
     m_settings.shadows = GsGpuRenderer::shadowsEnabled();
     m_settings.dofBlur = GsGpuRenderer::dofBlurEnabled();
     m_settings.dofZFar = GsGpuRenderer::dofZFar();
@@ -688,6 +693,7 @@ void PS2SettingsOverlay::applySettings()
     // [rscale] NOT applied here -- see preloadSettings (startup-only). applySettings runs
     // on live changes too, and a live scale store would desync the pipeline.
     GsGpuRenderer::setOutline(m_settings.outline);
+    GsGpuRenderer::setTexPack(m_settings.texPack);
     GsGpuRenderer::setShadows(m_settings.shadows);
     GsGpuRenderer::setDofBlur(m_settings.dofBlur);
     GsGpuRenderer::setDofZFar(m_settings.dofZFar);
@@ -1135,6 +1141,21 @@ void PS2SettingsOverlay::drawVideoTab()
     ImGui::TextDisabled("Takes full effect after restart.");
     if (toggleSwitch("Cel Outline", &m_settings.outline))
         m_dirty = true;
+    {   // [texreplace] Only offer the switch when a pack is actually indexed -- PS2X_TEXREPLACE
+        // points at the directory, and with no pack the toggle would do nothing and read as broken.
+        const bool havePack = ps2tex::replacementsEnabled();
+        if (!havePack) ImGui::BeginDisabled();
+        if (toggleSwitch("Texture Replacement", &m_settings.texPack))
+        {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
+            GsGpuRenderer::setTexPack(m_settings.texPack);
+            m_dirty = true;
+        }
+        if (!havePack)
+        {
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
+        }
+    }
     if (m_settings.outline)
     {   // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS
         // strength (it divides Ad by 128 where GL divides by 255); 100% is the old,

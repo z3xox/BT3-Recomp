@@ -3602,6 +3602,7 @@ bool GSRasterizer::decodeIsDeferrable(uint32_t pm)
 }
 
 std::atomic<unsigned long> g_recTplHit{0}, g_recTplMiss{0}, g_recTplWhy[5];   // [rectemplate] read by ps2_runtime.cpp
+std::atomic<uint64_t> g_scissorCulled{0};   // [scissorcull] primitives dropped as fully outside SCISSOR
 
 bool GSRasterizer::recordSpriteGPU(GS *gs)
 {
@@ -3620,6 +3621,122 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
     // in y, which did not. The vertices are integral; the SHIFT LIVES IN THE OFFSET.
     const float ofxF = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
     const float ofyF = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+
+    // [primcensus] PS2X_PRIMCENSUS=1: classify EVERY primitive reaching the record path, to find
+    // classes that cost full price and draw nothing. Rationale: every guest phase is per-primitive
+    // (vu1, recbuild, gif, vif, rectex, push), so deleting a primitive removes its cost from all of
+    // them at once -- which is why the zero-area cull was the biggest single win in the project
+    // (fights 22-25 -> 28-30 fps) while per-phase micro-optimisation has been yielding ~10%.
+    // Counting ONLY here, before the cull below, so the buckets are mutually comparable.
+    // Diagnostic: no behaviour change, one predictable branch when off.
+    {
+        static const bool s_census = [](){ const char *v = std::getenv("PS2X_PRIMCENSUS"); return v && v[0] && v[0] != '0'; }();
+        if (s_census)
+        {
+            static std::atomic<uint64_t> c_tot{0}, c_spr{0}, c_degen{0}, c_tiny{0}, c_off{0}, c_a0{0}, c_notme{0};
+            // c_offlive is the bucket that actually matters: offscreen AND not already dropped by
+            // the zero-area cull below. The raw offscreen count overstates the prize, because
+            // distant geometry is both more likely to be off the scissor AND more likely to be a
+            // micro-triangle -- the two sets correlate, so they must be measured exclusively.
+            static std::atomic<uint64_t> c_offlive{0};
+            const int nv = isSprite ? 2 : 3;
+            float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
+            bool allA0 = true;
+            for (int i = 0; i < nv; ++i)
+            {
+                const GSVertex &v = gs->m_vtxQueue[i];
+                const float sx = v.x - ofxF, sy = v.y - ofyF;   // window coords: scissor's space
+                mnx = std::min(mnx, sx); mxx = std::max(mxx, sx);
+                mny = std::min(mny, sy); mxy = std::max(mxy, sy);
+                if (v.a != 0) allA0 = false;
+            }
+            c_tot.fetch_add(1, std::memory_order_relaxed);
+            long long ar = 1;   // sprites are never zero-area
+            if (isSprite) c_spr.fetch_add(1, std::memory_order_relaxed);
+            else
+            {   // same exact 12.4 integer cross product the cull below uses, so the buckets agree.
+                // area is 2x the triangle area in (1/16 px)^2, so 1 px^2 == 512.
+                const long long x0 = std::lround(gs->m_vtxQueue[0].x * 16.0f), y0 = std::lround(gs->m_vtxQueue[0].y * 16.0f);
+                const long long x1 = std::lround(gs->m_vtxQueue[1].x * 16.0f), y1 = std::lround(gs->m_vtxQueue[1].y * 16.0f);
+                const long long x2 = std::lround(gs->m_vtxQueue[2].x * 16.0f), y2 = std::lround(gs->m_vtxQueue[2].y * 16.0f);
+                ar = std::llabs((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0));
+                if (ar == 0) c_degen.fetch_add(1, std::memory_order_relaxed);
+                else if (ar < 512) c_tiny.fetch_add(1, std::memory_order_relaxed);
+            }
+            // fully outside the scissor rect -> the GS draws nothing, but we pay the whole record path
+            if (mxx < (float)ctx.scissor.x0 || mnx > (float)ctx.scissor.x1 ||
+                mxy < (float)ctx.scissor.y0 || mny > (float)ctx.scissor.y1)
+            {
+                c_off.fetch_add(1, std::memory_order_relaxed);
+                if (ar != 0) c_offlive.fetch_add(1, std::memory_order_relaxed);   // the real prize
+            }
+            if (allA0 && gs->m_prim.abe) c_a0.fetch_add(1, std::memory_order_relaxed);
+            if (!tme) c_notme.fetch_add(1, std::memory_order_relaxed);
+
+            static std::atomic<uint64_t> s_lastNs{0};
+            const uint64_t nowNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch()).count();
+            uint64_t prev = s_lastNs.load(std::memory_order_relaxed);
+            if (prev == 0) s_lastNs.compare_exchange_strong(prev, nowNs, std::memory_order_relaxed);
+            else if (nowNs - prev >= 1000000000ull &&
+                     s_lastNs.compare_exchange_strong(prev, nowNs, std::memory_order_relaxed))
+            {
+                const double dt = (double)(nowNs - prev) / 1e9;
+                const uint64_t t = c_tot.exchange(0), sp = c_spr.exchange(0), dg = c_degen.exchange(0),
+                               ti = c_tiny.exchange(0), of = c_off.exchange(0), a0 = c_a0.exchange(0),
+                               nt = c_notme.exchange(0), ol = c_offlive.exchange(0);
+                const auto pct = [t](uint64_t n) { return t ? 100.0 * (double)n / (double)t : 0.0; };
+                std::fprintf(stderr,
+                    "[primcensus] %.0f prim/s | sprite %.1f%% tri %.1f%% | degenerate %.1f%% subpixel %.1f%% "
+                    "OFFSCREEN %.1f%% (LIVE %.1f%%) alpha0 %.1f%% untextured %.1f%%\n",
+                    (double)t / dt, pct(sp), pct(t - sp), pct(dg), pct(ti), pct(of), pct(ol), pct(a0), pct(nt));
+            }
+        }
+    }
+
+    // [scissorcull] EARLY OFF-SCISSOR CULL (default ON, PS2X_SCISSORCULL=0 restores).
+    //
+    // A primitive whose bounding box lies entirely outside the scissor rect draws NOTHING on real
+    // hardware -- the GS rejects it -- but we were recording it in full: the record path resolves
+    // its texture, builds the DrawCmd, batches it and ships it to the GL thread, which hands it to
+    // the GPU, which then discards it against the same rect (recordDrawCmd copies the scissor into
+    // cmd.sx/sy/sw/sh further down). Nothing downstream rejected it first; this is the only place
+    // that does.
+    //
+    // Measured by [primcensus] over 41 in-fight seconds: 9.0% of all primitives are fully
+    // off-scissor, of which 6.6% of the total are NOT already dropped by the zero-area cull below
+    // (the two sets correlate -- distant geometry is both more likely to be off-screen and more
+    // likely to be a micro-triangle -- so the exclusive figure is the one to quote, not the 9.0%).
+    // That is ~3% of the guest thread: the cull saves recpre+rectex+recbuild+push (433 of 899
+    // ns/prim on a slow machine) but NOT vu1/gif/vif, which have already run by the time we get
+    // here. Modest, but provably pixel-identical and it stacks with everything else.
+    //
+    // Deliberately AFTER the census above so the census still sees every primitive, and BEFORE the
+    // zero-area cull so the cheaper test runs first.
+    {
+        static const bool s_scCull = [](){ const char *v = std::getenv("PS2X_SCISSORCULL");
+                                           return !(v && v[0] == '0'); }();
+        if (s_scCull)
+        {
+            const int nvS = isSprite ? 2 : 3;
+            float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
+            for (int i = 0; i < nvS; ++i)
+            {
+                const GSVertex &v = gs->m_vtxQueue[i];
+                const float sx = v.x - ofxF, sy = v.y - ofyF;   // window coords, as SCISSOR is
+                mnx = std::min(mnx, sx); mxx = std::max(mxx, sx);
+                mny = std::min(mny, sy); mxy = std::max(mxy, sy);
+            }
+            // SCISSOR is inclusive on both edges (x0..x1), hence >= / <= rather than > / <.
+            if (mxx < (float)ctx.scissor.x0 || mnx > (float)ctx.scissor.x1 ||
+                mxy < (float)ctx.scissor.y0 || mny > (float)ctx.scissor.y1)
+            {
+                extern std::atomic<uint64_t> g_scissorCulled;
+                g_scissorCulled.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+    }
 
     // EARLY ZERO-AREA CULL (default ON, PS2X_KEEPDOTS=1 keeps them): ~90% of fight
     // triangles are collapsed micro-tris whose integer coords are identical after 12.4

@@ -6515,7 +6515,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         extern std::vector<Texture2D> g_pendingUnload;
         {   // [unloadmode] PS2X_UNLOADMODE: 1 delete (default), 0 leak (never delete), 2 flush the batch + glFinish before deleting
             static const int s_um = [](){ const char *v = std::getenv("PS2X_UNLOADMODE"); return v ? std::atoi(v) : 1; }();
-            if (s_um == 2 && !g_pendingUnload.empty()) { rlDrawRenderBatchActive(); glFinish(); }
+            if (s_um == 2 && !g_pendingUnload.empty()) { rlDrawRenderBatchActive(); glFlush(); }   // [fencesync] UnloadTexture is driver-refcounted while in use; a full glFinish drain served no purpose
             if (s_um != 0) for (Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); UnloadTexture(t); }
         }
         g_pendingUnload.clear();

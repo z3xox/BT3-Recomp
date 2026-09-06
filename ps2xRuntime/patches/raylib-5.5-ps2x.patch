@@ -1,14 +1,16 @@
 diff --git a/src/config.h b/src/config.h
-index e3749c5..2d00953 100644
+index e3749c5..001274283fc939e0e1c38912f38e395cbdf57a72 100644
 --- a/src/config.h
 +++ b/src/config.h
 @@ -104,7 +104,7 @@
  #define RL_SUPPORT_MESH_GPU_SKINNING           1      // GPU skinning, comment if your GPU does not support more than 8 VBOs
  
- //#define RL_DEFAULT_BATCH_BUFFER_ELEMENTS    4096    // Default internal render batch elements limits
+-//#define RL_DEFAULT_BATCH_BUFFER_ELEMENTS    4096    // Default internal render batch elements limits
 -#define RL_DEFAULT_BATCH_BUFFERS               1      // Default number of batch buffers (multi-buffering)
+-#define RL_DEFAULT_BATCH_DRAWCALLS           256      // Default number of batch draw calls (by state changes: mode, texture)
++#define RL_DEFAULT_BATCH_BUFFER_ELEMENTS    16384    // Default internal render batch elements limits
 +#define RL_DEFAULT_BATCH_BUFFERS               4      // Default number of batch buffers (multi-buffering)
- #define RL_DEFAULT_BATCH_DRAWCALLS           256      // Default number of batch draw calls (by state changes: mode, texture)
++#define RL_DEFAULT_BATCH_DRAWCALLS           512      // Default number of batch draw calls (by state changes: mode, texture)
  #define RL_DEFAULT_BATCH_MAX_TEXTURE_UNITS     4      // Maximum number of textures units that can be activated on batch drawing (SetShaderValueTexture())
  
 diff --git a/src/rlgl.h b/src/rlgl.h

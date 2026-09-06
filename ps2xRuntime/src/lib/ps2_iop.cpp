@@ -170,6 +170,34 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                 std::cerr << "[dvci-find] path=\"" << path << "\" -> "
                           << (ok ? "lbn=" : "NOT FOUND lbn=") << lbn << " size=" << size << std::endl;
 
+            // [menuhex] log ALL DVCI lookups that involve menu-relevant files
+            {
+                static const bool s_menuHex = [](){
+                    const char *v = std::getenv("PS2X_MENUHEX");
+                    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+                }();
+                if (s_menuHex && ok)
+                {
+                    std::string lower = path;
+                    for (auto &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (lower.find("main_") != std::string::npos ||
+                        lower.find("battle_") != std::string::npos ||
+                        lower.find("pzs3us") != std::string::npos ||
+                        lower.find("pak") != std::string::npos ||
+                        lower.find("cpak") != std::string::npos ||
+                        lower.find("textpack") != std::string::npos ||
+                        lower.find("menu") != std::string::npos ||
+                        lower.find("plate") != std::string::npos ||
+                        lower.find("afs") != std::string::npos)
+                    {
+                        std::cerr << "[menuhex-dvci] RESOLVE path=\"" << path
+                                  << "\" lbn=0x" << std::hex << lbn
+                                  << " size=0x" << size
+                                  << std::dec << std::endl;
+                    }
+                }
+            }
+
             // Write the file info back into the shared send buffer.
             std::memset(sb, 0, 0x24u);
             std::memcpy(sb + 0, &lbn, 4);   // sceCdlFILE.lsn

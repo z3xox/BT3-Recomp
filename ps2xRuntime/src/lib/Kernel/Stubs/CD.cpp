@@ -99,6 +99,30 @@ namespace ps2_stubs
                 std::cerr << "[cdRead] lbn=0x" << std::hex << a0 << " sectors=0x" << a1 << " dst=0x" << a2 << std::dec << std::endl;
         }
 
+        // [menuhex] PS2X_MENUHEX=1: hex-dump first 128 bytes of every sceCdRead into guest RAM,
+        // plus ra (caller PC). No cap. Useful to trace PAK/AFS data loading.
+        {
+            static const bool s_menuHex = [](){
+                const char *v = std::getenv("PS2X_MENUHEX");
+                return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+            }();
+            if (s_menuHex)
+            {
+                const uint32_t ra = getRegU32(ctx, 31);
+                const uint32_t pc = ctx->pc;
+                const uint32_t dstOff = a2 & PS2_RAM_MASK;
+                const uint32_t readBytes = a1 * kCdSectorSize;
+                std::cerr << "[menuhex] sceCdRead pc=0x" << std::hex << pc
+                          << " ra=0x" << ra
+                          << " lbn=0x" << a0
+                          << " sec=0x" << a1
+                          << " dst=0x" << a2
+                          << " bytes=0x" << readBytes
+                          << std::dec << std::endl;
+                // We'll hex-dump AFTER the read succeeds (below tryRead).
+            }
+        }
+
         struct CdReadArgs
         {
             uint32_t lbn = 0;
@@ -293,6 +317,44 @@ namespace ps2_stubs
             }
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             noteAdxHeaderIfPresent(rdram, a2, a1);
+
+            // [menuhex] hex-dump first 128 bytes of data just read into guest RAM
+            {
+                static const bool s_menuHex = [](){
+                    const char *v = std::getenv("PS2X_MENUHEX");
+                    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+                }();
+                if (s_menuHex)
+                {
+                    const uint32_t off = selected.buf & PS2_RAM_MASK;
+                    const size_t bytes = clampReadBytes(selected.sectors, off);
+                    const size_t dumpLen = bytes < 128u ? bytes : 128u;
+                    std::cerr << "[menuhex] DATA lbn=0x" << std::hex << selected.lbn
+                              << " sec=" << selected.sectors
+                              << " dst=0x" << selected.buf
+                              << " bytes=0x" << bytes
+                              << " hex:" << std::dec << std::endl;
+                    for (size_t i = 0; i < dumpLen; i += 16)
+                    {
+                        std::cerr << "  " << std::hex << std::setw(4) << std::setfill('0') << i << ": ";
+                        std::cerr.unsetf(std::ios::hex);
+                        for (size_t j = 0; j < 16 && (i + j) < dumpLen; ++j)
+                        {
+                            std::cerr << std::hex << std::setw(2) << std::setfill('0')
+                                      << static_cast<uint32_t>(rdram[off + i + j]) << " ";
+                        }
+                        std::cerr << std::dec;
+                        std::cerr << " |";
+                        for (size_t j = 0; j < 16 && (i + j) < dumpLen; ++j)
+                        {
+                            char c = static_cast<char>(rdram[off + i + j]);
+                            std::cerr << (c >= 32 && c < 127 ? c : '.');
+                        }
+                        std::cerr << "|" << std::endl;
+                    }
+                }
+            }
+
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }
@@ -537,13 +599,42 @@ namespace ps2_stubs
         if (shouldTrace)
         {
             RUNTIME_LOG("[sceCdSearchFile] pc=0x" << std::hex << ctx->pc
-                                                  << " ra=0x" << callerRa
-                                                  << " file=0x" << fileAddr
-                                                  << " pathAddr=0x" << pathAddr
-                                                  << " path=\"" << sanitizeForLog(path) << "\""
-                                                  << std::dec << std::endl);
+                                                   << " ra=0x" << callerRa
+                                                   << " file=0x" << fileAddr
+                                                   << " pathAddr=0x" << pathAddr
+                                                   << " path=\"" << sanitizeForLog(path) << "\""
+                                                   << std::dec << std::endl);
         }
         ++traceCount;
+
+        // [menuhex] log ALL sceCdSearchFile calls for menu-relevant paths
+        {
+            static const bool s_menuHex = [](){
+                const char *v = std::getenv("PS2X_MENUHEX");
+                return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+            }();
+            if (s_menuHex && !path.empty())
+            {
+                std::string lower = normalizedPath;
+                for (auto &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lower.find("main_") != std::string::npos ||
+                    lower.find("battle_") != std::string::npos ||
+                    lower.find("pzs3us") != std::string::npos ||
+                    lower.find("pak") != std::string::npos ||
+                    lower.find("cpak") != std::string::npos ||
+                    lower.find("textpack") != std::string::npos ||
+                    lower.find("menu") != std::string::npos ||
+                    lower.find("plate") != std::string::npos ||
+                    lower.find("afs") != std::string::npos)
+                {
+                    std::cerr << "[menuhex-search] pc=0x" << std::hex << ctx->pc
+                              << " ra=0x" << callerRa
+                              << " path=\"" << path << "\""
+                              << " norm=\"" << normalizedPath << "\""
+                              << std::dec << std::endl;
+                }
+            }
+        }
 
         if (path.empty())
         {

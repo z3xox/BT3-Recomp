@@ -412,6 +412,30 @@ namespace
         g_cdFilesByKey.emplace(key, entry);
         entryOut = entry;
         g_lastCdError = 0;
+
+        // [menuhex] log ALL file registrations
+        {
+            static const bool s_menuHex = [](){
+                const char *v = std::getenv("PS2X_MENUHEX");
+                return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+            }();
+            if (s_menuHex)
+            {
+                static std::atomic<uint32_t> s_rcnt{0};
+                if (s_rcnt.fetch_add(1) < 200u)
+                {
+                    std::string lower = ps2Path;
+                    for (auto &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    std::cerr << "[menuhex-register] ps2=\"" << ps2Path
+                              << "\" host=\"" << path.filename().string()
+                              << "\" lbn=0x" << std::hex << entry.baseLbn
+                              << " size=0x" << entry.sizeBytes
+                              << " sec=" << entry.sectors
+                              << std::dec << std::endl;
+                }
+            }
+        }
+
         return true;
     }
 
@@ -458,6 +482,31 @@ namespace
                 continue;
             }
 
+            // [menuhex] log which host file a sector read came from
+            {
+                static const bool s_menuHex = [](){
+                    const char *v = std::getenv("PS2X_MENUHEX");
+                    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+                }();
+                if (s_menuHex)
+                {
+                    const std::string &path = entry.hostPath.filename().string();
+                    std::string lower = path;
+                    for (auto &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    // log all reads that come from registered files
+                    static std::atomic<uint32_t> s_rcnt{0};
+                    if (s_rcnt.fetch_add(1) < 500u)
+                    {
+                        std::cerr << "[menuhex-sectors] lbn=0x" << std::hex << lbn
+                                  << " sec=" << sectors
+                                  << " file=\"" << entry.hostPath.filename().string() << "\""
+                                  << " baseLbn=0x" << entry.baseLbn
+                                  << " offset=0x" << ((uint64_t)(lbn - entry.baseLbn) * kCdSectorSize)
+                                  << std::dec << std::endl;
+                    }
+                }
+            }
+
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
             return readHostRange(entry.hostPath, offset, dst, byteCount);
@@ -479,6 +528,26 @@ namespace
             }
 
             const uint64_t offset = static_cast<uint64_t>(lbn) * kCdSectorSize;
+
+            // [menuhex] log ISO image reads
+            {
+                static const bool s_menuHex = [](){
+                    const char *v = std::getenv("PS2X_MENUHEX");
+                    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+                }();
+                if (s_menuHex)
+                {
+                    static std::atomic<uint32_t> s_isocnt{0};
+                    if (s_isocnt.fetch_add(1) < 500u)
+                    {
+                        std::cerr << "[menuhex-iso] lbn=0x" << std::hex << lbn
+                                  << " sec=" << sectors
+                                  << " iso_off=0x" << offset
+                                  << std::dec << std::endl;
+                    }
+                }
+            }
+
             return readHostRange(cdImage, offset, dst, byteCount);
         }
 

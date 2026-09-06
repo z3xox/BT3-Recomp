@@ -11,12 +11,18 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "game_overrides.h"
+#include "Kernel/Stubs/Pad.h"        // [hstate]/[fightprobe]: ps2_stubs::getPadDebugSnapshot()
+#include "Kernel/Stubs/MemoryCard.h" // [hstate]: ps2_stubs::getMemoryCardDebugSnapshot()
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_gpu_renderer.h"
 
 #if defined(__linux__)
 #include "runtime/pad_evdev_linux.h"
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+#include <set>
 #endif
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -346,6 +352,164 @@ struct ProgramHeader
 
 namespace
 {
+#ifdef __linux__
+namespace
+{
+    // [pinthreads] PS2X_PIN: keep the game thread and the GL/present thread on distinct
+    // physical cores. Left to the OS on a 2-core host, two heavy CPU threads quietly land
+    // on SMT siblings of the SAME physical core (e.g. cpus 0 and 2 on a 2C/4T box), halving
+    // the pipeline capacity both depend on. Pinning (the trick PCSX2/AetherSX2 apply to their
+    // EE/GS threads) buys ~5-15% and tighter 0.1% lows. Values (Linux only):
+    //   unset    = auto: pin only when the host exposes exactly 2 physical cores
+    //   "0" | "none" | "off" = never pin
+    //   "A,B"    = game thread -> CPU A, GL/present thread -> CPU B
+    std::vector<int> ps2xParseCpuList(const std::string &s)
+    {
+        std::vector<int> out;
+        std::string t;
+        auto emit = [&](const std::string &tok)
+        {
+            const size_t dash = tok.find('-');
+            const int lo = std::atoi(tok.substr(0, dash).c_str());
+            const int hi = (dash == std::string::npos) ? lo : std::atoi(tok.substr(dash + 1).c_str());
+            if (lo >= 0 && hi >= lo) for (int c = lo; c <= hi; ++c) out.push_back(c);
+        };
+        for (char ch : s)
+        {
+            if (ch == ',' || ch == ' ') { if (!t.empty()) { emit(t); t.clear(); } }
+            else if (ch != '\n') t += ch;
+        }
+        if (!t.empty()) emit(t);
+        return out;
+    }
+
+    std::vector<int> ps2xCoreCpus(int cpu)
+    {
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
+        for (const char *leaf : {"core_cpus_list", "thread_siblings_list"})
+        {
+            std::ifstream f(base + leaf);
+            std::string s;
+            if (f >> s && !s.empty())
+            {
+                const std::vector<int> cpus = ps2xParseCpuList(s);
+                if (!cpus.empty()) return cpus;
+            }
+        }
+        return {cpu};
+    }
+
+    std::vector<int> ps2xOnlineCpus(const cpu_set_t *only = nullptr)
+    {
+        std::vector<int> out;
+        const long n = sysconf(_SC_NPROCESSORS_CONF);
+        for (long c = 0; c < n; ++c)
+        {
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/online");
+            bool on = true;
+            if (f) { int x = 0; f >> x; on = (x != 0); }
+            if (on && (!only || CPU_ISSET(c, only))) out.push_back((int)c);
+        }
+        return out;
+    }
+
+    std::vector<int> ps2xCoreFirstCpus(const cpu_set_t *only = nullptr)
+    {
+        std::set<int> reps;
+        for (int c : ps2xOnlineCpus(only))
+        {
+            const std::vector<int> grp = ps2xCoreCpus(c);
+            if (!grp.empty()) reps.insert(*std::min_element(grp.begin(), grp.end()));
+        }
+        return std::vector<int>(reps.begin(), reps.end());
+    }
+
+    std::string ps2xCpuMaskStr(const std::vector<int> &cpus)
+    {
+        std::string s;
+        for (size_t i = 0; i < cpus.size(); ++i) { if (i) s += ','; s += std::to_string(cpus[i]); }
+        return s;
+    }
+
+    // Fills the game-thread and GL-thread masks; returns false when pinning is off/inaplicable.
+    bool ps2xPinMasks(cpu_set_t &game, cpu_set_t &gl)
+    {
+        CPU_ZERO(&game); CPU_ZERO(&gl);
+        const char *v = std::getenv("PS2X_PIN");
+        if (v && v[0] && (!strcmp(v, "0") || !strcmp(v, "none") || !strcmp(v, "off")))
+            return false;
+        cpu_set_t allowed; CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return false;
+        std::vector<int> g, m;
+        if (v && v[0] && strcmp(v, "auto"))
+        {
+            const std::vector<int> picks = ps2xParseCpuList(v);
+            if (picks.size() != 2)
+            {
+                std::fprintf(stderr, "[pinthreads] PS2X_PIN=\"%s\" not A,B (e.g. 0,1); ignoring\n", v);
+                return false;
+            }
+            const std::vector<int> a = ps2xCoreCpus(picks[0]);
+            if (std::find(a.begin(), a.end(), picks[1]) != a.end())
+                std::fprintf(stderr, "[pinthreads] WARNING PS2X_PIN=%d,%d put both threads on the SAME physical core (SMT siblings); pick one CPU per core\n", picks[0], picks[1]);
+            g = {picks[0]}; m = {picks[1]};
+        }
+        else
+        {
+            // Auto counts physical cores only within the affinity WE are allowed (so a
+            // taskset -c 0,1 or a 2-core container engages exactly like a real 2-core box).
+            const std::vector<int> cores = ps2xCoreFirstCpus(&allowed);
+            // auto engages only on 2-physical-core hosts
+            if (cores.size() != 2)
+            {
+                std::fprintf(stderr, "[pinthreads] auto: host exposes %zu physical cores, skipping pin\n", cores.size());
+                return false;
+            }
+            g = ps2xCoreCpus(cores[0]);            // whole core A (both SMT threads)
+            m = ps2xCoreCpus(cores[1]);            // whole core B
+        }
+        auto prune = [&](std::vector<int> &sel)
+        {
+            for (size_t i = 0; i < sel.size(); ++i)
+                if (!CPU_ISSET(sel[i], &allowed)) sel.erase(sel.begin() + i--);
+        };
+        prune(g); prune(m);
+        if (g.empty() || m.empty())
+        {
+            std::fprintf(stderr, "[pinthreads] requested cpus not allowed by the process; skipping\n");
+            return false;
+        }
+        for (int c : g) CPU_SET(c, &game);
+        for (int c : m) CPU_SET(c, &gl);
+
+        std::fprintf(stderr, "[pinthreads] %s: game->{%s} GL/present->{%s}\n",
+                     (v && v[0] && strcmp(v, "auto")) ? "explicit" : "auto",
+                     ps2xCpuMaskStr(g).c_str(), ps2xCpuMaskStr(m).c_str());
+        return true;
+    }
+
+    // [pinthreads] keeper: third-party init (GLFW/Mesa/audio) or a cgroup update can clear
+    // the process affinity at ANY point (observed during boot and again ~40s in). Run for
+    // the whole session -- the check is 5x/s of two getaffinity syscalls, negligible.
+    void ps2xPinKeeperLoop(pthread_t gameTid, const cpu_set_t &sGame, const cpu_set_t &sGl,
+                           std::atomic<bool> *stop)
+    {
+        int logs = 0;
+        while (!stop->load(std::memory_order_relaxed))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            cpu_set_t cg, cm; CPU_ZERO(&cg); CPU_ZERO(&cm);
+            const bool dg = (pthread_getaffinity_np(gameTid, sizeof(cg), &cg) != 0) || !CPU_EQUAL(&cg, &sGame);
+            const bool dm = (sched_getaffinity(getpid(), sizeof(cm), &cm) != 0) || !CPU_EQUAL(&cm, &sGl);
+            if (dg) pthread_setaffinity_np(gameTid, sizeof(cg), &sGame);
+            if (dm) sched_setaffinity(getpid(), sizeof(cm), &sGl);
+            if ((dg || dm) && logs++ < 3)
+                std::fprintf(stderr, "[pinthreads] keeper re-pinned game=%s main=%s\n", dg ? "yes" : "ok", dm ? "yes" : "ok");
+        }
+    }
+}
+#endif
+
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
@@ -1034,6 +1198,10 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
+        {   // [vsync] PS2X_VSYNC=1: enable vsync (GPU waits for v-blank -> idles -> lower temp).
+            const char *v = std::getenv("PS2X_VSYNC");
+            if (v && v[0] && v[0] != '0') SetConfigFlags(FLAG_VSYNC_HINT);
+        }
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
@@ -3924,6 +4092,26 @@ void PS2Runtime::run()
         g_activeThreads.fetch_sub(1, std::memory_order_relaxed);
         gameThreadFinished.store(true, std::memory_order_release); });
 
+#ifdef __linux__
+    std::thread pinKeeper;
+    std::atomic<bool> keepStop{false};
+    {   // [pinthreads] PS2X_PIN. Game thread = guest EE below; THIS thread = GL + present.
+        cpu_set_t sGame, sGl;
+        if (ps2xPinMasks(sGame, sGl))
+        {
+            const int r1 = pthread_setaffinity_np(gameThread.native_handle(), sizeof(cpu_set_t), &sGame);
+            const int r2 = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &sGl);
+            if (r1 != 0 || r2 != 0)
+                std::fprintf(stderr, "[pinthreads] setaffinity failed r1=%d r2=%d\n", r1, r2);
+            else
+                pinKeeper = std::thread(ps2xPinKeeperLoop, gameThread.native_handle(), sGame, sGl, &keepStop);
+        }
+    }
+#else
+    std::thread pinKeeper; std::atomic<bool> keepStop{false};
+    (void)pinKeeper; (void)keepStop;
+#endif
+
     // EE PC sampler (PS2X_PCSAMPLE): samples the currently-dispatched guest function PC
     // to reveal whether the game thread is spinning in one hot function (fixable wait) or
     // spread across many (genuinely compute-bound recompiled code).
@@ -4072,6 +4260,260 @@ void PS2Runtime::run()
                           << " fade=" << fadeState << "/" << fadeLevel
                           << " introSub=" << s_introSub << " introTimer=" << s_introTimer << "/1800"
                           << std::dec << std::endl;
+                // ===================== [hstate] Jerarquía legible de estados =====================
+                // Traduce bt3State (raw) a fase + sub-fase humana. BOOT y MENU están mapeados con
+                // offsets ya documentados en tasks/main_menu_state_machine.md y tasks/ESTATUS.md.
+                // FIGHT/IN_FIGHT todavía no tienen los offsets de "tipo de combate"
+                // jugador vs CPU / 2 jugadores) identificados -> ver el bloque [fightprobe] más abajo,
+                // que es el que junta la evidencia para poder completar este switch.
+                if (const uint8_t *rd = m_memory.getRDRAM())
+                {
+                    auto r32safe = [&](uint32_t addr) -> uint32_t {
+                        uint32_t v = 0xffffffffu;
+                        std::memcpy(&v, rd + (addr & PS2_RAM_MASK), 4);
+                        return v;
+                    };
+                    auto hex32 = [](uint32_t v) -> std::string {
+                        std::ostringstream o; o << "0x" << std::hex << v; return o.str();
+                    };
+
+                    std::string phase = "UNKNOWN";
+                    std::string sub;
+
+                    switch (bt3State)
+                    {
+                    case 0x01u:
+                    {
+                        phase = "BOOT";
+                        extern std::atomic<uint32_t> g_ps2FmvActive; // [hstate] definido en ps2_gs_gpu.cpp
+                        const bool fmv = g_ps2FmvActive.load(std::memory_order_relaxed) != 0u;
+                        const ps2_stubs::MemoryCardDebugSnapshot mc = ps2_stubs::getMemoryCardDebugSnapshot();
+                        // Heurística best-effort: refinar una vez que tengamos logs reales de un boot
+                        // completo (memcard aparece antes de que exista introTimer > 0).
+                        if (!mc.openFiles.empty())
+                            sub = "MEMCARD_LOAD(openFiles=" + std::to_string(mc.openFiles.size())
+                                + ",lastCmd=" + hex32(mc.lastCmd) + ")";
+                        else if (mc.lastCmd != 0)
+                            sub = "MEMCARD_CHECK(lastCmd=" + hex32(mc.lastCmd)
+                                + ",lastResult=" + std::to_string(mc.lastResult) + ")";
+                        else if (fmv)
+                            sub = "INTRO_FMV";
+                        else if (s_introTimer > 0)
+                            sub = "TITLE_SPLASH(timer=" + std::to_string(s_introTimer) + "/1800)";
+                        else
+                            sub = "SPLASH_LOGOS(sin marcador exacto todavia)";
+                        break;
+                    }
+                    case 0x04u:
+                    {
+                        phase = "MENU";
+                        const uint32_t mainStruct = r32safe(0x3B38D8u);
+                        if (mainStruct != 0u && mainStruct != 0xffffffffu)
+                        {
+                            const uint32_t globalFlags = r32safe(mainStruct + 0x3BCu);
+                            const bool submenu = (globalFlags & 0x08u) != 0u;
+                            const uint32_t subStruct = r32safe(mainStruct + 0x9A4u);
+                            const uint32_t menuState = (subStruct && subStruct != 0xffffffffu)
+                                ? r32safe(subStruct + 0x40u) : 0xffffffffu;
+                            // Cursor/selección/estado del item activo: *(0x3B38E8)+0x12C/0x138/0x13C
+                            // (offsets documentados en tasks/ESTATUS.md y main_menu_state_machine.md).
+                            const uint32_t itemBase = r32safe(0x3B38E8u);
+                            int32_t cursor = -1, selection = -1; uint32_t itemState = 0xffffffffu;
+                            if (itemBase != 0u && itemBase != 0xffffffffu)
+                            {
+                                cursor    = static_cast<int32_t>(r32safe(itemBase + 0x12Cu));
+                                selection = static_cast<int32_t>(r32safe(itemBase + 0x138u));
+                                itemState = r32safe(itemBase + 0x13Cu);
+                            }
+                            static const char *kItemStateNames[9] = {
+                                "PLATE_LOAD", "SECOND_PASS", "REFERENCE_COUNTER", "ANIMATION",
+                                "CONFIRM_ACCEPT", "NAVIGATION", "CHARACTER_SELECT", "VISUAL_RENDER",
+                                "FINAL_CONFIRM"
+                            };
+                            std::ostringstream o;
+                            o << (menuState == 9u ? "DISPLAYED" : menuState == 10u ? "TRANSITIONING" : "STATE?");
+                            o << (submenu ? "/SUBMENU" : "/ROOT");
+                            o << " cursor=" << cursor << " sel=" << selection << " itemState=";
+                            if (itemState < 9u) o << kItemStateNames[itemState];
+                            else o << hex32(itemState);
+                            sub = o.str();
+                        }
+                        else sub = "mainStruct=0 (menu aun no inicializado)";
+                        break;
+                    }
+                    case 0x06u: phase = "LOADING"; break;
+                    case 0x26u: case 0x28u: case 0x29u:
+                        phase = "PREFIGHT_SETUP"; sub = "raw=" + hex32(bt3State); break;
+                    case 0x27u: phase = "FIGHT";   sub = "modo=? (ver [fightprobe])"; break;
+                    case 0x2Du: phase = "IN_FIGHT";   sub = "modo=? (ver [fightprobe])"; break;
+                    case 0x38u: phase = "POST_FIGHT"; break;
+                    default: break;
+                    }
+
+                    std::cerr << "[hstate] phase=" << phase << " sub=" << sub
+                              << " raw=" << hex32(bt3State) << std::endl;
+                }
+                // ===================== [fightprobe] Diagnóstico de tipo de combate =====================
+                // PS2X_FIGHTPROBE=1: en cada transición de bt3state hacia 0x26/0x27/0x2D vuelca:
+                //  (a) qué puertos de pad están siendo efectivamente leídos (readCount creciendo)
+                //      -> distingue CPU vs CPU (ningún puerto avanza) de P1 vs CPU (solo puerto 0)
+                //      de P1 vs P2 local (puertos 0 y 1).
+                //  (b) un hexdump de la región 0x3C00-0x3D00 del main-struct del menú (selección de
+                //      personaje/escenario/dificultad que se hizo en 0x04 antes de entrar a la pelea).
+                // Correr 3 veces (CPU-CPU, jugador-CPU, jugador-jugador local) y diffear las líneas
+                // [fightprobe] pegadas: el/los bytes que cambien de forma consistente entre corridas
+                // son el flag de "tipo de control" que hoy no está identificado.
+                {
+                    static const bool s_fightProbeOn = [](){
+                        const char *v = std::getenv("PS2X_FIGHTPROBE"); return v && v[0] && v[0] != '0';
+                    }();
+                    static uint32_t s_lastProbedState = 0xffffffffu;
+                    if (s_fightProbeOn && (bt3State == 0x26u || bt3State == 0x27u || bt3State == 0x2Du)
+                        && bt3State != s_lastProbedState)
+                    {
+                        s_lastProbedState = bt3State;
+                        const ps2_stubs::PadDebugSnapshot pad = ps2_stubs::getPadDebugSnapshot();
+                        std::ostringstream o;
+                        o << "[fightprobe] onEnter=0x" << std::hex << bt3State << std::dec;
+                        for (size_t port = 0; port < ps2_stubs::kPadDebugPortCount; ++port)
+                        {
+                            const ps2_stubs::PadDebugPortSnapshot &p = pad.ports[port][0];
+                            o << " port" << port << "(open=" << (p.open ? 1 : 0)
+                              << ",reads=" << p.readCount
+                              << ",lastBtn=0x" << std::hex << p.lastButtons << std::dec << ")";
+                        }
+                        if (const uint8_t *rd2 = m_memory.getRDRAM())
+                        {
+                            auto r32b = [&](uint32_t addr) -> uint32_t {
+                                uint32_t v = 0; std::memcpy(&v, rd2 + (addr & PS2_RAM_MASK), 4); return v;
+                            };
+                            const uint32_t mainStruct = r32b(0x3B38D8u);
+                            o << " mainStruct=0x" << std::hex << mainStruct << std::dec;
+                            if (mainStruct)
+                            {
+                                o << " selectRegion[0x3C00:0x3D00)=";
+                                for (uint32_t off = 0x3C00u; off < 0x3D00u; off += 4u)
+                                    o << ' ' << std::hex << std::setw(8) << std::setfill('0') << r32b(mainStruct + off);
+                                o << std::dec;
+                            }
+                        }
+                        std::cerr << o.str() << std::endl;
+                    }
+                }
+                // ===================== [menuhex] Estado del main menu =====================
+                // PS2X_MENUHEX=1: sondea TODOS los estados (0x04 root, 0x3e OPTIONS, 0x2c etc).
+                // vuelca cada vez que cambia el estado del menu.
+                //   mainPtr   = *(0x2FF10C)      (main game-state struct, ya usada por hstate)
+                //     +0x18   = screen_state_id  (bt3State)
+                //     +0x2C   = selected_entry_ID (la entry actualmente seleccionada)
+                //     +0x148  = cursor (indice en la lista de entries, 0-9)
+                //     +0x14   = visibility_flags (bit 6 = menu visible)
+                //     +0x68C  = transition_flags
+                //   dispPtr   = *(0x2FF28C)
+                //     +0x08   = display_filter (0-127)
+                //     +0xA0C  = frame_counter (0-24)
+                // Mas las jump tables fijas de overlay (ya confirmadas legibles):
+                //   0x3B4290 jumpTable (10 handlers), 0x3B42C0 dispatch2 (5 handlers).
+                {
+                    static const bool s_menuHexOn = [](){
+                        const char *v = std::getenv("PS2X_MENUHEX"); return v && v[0] && v[0] != '0';
+                    }();
+                    static std::string s_menuHexLastKey;   // fingerprint del ultimo estado volcado
+                    if (s_menuHexOn)
+                    {
+                        if (const uint8_t *rd3 = m_memory.getRDRAM())
+                        {
+                            auto r32m = [&](uint32_t addr) -> uint32_t {
+                                uint32_t v = 0; std::memcpy(&v, rd3 + (addr & PS2_RAM_MASK), 4); return v;
+                            };
+                            const uint32_t mainPtr = r32m(0x2FF10Cu);
+                            if (mainPtr == 0u || mainPtr == 0xffffffffu)
+                            {
+                                s_menuHexLastKey.clear();   // aun no inicializado: resetear fingerprint
+                            }
+                            else
+                            {
+                                const uint32_t dispPtr = r32m(0x2FF28Cu);
+                                const uint32_t screenState = r32m(mainPtr + 0x18u);
+                                const uint32_t selectedEntry = r32m(mainPtr + 0x2Cu);
+                                const uint32_t cursor = r32m(mainPtr + 0x148u);
+                                const uint32_t visibility = r32m(mainPtr + 0x14u);
+                                const uint32_t transition = r32m(mainPtr + 0x68Cu);
+                                const uint32_t dispFilter = (dispPtr && dispPtr != 0xffffffffu)
+                                    ? r32m(dispPtr + 0x08u) : 0xffffffffu;
+                                const uint32_t frameCtr = (dispPtr && dispPtr != 0xffffffffu)
+                                    ? r32m(dispPtr + 0xA0Cu) : 0xffffffffu;
+
+                                std::ostringstream kk;
+                                kk << std::hex << mainPtr << '/' << screenState << '/' << selectedEntry << '/'
+                                   << std::dec << static_cast<int32_t>(cursor) << '/' << transition;
+                                const std::string key = kk.str();
+                                if (key != s_menuHexLastKey)
+                                {
+                                    s_menuHexLastKey = key;
+                                    std::ostringstream m;
+                                    m << "[menuhex] mainPtr=0x" << std::hex << mainPtr
+                                      << " dispPtr=0x" << dispPtr << std::dec;
+                                    m << " screen=0x" << std::hex << screenState
+                                      << " selEntry=" << selectedEntry << std::dec
+                                      << " cursor=" << static_cast<int32_t>(cursor)
+                                      << " vis=0x" << std::hex << visibility
+                                      << " trans=0x" << transition << std::dec
+                                      << " dispFilter=" << (dispFilter == 0xffffffffu ? -1 : (int)(dispFilter & 0x7Fu))
+                                      << " frame=" << frameCtr;
+                                    std::cerr << m.str() << std::endl;
+
+                                    // "caption" deducida: selEntry -> nombre de entry (10 entries)
+                                    static const char *kEntryNames[10] = {
+                                        "DRAGON_ROAD", "ULTIMATE_BATTLE", "WORLD_TOURNAMENT", "DUEL", "DRAGON_NET",
+                                        "EVOLUCION_Z", "ENTRENAMIENTO", "DATA_CENTER", "REF_PERSONAJES", "OPCIONES"
+                                    };
+                                    const int32_t cur = static_cast<int32_t>(selectedEntry);
+                                    if (cur >= 0 && cur < 10)
+                                    {
+                                    std::cerr << "[menuhex] selEntry=" << cur
+                                              << " -> " << kEntryNames[cur] << std::endl;
+                                    }
+                                    else
+                                    {
+                                    std::cerr << "[menuhex] selEntry=" << cur
+                                              << " (fuera de rango 0-9, indice de submenu?)" << std::endl;
+                                    }
+
+                                    // (b) Item state jump table (10 handlers)
+                                    {
+                                        std::ostringstream j;
+                                        j << "[menuhex] jumpTable[0x3B4290]:";
+                                        for (uint32_t a = 0x3B4290u; a < 0x3B42B8u; a += 4u)
+                                            j << ' ' << std::hex << std::setw(8) << std::setfill('0') << r32m(a);
+                                        std::cerr << j.str() << std::dec << std::endl;
+                                    }
+
+                                    // (c) Second dispatch table (5 handlers)
+                                    {
+                                        std::ostringstream d;
+                                        d << "[menuhex] dispatch2[0x3B42C0]:";
+                                        for (uint32_t a = 0x3B42C0u; a < 0x3B42D4u; a += 4u)
+                                            d << ' ' << std::hex << std::setw(8) << std::setfill('0') << r32m(a);
+                                        std::cerr << d.str() << std::dec << std::endl;
+                                    }
+
+                                    // (d) seleccion de la struct principal: ventana +0x00..+0x30 y +0x140..+0x150
+                                    {
+                                        std::ostringstream n;
+                                        n << "[menuhex] mainPtr+0x00:";
+                                        for (uint32_t off = 0x00u; off < 0x34u; off += 4u)
+                                            n << ' ' << std::hex << std::setw(8) << std::setfill('0') << r32m(mainPtr + off);
+                                        n << " | +0x140:";
+                                        for (uint32_t off = 0x140u; off < 0x150u; off += 4u)
+                                            n << ' ' << std::hex << std::setw(8) << std::setfill('0') << r32m(mainPtr + off);
+                                        std::cerr << n.str() << std::dec << std::endl;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Scheduler-state dump (when PS2X_SCHED on): shows the deadlock -- which tid holds
                 // the token (m_schedCurrent) and each thread's present/blocked/order/pc.
                 if (m_schedEnabled)
@@ -4725,6 +5167,11 @@ void PS2Runtime::run()
 
     requestStop();
     if (GsGpuRenderer::enabled()) ps2GpuRenderer().abortBlockingBarriers();   // [barblock]
+
+#ifdef __linux__
+    keepStop.store(true, std::memory_order_relaxed);
+    if (pinKeeper.joinable()) pinKeeper.join();
+#endif
 
     const auto joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!gameThreadFinished.load(std::memory_order_acquire) &&

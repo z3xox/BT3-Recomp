@@ -108,6 +108,7 @@ else()
     endif()
     endif()
 
+
     FetchContent_Declare(
         imgui
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -529,6 +530,15 @@ if(NOT PS2X_IS_VITA)
         src/lib/ps2_settings_overlay.cpp
     )
     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    # gamemode: request CPU governor / IO priority optimisations at startup
+    # (auto-release on exit; harmless no-op if the daemon isn't running).
+    find_library(GAMEMODE_LIB NAMES libgamemodeauto.so gamemodeauto NAMES_PER_DIR)
+    if(GAMEMODE_LIB)
+        target_link_libraries(ps2EntryRunner PRIVATE ${GAMEMODE_LIB})
+        message(STATUS "gamemode: linking libgamemodeauto (${GAMEMODE_LIB})")
+    else()
+        message(STATUS "gamemode: libgamemodeauto not found, running without it")
+    endif()
     # Stage the settings-overlay assets (font) next to the executable.
     add_custom_command(TARGET ps2EntryRunner POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_directory

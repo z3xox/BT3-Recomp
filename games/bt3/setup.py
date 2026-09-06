@@ -191,6 +191,7 @@ def main() -> None:
     run([sys.executable, HERE / "gen_overlay.py",
          "--recomp", recomp, "--dbzp", WORK / "BIN" / "DBZP.BIN",
          "--work", WORK / "overlay", "--runtime", ROOT / "ps2xRuntime"])
+    run([sys.executable, HERE / "apply_overlay_patches.py", ROOT / "ps2xRuntime"])
 
     # 6. Install into the runtime tree.
     print("== installing runner sources")

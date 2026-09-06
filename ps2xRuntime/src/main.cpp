@@ -523,9 +523,21 @@ int main(int argc, char *argv[])
         def("PS2X_IDXRT", "1"); def("PS2X_IDXONLY", "1"); def("PS2X_MASKBUILDSKIP", "1");
         def("PS2X_P8TWIN", "1"); def("PS2X_SHCOMPSKIP", "15972,16012,16004,16008,16016,16020,16024");
         def("PS2X_BT3_CDTICK", "1"); def("PS2X_SCHED", "1"); def("PS2X_FORCE_MC", "1");
+        // [asyncdefault] ON by user decision 2026-09-07. The old reason for holding it back --
+        // "better averages but 80-157 ms hitch frames" -- no longer applies: [asyncpace] fixed the
+        // fast-forward (readIORegister was clearing CHCR.STR while the worker still had the channel,
+        // so the guest saw every DMA complete instantly) and [framegate] fixed the pacing. Measured
+        // on an i5-12400: 1P 22.7 -> 29.9 fps, splitscreen 16.8 -> 22.6, guest 19.77 -> 3.33 ms.
+        //
+        // ⚠ STILL OWED, and the reason this was held back until now: the async races are not
+        // cleaned up -- guest GS-priv-reg writes vs the worker, VIF1 register writes, the SW-mode
+        // latch -- and no corruption soak has been run. Two user access-violation crash reports
+        // exist (2026-09-07, see [[runtime-threading-race]]); one had async on, one had it off, so
+        // async is not the sole cause, but it is the one subsystem with known-unresolved races.
+        // PS2X_ASYNC_KICK=0 opts out (def() never overwrites an explicit value).
+        def("PS2X_ASYNC_KICK", "1");
         setenv("PS2X_DEFAULTED", s_defaulted.c_str(), 1);
-        // Deliberately NOT defaulted: PS2X_BARSTAT (diagnostic spam), PS2X_ASYNC_KICK
-        // (better averages but 80-157ms hitch frames -- measured), PS2X_TIMERMULT.
+        // Deliberately NOT defaulted: PS2X_BARSTAT (diagnostic spam), PS2X_TIMERMULT.
     }
 
     try

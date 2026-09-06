@@ -361,7 +361,7 @@ public:
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
-    // ---- Async kick pipeline (PS2X_ASYNC_KICK=1, default off) ----
+    // ---- Async kick pipeline (PS2X_ASYNC_KICK, DEFAULT ON since 2026-09-07; =0 opts out) ----
     // The VIF1->VU1->GIF->raster pipeline runs on a dedicated worker thread instead of
     // synchronously inside the guest's D1_CHCR store. The tag walk already produces a
     // self-contained chainBuf copy, so jobs carry no live guest-RAM pointers (qwc-only
@@ -448,7 +448,7 @@ public:
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
 
-    // Async kick worker state (only used when PS2X_ASYNC_KICK=1).
+    // Async kick worker state (only used when PS2X_ASYNC_KICK is on -- the default).
     struct KickJob
     {
         enum Kind : uint8_t { Vif1 = 0, GifPath3 = 1, SwapFrame = 2 };

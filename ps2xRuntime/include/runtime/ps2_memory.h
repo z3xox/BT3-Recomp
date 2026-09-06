@@ -455,6 +455,10 @@ public:
         uint8_t kind = Vif1;
         std::vector<uint8_t> data;
     };
+    // [asyncpace] Outstanding async work per DMA channel, indexed [0]=VIF0 [1]=VIF1 [2]=GIF.
+    // readIORegister reports CHCR.STR from this so the guest sees the transfer as still RUNNING
+    // while the kick worker is actually still on it -- see the long note at the read site.
+    std::atomic<int> m_asyncChanBusy[3]{};
     std::deque<KickJob> m_kickQueue;
     std::mutex m_kickMtx;
     std::condition_variable m_kickCv;     // wakes the worker

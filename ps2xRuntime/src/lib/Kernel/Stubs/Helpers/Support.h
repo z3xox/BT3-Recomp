@@ -1,4 +1,8 @@
 #include <algorithm>
+#include <map>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cctype>
 
 namespace
@@ -1986,8 +1990,55 @@ namespace
     static void applyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)
     {
         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
+        {   // [envdrop] the silent bail: if this ever fires, a whole draw environment is lost
+            static const bool s_ed = [](){ const char *v = std::getenv("PS2X_ENVDIAG");
+                                           return v && v[0] && v[0] != '0'; }();
+            static unsigned long nb = 0;
+            if (s_ed && (++nb % 100ul) == 1ul)
+                std::fprintf(stderr, "[envdrop] applyGsRegPairs BAILED (#%lu) runtime=%d pairs=%d sync=%d\n",
+                             nb, runtime ? 1 : 0, pairs ? 1 : 0,
+                             runtime ? (int)runtime->syncCoreSubsystems() : -1);
             return;
+        }
         fenceAsyncKickForGsAccess(runtime);
+        {   // [envdiag] PS2X_ENVDIAG=1: which draw environments the guest actually applies.
+            // At long camera distance ~50k character draws end up carrying the OUTLINE pass's
+            // XYOFFSET (1920,1920) into the SCENE, which scissors them away. Counting the
+            // (FRAME,XYOFFSET) pairs the guest applies says whether the restore is never
+            // issued by the game or lost on our side.
+            static const bool s_ed = [](){ const char *v = std::getenv("PS2X_ENVDIAG");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_ed)
+            {
+                static std::map<std::string, unsigned long> hist;
+                static auto t0 = std::chrono::steady_clock::now();
+                uint32_t fbp = 0xFFFFFFFFu, ofx = 0xFFFFFFFFu, ofy = 0;
+                for (size_t i = 0; i < pairCount; ++i)
+                {
+                    const uint8_t r = (uint8_t)(pairs[i].reg & 0xFFu);
+                    if (r == 0x4Cu || r == 0x4Du) fbp = (uint32_t)(pairs[i].value & 0x1FFull);
+                    if (r == 0x18u || r == 0x19u)
+                    { ofx = (uint32_t)((pairs[i].value & 0xFFFFull) / 16u);
+                      ofy = (uint32_t)(((pairs[i].value >> 32) & 0xFFFFull) / 16u); }
+                }
+                if (fbp != 0xFFFFFFFFu || ofx != 0xFFFFFFFFu)
+                {
+                    char k[64];
+                    std::snprintf(k, sizeof k, "FRAME=f%d XYOFF=(%d,%d) npairs=%d",
+                                  (int)fbp, (int)ofx, (int)ofy, (int)pairCount);
+                    ++hist[k];
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now - t0 >= std::chrono::seconds(2))
+                {
+                    t0 = now;
+                    std::fprintf(stderr, "[envdiag] draw environments applied (2 s):");
+                    for (auto &kv : hist) std::fprintf(stderr, " | %s x%lu", kv.first.c_str(), kv.second);
+                    std::fprintf(stderr, "\n");
+                    hist.clear();
+                }
+            }
+        }
         for (size_t i = 0; i < pairCount; ++i)
         {
             runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);

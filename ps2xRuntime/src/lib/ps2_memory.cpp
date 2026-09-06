@@ -2255,6 +2255,10 @@ void PS2Memory::enqueueKickJob(KickJob &&job)
     }
     if (m_kickStop)
         return;
+    // [asyncpace] Mark the channel BUSY here, not in the worker: the guest can poll CHCR the
+    // instant it returns from the kick, long before the worker picks the job up.
+    if (job.kind == KickJob::Vif1)          m_asyncChanBusy[1].fetch_add(1, std::memory_order_release);
+    else if (job.kind == KickJob::GifPath3) m_asyncChanBusy[2].fetch_add(1, std::memory_order_release);
     m_kickQueue.push_back(std::move(job));
     m_kickCv.notify_one();
 }
@@ -2274,6 +2278,13 @@ void PS2Memory::drainKickQueue()
     m_kickDoneCv.wait(lk, [this]() { return (m_kickQueue.empty() && !m_kickBusy) || m_kickStop; });
 }
 
+// [framegate] The kick worker's BUSY time for the last completed frame, in ns. The frame gate in
+// game_overrides.cpp uses it to decide whether to enforce two vsync ticks: sync mode's brake was
+// the render exceeding one vsync, so we only reproduce that brake when the render actually does.
+// Menus leave the worker nearly idle, so they stay ungated at 60; a split-screen fight loads it to
+// ~18 ms, so the gate engages and holds 30.
+std::atomic<uint64_t> g_workerFrameNs{0};
+
 void PS2Memory::kickWorkerLoop()
 {
     for (;;)
@@ -2288,6 +2299,7 @@ void PS2Memory::kickWorkerLoop()
             m_kickQueue.pop_front();
             m_kickBusy = true;
         }
+        const auto _jobT0 = std::chrono::steady_clock::now();   // [framegate]
         switch (job.kind)
         {
         case KickJob::Vif1:
@@ -2306,6 +2318,16 @@ void PS2Memory::kickWorkerLoop()
         // replicate that here so deferred PATH3 packets don't sit queued across frames.
         if (job.kind != KickJob::SwapFrame && m_gifArbiter)
             m_gifArbiter->drain();
+        {   // [framegate] accumulate this frame's worker cost; publish it at the frame boundary
+            static uint64_t s_accNs = 0;
+            s_accNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - _jobT0).count();
+            if (job.kind == KickJob::SwapFrame)
+            {
+                g_workerFrameNs.store(s_accNs, std::memory_order_relaxed);
+                s_accNs = 0;
+            }
+        }
         {
             // Worker-thread-only heartbeat (no locking needed for the statics).
             static uint64_t s_jobs = 0, s_swaps = 0;
@@ -2327,6 +2349,10 @@ void PS2Memory::kickWorkerLoop()
                 s_jobs = 0; s_swaps = 0; s_last = now;
             }
         }
+        // [asyncpace] Released AFTER the drain above, so CHCR.STR only reads 0 once this
+        // channel's work has actually reached the GS -- the hardware contract the guest relies on.
+        if (job.kind == KickJob::Vif1)          m_asyncChanBusy[1].fetch_sub(1, std::memory_order_release);
+        else if (job.kind == KickJob::GifPath3) m_asyncChanBusy[2].fetch_sub(1, std::memory_order_release);
         {
             std::unique_lock<std::mutex> lk(m_kickMtx);
             m_kickBusy = false;
@@ -3079,6 +3105,25 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if ((address & 0xFF) == 0x00)
             {
+                // [asyncpace] CHCR.STR (bit 8) is the guest's "is my DMA done?" signal -- BT3's
+                // frame loop (FUN_00100ab8) kicks D1_CHCR=0x145 and will not start the next frame
+                // until it reads back 0. Clearing it unconditionally is CORRECT in sync mode,
+                // where the whole VIF1->VU1->GIF->record pipeline really did run inline inside the
+                // CHCR write before the guest could read anything.
+                //
+                // Under PS2X_ASYNC_KICK it was a lie, and it is THE reason async "fast-forwards":
+                // the guest was told the render had finished while the worker still had the frame
+                // queued, so the engine free-ran at 41-56 GAME fps against a 30 fps design (prims/s
+                // 2.3M -> 3.9M -- more frames, not faster ones). Measured 2026-09-06.
+                //
+                // Reporting the channel BUSY while the worker still owes work restores the game's
+                // OWN hardware pacing, and still overlaps: the guest runs its logic between the
+                // kick and the next poll, exactly as the EE did while VU1/GIF worked.
+                const uint32_t chan = (address >> 12) & 7u;   // 0x9000 -> 1 (VIF1), 0xA000 -> 2 (GIF)
+                if (asyncKickEnabled() && chan < 3u &&
+                    m_asyncChanBusy[chan].load(std::memory_order_acquire) > 0)
+                    return m_ioRegisters[address] | 0x100u;   // still RUNNING
+
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;
                 return channelStatus;

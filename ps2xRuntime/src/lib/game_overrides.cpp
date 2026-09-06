@@ -1,6 +1,16 @@
 #include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
+
+// [guestbusy-tid] Defined in ps2_gs_gpu_renderer.cpp; declared HERE at file scope on purpose.
+// Declaring it inside bt3FrameKick put it in this file's anonymous namespace, which silently
+// created a SECOND internal-linkage symbol and failed at link with
+// "undefined reference to (anonymous namespace)::g_guestThreadCpuNs".
+extern std::atomic<uint64_t> g_guestThreadCpuNs;
+
+// [framegate] vsync tick source, declared at file scope for the same reason as the above.
+namespace ps2_syscalls { uint64_t GetCurrentVSyncTick(); }
+extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
 #include "ps2_runtime_calls.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -3837,6 +3847,62 @@ namespace
         // would only advance when the next SE command happened to arrive.
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
+        {   // [framegate] PS2X_FRAMEGATE (default ON when async is on, =0 disables): require two
+            // vsync ticks between render kicks.
+            //
+            // BT3's 30 fps is partly EMERGENT, not declared. Measured 2026-09-06, split screen:
+            //   sync : frame 33.3 ms = 21.62 CPU + 11.7 wait  -> guest CPU EXCEEDS one 16.7 ms
+            //          vsync, so the frame always misses the next one and lands on the second.
+            //   async: frame 21.3 ms =  3.62 CPU + 17.7 wait  -> CPU now FITS inside one vsync,
+            //          so it starts catching vsyncs it used to miss: 47 fps, i.e. fast-forward.
+            // 1P was never affected (sync CPU 13.9 ms already fits) which is why async holds a
+            // clean 30 there and only split screen ran away. So the render DURATION was the brake,
+            // and moving it off-thread removed it -- no status bit could have fixed that, and
+            // indeed [kickq] shows depth=0 in both modes, i.e. the worker is never backed up and
+            // the CHCR.STR gate is always already clear when the guest polls.
+            //
+            // Two ticks is what the console effectively enforced. It costs nothing whenever the
+            // guest is already slower than that (every machine that cannot hit 30 -- the ones we
+            // actually care about), and it stops the overshoot on machines that can.
+            static const bool s_gate = [](){ const char *v = std::getenv("PS2X_FRAMEGATE");
+                                             return !(v && v[0] == '0'); }();
+            // CONDITIONAL, and it must be: the first version gated unconditionally and halved the
+            // MENUS, which run at 60 on hardware (fights are the 30-locked ones). Sync mode's brake
+            // was the render EXCEEDING ONE VSYNC, so only reproduce it when the render actually
+            // does. Menus leave the worker near-idle -> ungated -> 60 preserved. A split-screen
+            // fight loads it to ~18 ms -> gated -> 30, which is what sync produced anyway.
+            static const uint64_t s_vsyncNs = [](){ const char *v = std::getenv("PS2X_VBLANK_US");
+                                                    const long us = (v && v[0]) ? std::atol(v) : 0L;
+                                                    return (uint64_t)(us > 1000 ? us : 16667L) * 1000ull; }();
+            const bool heavy = g_workerFrameNs.load(std::memory_order_relaxed) > s_vsyncNs;
+            if (s_gate && heavy && PS2Memory::asyncKickEnabled())
+            {
+                static uint64_t s_lastTick = 0;
+                const uint64_t want = s_lastTick + 2u;
+                // Bounded: never wait more than ~50 ms, so a stalled vblank worker cannot hang
+                // the guest (the failure mode I wrongly suspected of [asyncpace] earlier tonight).
+                for (int i = 0; i < 50; ++i)
+                {
+                    const uint64_t now = ps2_syscalls::GetCurrentVSyncTick();
+                    if (now >= want || now < s_lastTick) break;   // reached it, or counter reset
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                s_lastTick = ps2_syscalls::GetCurrentVSyncTick();
+            }
+        }
+        {   // [guestbusy-tid] Publish THIS thread's CPU time for the [guestbusy] meter in
+            // GsGpuRenderer::swapFrame(). bt3FrameKick is the game's own per-frame render kick, so
+            // it always runs on the guest thread -- unlike swapFrame, which moves to the kick worker
+            // under PS2X_ASYNC_KICK and made guest_ms measure the wrong thread there.
+#if defined(_WIN32)
+            extern "C" unsigned long long ps2xWinThreadCpuNs();
+            g_guestThreadCpuNs.store((uint64_t)ps2xWinThreadCpuNs(), std::memory_order_relaxed);
+#else
+            struct timespec tg; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tg);
+            g_guestThreadCpuNs.store((uint64_t)tg.tv_sec * 1000000000ull + (uint64_t)tg.tv_nsec,
+                                     std::memory_order_relaxed);
+#endif
+        }
         {   // [init114] lifecycle: periodic read of the resident texture table rec0/rec14 ptrs
             static const bool s_i14 = [](){ const char *v = std::getenv("PS2X_INIT114"); return v && v[0] && v[0] != '0'; }();
             if (s_i14)

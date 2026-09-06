@@ -123,6 +123,7 @@ uint32_t g_gaClutData[256];                    // [gpualias] SW-chain palette sn
 std::atomic<unsigned> g_gaClutSeq{0};
 static unsigned long g_gaExecCount = 0;       // [gpualias] chain passes executed (staleness tracking)
 std::atomic<uint64_t> g_guestBusyNs{0}, g_guestBusyFrames{0};   // [guestbusy] file scope: read by ps2_runtime.cpp
+std::atomic<uint64_t> g_guestThreadCpuNs{0};   // [guestbusy-tid] published by bt3FrameKick on the GUEST thread
 #include "runtime/ps2_guestprof.h"
 namespace gprof { bool g_on = [](){ const char *v = std::getenv("PS2X_GUESTPROF"); return v && v[0] && v[0] != '0'; }(); std::atomic<uint64_t> g_acc[NPHASE]; thread_local TL t_tl; }   // [guestprof]
 std::atomic<uint64_t> g_guestWallNs{0};   // [guestwall] wall time between publishes (CPU + blocked)
@@ -133,6 +134,25 @@ static bool ps2xOnGlThread()
 {
     const size_t h = std::hash<std::thread::id>{}(std::this_thread::get_id());
     return g_glTidHash.load(std::memory_order_relaxed) == h;
+}
+// [hudtrace] PS2X_HUDTRACE=1: follow HUD-class draws (textured, into a display buffer, in the
+// top band) through the draw loop. The splitscreen texture loss has every existing drop counter
+// reading ZERO while the HUD is visibly gone, and the GS stream provably contains the draws --
+// so the question is whether they reach the GL emit at all. Stage 0 = entered the loop body,
+// stage 1 = texture resolved, stage 2 = quad emitted. A gap between stages names the culprit;
+// no gap means they are drawn and then made invisible (state or overpaint).
+unsigned long g_hudTrace[3] = {0, 0, 0};
+bool g_hudTraceCur = false;   // set per draw-loop iteration at stage 0
+bool ps2xHudTraceOn()
+{
+    static const bool on = [](){ const char *v = std::getenv("PS2X_HUDTRACE");
+                                 return v && v[0] && v[0] != '0'; }();
+    return on;
+}
+void ps2xHudTraceEmit(uint64_t, uint32_t, float, float, float)
+{
+    extern unsigned long g_hudTrace[3]; extern bool g_hudTraceCur;
+    if (ps2xHudTraceOn() && g_hudTraceCur) ++g_hudTrace[2];
 }
 unsigned long g_putTexCount = 0, g_evictCount = 0;   // [cachestat]
 std::unordered_set<uint64_t> g_evictedThisFrame; bool g_evictDrawOn = false; unsigned long g_evictDrawHits = 0;   // [evictdraw]
@@ -3797,6 +3817,53 @@ void GsGpuRenderer::seedSceneAlphaForRebuild(uint32_t fbp)
 }
 
 
+std::map<std::string, unsigned long> g_hudFind;
+unsigned long g_hudPixN = 0, g_hudPixChanged = 0;
+std::vector<uint32_t> *g_hudPixAfter = nullptr; int g_hudPixX=0, g_hudPixY=0, g_hudPixW=0, g_hudPixH=0;
+double g_f224SrcA = -1.0;
+uint32_t g_ffGen = 0xFFFFFFFFu; double g_ffPrev = -1.0; size_t g_ffLast = 0; int g_ffHits = 0;
+std::map<std::string, unsigned long> g_f224Who; uint32_t g_f224WhoGen = 0xFFFFFFFFu;
+std::vector<double> g_f224Bis; uint32_t g_f224BisGen = 0xFFFFFFFFu;
+double g_f224Before = -1.0; uint32_t g_f224Gen = 0xFFFFFFFFu; unsigned long g_f224Draws = 0;
+std::map<std::string, unsigned long> g_f224Writers;
+// [f224fine] CHEAP sampler: a 4-row strip of the mask page instead of a full texture
+// download (a 2048x1792 LoadImageFromTexture is ~14 MB and cannot be run hundreds of times
+// per frame). The strip sits at 55%% of the height, which is where the silhouettes are.
+double ps2xStripAlphaOf(uint32_t fbp)
+{
+    auto it = g_fbos.find(fbp);
+    if (it == g_fbos.end() || it->second.rt.texture.id == 0) return -1.0;
+    rlDrawRenderBatchActive();
+    const int w = it->second.rt.texture.width, h = it->second.rt.texture.height;
+    if (w <= 0 || h <= 8) return -1.0;
+    const int y0 = (h * 55) / 100;
+    static std::vector<uint32_t> buf;
+    buf.resize((size_t)w * 4);
+    int prevFB = 0; glGetIntegerv(0x8CA6 /*FRAMEBUFFER_BINDING*/, &prevFB);
+    rlEnableFramebuffer(it->second.rt.id);
+    glReadPixels(0, y0, w, 4, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, buf.data());
+    if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+    unsigned long sum = 0;
+    for (uint32_t px : buf) sum += (px >> 24);
+    return buf.empty() ? -1.0 : (double)sum / (double)buf.size();
+}
+double ps2xF224StripAlpha() { return ps2xStripAlphaOf(224u); }
+// [f224trace] mean alpha of the mask page, sampled sparsely (GL thread only).
+double ps2xF224AlphaMean()
+{
+    auto it = g_fbos.find(224u);
+    if (it == g_fbos.end() || it->second.rt.texture.id == 0) return -1.0;
+    rlDrawRenderBatchActive();
+    Image img = LoadImageFromTexture(it->second.rt.texture);
+    const unsigned char *p = (const unsigned char *)img.data;
+    double sum = 0.0; unsigned long n = 0;
+    if (p && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+        for (int y = 0; y < img.height; y += 8)
+            for (int x = 0; x < img.width; x += 8)
+            { sum += p[((size_t)y * img.width + x) * 4 + 3]; ++n; }
+    UnloadImage(img);
+    return n ? sum / (double)n : -1.0;
+}
 static void ps2xDbgCol0(const char *tag, int idx)
 {   // [segchk] helper: f224 column-0 mean alpha, printed with a tag
     extern bool g_replayInWindow; if (!g_replayInWindow) return;
@@ -5755,6 +5822,18 @@ void GsGpuRenderer::recordCmd(const DrawCmd &cmd)
         if (s_sf && sdh >= 440.0f && sdw > 0.0f && sdw <= 64.0f)
             c.srcUploaded = false;
     }
+    // [trifbo] PS2X_TRI_FBO=1 (diagnostic): the same upload-veto problem PS2X_STRIP_FBO
+    // addresses for full-height strips also hits the character/ink composite, which reads
+    // page 336 as TRIANGLES. The stage-tile atlas shares fbp336's base page, so an upload
+    // there makes m_pageSeq > m_fbpRenderSeq and every composite draw decodes stale VRAM
+    // instead of sampling the render target. Measured in the offline A/B: the WORKING dump
+    // resolves 5688 of these via the FBO, the BROKEN dump resolves ZERO (all "decoded UP").
+    if (c.srcUploaded && c.isTriangle && !c.isTransfer && (c.srcTbp0 / 32u) == 336u)
+    {
+        static const bool s_tf = [](){ const char *v = std::getenv("PS2X_TRI_FBO");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_tf) c.srcUploaded = false;
+    }
     // Stamp the destination AFTER the source check (a draw must not shadow its own source).
     {   // Strip-assembly check at RECORD time, i.e. in the guest's own submission order, so
         // the draw loop's reordering cannot manufacture false restarts. Same estimator is run
@@ -5983,15 +6062,21 @@ void GsGpuRenderer::swapFrame()
     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);
     {   // [guestbusy] the guest thread's CPU time per published frame (the game paces in whole vsyncs, so the fps counter
         // hides everything between 33 and 50 ms; this is the number that says how far the frame is from 30 fps)
-#if defined(_WIN32)
-        const uint64_t now = ps2xWinThreadCpuNs();   // ps2_win_timer.cpp (GetThreadTimes)
-#else
-        struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
-        const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-#endif
+        //
+        // [guestbusy-tid] It MUST be the guest thread's clock, and it was not. This block sampled
+        // whatever thread called swapFrame -- the guest thread in sync mode, but the KICK WORKER
+        // under PS2X_ASYNC_KICK (ps2_memory.cpp dispatches KickJob::SwapFrame there). So an
+        // async-vs-sync comparison silently compared two DIFFERENT THREADS: on 2026-09-06 that read
+        // as guest_ms 13.3 -> 9.7 and looked like a 27% win, when it was the worker's clock against
+        // the guest's. The guest thread now publishes its own CPU time once per frame from
+        // bt3FrameKick (game_overrides.cpp), which runs on the guest thread in BOTH modes, and this
+        // block just consumes it. Zero when the publisher has not run yet (boot/menus).
+        extern std::atomic<uint64_t> g_guestThreadCpuNs;   // published by bt3FrameKick
+        const uint64_t now = g_guestThreadCpuNs.load(std::memory_order_relaxed);
+        if (now == 0) { /* publisher not running yet -- skip this sample */ }
         static uint64_t s_last = 0;
-        if (s_last) { g_guestBusyNs.fetch_add(now - s_last, std::memory_order_relaxed); g_guestBusyFrames.fetch_add(1, std::memory_order_relaxed); }
-        s_last = now;
+        if (s_last && now > s_last) { g_guestBusyNs.fetch_add(now - s_last, std::memory_order_relaxed); g_guestBusyFrames.fetch_add(1, std::memory_order_relaxed); }
+        if (now) s_last = now;
         {   // [guestwall] wall clock twin: CPU-vs-wall gap = time BLOCKED (barriers, publish waits)
 #if defined(_WIN32)
             const uint64_t noww = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -6844,6 +6929,22 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
             size_t cacheBytes = 0;
             for (const auto &kv : m_texCache) cacheBytes += kv.second.rgba.size();
+            {   // [hudtrace] once a second: how far HUD-class draws get through the loop
+                extern unsigned long g_hudTrace[3]; extern bool ps2xHudTraceOn();
+                static auto ht0 = std::chrono::steady_clock::now();
+                static unsigned long last[3] = {0, 0, 0};
+                if (ps2xHudTraceOn())
+                {
+                    const auto htn = std::chrono::steady_clock::now();
+                    if (std::chrono::duration<double>(htn - ht0).count() >= 1.0)
+                    {
+                        std::fprintf(stderr, "[hudtrace] per sec: entered=%lu texResolved=%lu emitted=%lu\n",
+                                     g_hudTrace[0] - last[0], g_hudTrace[1] - last[1], g_hudTrace[2] - last[2]);
+                        for (int i = 0; i < 3; ++i) last[i] = g_hudTrace[i];
+                        ht0 = htn;
+                    }
+                }
+            }
             {   // [cachestat] PS2X_CACHESTAT=1: once a second -- entries, MB, decodes/s, evictions/s
                 static const bool s_cst = [](){ const char *v = std::getenv("PS2X_CACHESTAT"); return v && v[0] && v[0] != '0'; }();
                 extern unsigned long g_putTexCount, g_evictCount;
@@ -7495,6 +7596,19 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
         }
         if (!moved) return fbp;
+        {   // [viewidx] PS2X_VIEWIDX=1: an INDEXED read (PSMT8/T8H/T4/T4HL/T4HH) must keep the
+            // BASE key, exactly as the sfKey comment states ("a PSMT8/PSMT8H read of a CT32
+            // buffer keeps the base key; only a PSMCT16 re-view moves"). It does not today:
+            // measured in the offline A/B, the character/ink composite's PSMT8 read of page 336
+            // relocates to view 1104 (or 848 with FBWSPLIT=0), neither of which has an FBO, so
+            // 217k composite draws fall back to decoding stale VRAM. Page 336 itself HAS an FBO
+            // in both states. Indexed data is a reinterpretation of the same bytes, not a
+            // separate surface, so it must not be relocated.
+            static const bool s_vi = [](){ const char *v = std::getenv("PS2X_VIEWIDX");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_vi && (psm == 0x13u || psm == 0x1Bu || psm == 0x14u || psm == 0x24u || psm == 0x2Cu))
+                return fbp;
+        }
         if (s_fbwSplit && fbp == 336u && sizeHint > 4 && psmBits(psm) == 32)
             return fbp + 768u;      // the wide (FBW=8 / 512-declared) CT32 writer: its own surface
         return fbp + 512u;
@@ -8580,12 +8694,14 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
 // First-hit-only reporting HIDES count differences: a gate that fires in both configs looks
 // identical even when it eats 96 more draws in one of them. Accumulate and dump per frame.
 static std::map<int, unsigned long> g_gateHits;
+static std::map<uint32_t, unsigned long> g_gatePage;   // [gateall] drops attributed to the SOURCE page
+static std::map<uint32_t, unsigned long> g_gateSeenPage;   // [gateall] draws watched, per source page
 static const bool g_zpassWatch = [](){ const char *v = std::getenv("PS2X_ZPASS");
                                        return v && v[0] && v[0] != '0'; }();
 // PS2X_ZPASS=<psm>: which source format to trace (50 = PSMZ32, 20 = PSMT4, 27 = PSMT8H).
 static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS");
                                          return (v && v[0]) ? (unsigned)std::atoi(v) : 0x32u; }();
-#define PS2X_GATE_HIT() do { if (gateWatch) { ++g_gateHits[__LINE__]; } \
+#define PS2X_GATE_HIT() do { if (gateWatch) { ++g_gateHits[__LINE__]; ++g_gatePage[c.srcTbp0 / 32u]; } \
         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static std::set<int> s_zl; \
             if (s_zl.insert(__LINE__).second) \
                 std::fprintf(stderr, "[zpass] *** DROPPED at line %d *** dest=f%u fbmsk=%08x\n", \
@@ -8790,6 +8906,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
          (!hoistAll && ti + 1u < (size_t)DC[ci].triCount) ? (void)++ti : (void)(ti = 0, ++ci))
     {
         const uint32_t nTri = DC[ci].triCount;
+        {   // [hudtrace] stage 0: a HUD-class command entered the loop body
+            extern unsigned long g_hudTrace[3]; extern bool ps2xHudTraceOn(); extern bool g_hudTraceCur;
+            const DrawCmd &hc = DC[ci];
+            g_hudTraceCur = ps2xHudTraceOn() && hc.texKey && !hc.isTransfer && !hc.isDecode
+                && (hc.destFbp == 0u || hc.destFbp == 112u)
+                && hc.tri[0].y <= 90.0f && hc.tri[1].y <= 90.0f && hc.tri[2].y <= 90.0f;
+            if (g_hudTraceCur) ++g_hudTrace[0];
+        }
         hoistAll = hoistOk && nTri > 1u;                                  // [glhoist]
         if (hoistAll && wsHudInv != 1.0f && !DC[ci].wsHudApplied
             && (DC[ci].destFbp == 0u || DC[ci].destFbp == 112u)
@@ -9412,6 +9536,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         applyDepth(false, 1u, false);
                         rlSetBlendMode(RL_BLEND_ALPHA);
                         rlSetTexture(s_tex.id);
+                        ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255); rlNormal3f(0.0f, 0.0f, 1.0f);
                         // offX/offY are per-draw (atlas slot) and not in scope here; the overlay
@@ -9493,13 +9618,345 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
             if (skipThis) continue;
         }
+        {   // [unmaskchar] PS2X_UNMASKCHAR=1: CAUSAL TEST. Half the character cel draws
+            // (src page 15680, PSMT8) carry fbmsk=ffffffff -- every colour channel masked, so
+            // they write nothing -- where console's stream carries ff000000 for all of them.
+            // That correlates with the washed mask (173/frame washed vs 65 working), but a
+            // correlation is not a cause: it could equally be a CONSEQUENCE of fewer characters
+            // being drawn. Give those draws console's mask and see whether the HUD returns.
+            // If it does, the mask is the cause. If it does not, the whole lead is wrong.
+            static const bool s_um = [](){ const char *v = std::getenv("PS2X_UNMASKCHAR");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_um && !c.isTransfer && c.isTriangle && c.fbmsk == 0xFFFFFFFFu
+                && c.srcTbp0 == 15680u)
+            {
+                const_cast<GsGpuRenderer::DrawCmd &>(c).fbmsk = 0xFF000000u;
+                static unsigned long n = 0;
+                if ((++n % 20000ul) == 1ul)
+                    std::fprintf(stderr, "[unmaskchar] gave %lu character draws console's ff000000\n", n);
+            }
+        }
+        {   // [f224fine] PS2X_F224FINE=1: bisect the frame down to the individual command.
+            // The 20-point bisect showed the page go 253 -> 237 partway through a working frame,
+            // but NO command targeting page 224 moves it -- so the writer is something else the
+            // loop runs. Sample a cheap strip every `stride` commands; when it jumps, print the
+            // command span responsible and dump what is in it.
+            static const bool s_ffine = [](){ const char *v = std::getenv("PS2X_F224FINE");
+                                              return v && v[0] && v[0] != '0'; }();
+            if (s_ffine && DC.size() >= 400)
+            {
+                extern double ps2xF224StripAlpha();
+                extern uint32_t g_ffGen; extern double g_ffPrev; extern size_t g_ffLast; extern int g_ffHits;
+                if (g_ffGen != frameGen) { g_ffGen = frameGen; g_ffPrev = -1.0; g_ffLast = 0; g_ffHits = 0; }
+                const size_t stride = (DC.size() / 256) < 16 ? 16 : (DC.size() / 256);
+                if ((ci % stride) == 0)
+                {
+                    const double v = ps2xF224StripAlpha();
+                    if (g_ffPrev >= 0.0 && v >= 0.0 && (v - g_ffPrev > 4.0 || g_ffPrev - v > 4.0) && g_ffHits < 4)
+                    {
+                        ++g_ffHits;
+                        std::fprintf(stderr, "[f224fine] gen=%u alpha %.1f -> %.1f between ci %zu..%zu (of %zu)\n",
+                                     frameGen, g_ffPrev, v, g_ffLast, ci, DC.size());
+                        int n = 0;
+                        for (size_t j = g_ffLast; j < ci && j < DC.size() && n < 8; ++j)
+                        {
+                            const DrawCmd &d = DC[j];
+                            std::fprintf(stderr, "    ci=%zu %s%s%s%s dst=f%u dpsm=%02x src=%u/psm%02x fbmsk=%08x bm=%02x tex=%d alias=%u\n",
+                                         j,
+                                         d.isTransfer ? "XFER " : "", d.isVramBlit ? "BLIT " : "",
+                                         d.isDecode ? "DECODE " : "", d.isTriangle ? "tri" : "spr",
+                                         d.destFbp, (unsigned)d.destPsm, d.srcTbp0, (unsigned)d.srcPsm,
+                                         d.fbmsk, (unsigned)d.blendMode, d.texKey ? 1 : 0,
+                                         (unsigned)d.aliasKind);
+                            ++n;
+                        }
+                    }
+                    g_ffPrev = v; g_ffLast = ci;
+                }
+            }
+        }
+        {   // [f224who] PS2X_F224WHO=1: WHAT actually runs in the 30-35%% window of the command
+            // list, where the bisect shows the silhouettes appear on working frames and fail to
+            // appear on washed ones. No theory -- just a census of the commands there.
+            static const bool s_fw = [](){ const char *v = std::getenv("PS2X_F224WHO");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_fw && DC.size() >= 40)
+            {
+                extern std::map<std::string, unsigned long> g_f224Who; extern uint32_t g_f224WhoGen;
+                if (g_f224WhoGen != frameGen) { g_f224WhoGen = frameGen; g_f224Who.clear(); }
+                // PS2X_F224WHO=2 censuses the WHOLE frame. A proportional window lands on a
+                // different phase of the frame when the list length changes, which made the
+                // 30-35%% comparison unsafe (f336 untextured tris read 538/frame washed vs
+                // 182 working -- an alignment artifact, not necessarily a real difference).
+                static const int s_fwMode = [](){ const char *v = std::getenv("PS2X_F224WHO");
+                                                  return v && v[0] ? std::atoi(v) : 1; }();
+                const size_t lo = (s_fwMode >= 2) ? 0u : (DC.size() * 30) / 100;
+                const size_t hi = (s_fwMode >= 2) ? DC.size() : (DC.size() * 36) / 100;
+                if (ci >= lo && ci < hi)
+                {
+                    char k[96];
+                    std::snprintf(k, sizeof k, "%s dst=f%u src=%u/psm%02x fbmsk=%08x%s%s",
+                                  c.isTransfer ? "XFER" : (c.isVramBlit ? "BLIT" : (c.isDecode ? "DECODE" : (c.isTriangle ? "tri" : "spr"))),
+                                  c.destFbp, c.srcTbp0, (unsigned)c.srcPsm, c.fbmsk,
+                                  c.isAliasPass ? "+alias" : "", c.texKey ? "" : "/untex");
+                    ++g_f224Who[k];
+                }
+            }
+        }
+        {   // [noate] PS2X_NOATE=1: force the GS alpha test OFF. The character cel passes run
+            // ATE=1 ATST=GEQUAL AREF=127, and aref is passed as AREF/128 = 0.992 in units where
+            // GS alpha 0x80 == 1.0. Any texture whose alpha reaches the shader on the /255
+            // convention instead lands near 0.5 and EVERY character texel fails -- which would
+            // delete the characters wholesale, exactly the observed symptom. If the fighters
+            // come back with the test disabled, the fault is the alpha scale on that path.
+            static const bool s_noate = [](){ const char *v = std::getenv("PS2X_NOATE");
+                                              return v && v[0] && v[0] != '0'; }();
+            if (s_noate) const_cast<GsGpuRenderer::DrawCmd &>(c).alphaTest = false;
+        }
+        {   // [hudfind] PS2X_HUDFIND=1: identify the HUD's producing draws EMPIRICALLY instead of
+            // guessing. Assumptions about "the HUD draws" have been wrong twice: the 290 sprites
+            // reading page 7168 are 512x512 composites (ink/shadow/rim), and there are NO small
+            // sprites in the HUD band at all -- in the WORKING dump either. So: for every draw
+            // into a scene buffer, count bright-green pixels in the top band before and after,
+            // and report the draws that INCREASE it. Those are the HUD, by definition.
+            static const bool s_hf = [](){ const char *v = std::getenv("PS2X_HUDFIND");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_hf && !c.isTransfer && (c.destFbp == 0u || c.destFbp == 112u))
+            {
+                auto fit = g_fbos.find(c.destFbp);
+                if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
+                {
+                    const int fw = fit->second.rt.texture.width, fh = fit->second.rt.texture.height;
+                    const int bh = fh / 8;                       // top ~12% band
+                    static std::vector<uint32_t> buf;
+                    auto greens = [&]() -> long {
+                        buf.resize((size_t)fw * bh);
+                        rlDrawRenderBatchActive();
+                        int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
+                        rlEnableFramebuffer(fit->second.rt.id);
+                        glReadPixels(0, fh - bh, fw, bh, 0x1908, 0x1401, buf.data());
+                        if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+                        long n = 0;
+                        for (uint32_t px : buf)
+                        { const int r = px & 0xFF, g = (px >> 8) & 0xFF, b = (px >> 16) & 0xFF;
+                          if (g > 200 && r < 100 && b < 100) ++n; }
+                        return n; };
+                    static long s_prev = -1; static char s_desc[160] = {0};
+                    const long now = greens();
+                    if (s_prev >= 0 && now > s_prev + 200)
+                    {
+                        extern std::map<std::string, unsigned long> g_hudFind;
+                        ++g_hudFind[s_desc];
+                    }
+                    s_prev = now;
+                    std::snprintf(s_desc, sizeof s_desc, "%s dst=f%u src=%u/psm%02x cbp=%u fbmsk=%08x bm=%02x %s",
+                                  c.isTriangle ? "tri" : "spr", c.destFbp, c.srcTbp0, (unsigned)c.srcPsm,
+                                  c.srcClutTbp, c.fbmsk, (unsigned)c.blendMode, c.texKey ? "tex" : "untex");
+                    {
+                        extern std::map<std::string, unsigned long> g_hudFind;
+                        static auto t0 = std::chrono::steady_clock::now();
+                        const auto tn = std::chrono::steady_clock::now();
+                        if (tn - t0 >= std::chrono::seconds(3) && !g_hudFind.empty())
+                        {
+                            t0 = tn;
+                            std::fprintf(stderr, "[hudfind] draws that ADD HUD green:");
+                            for (auto &kv : g_hudFind) std::fprintf(stderr, " | %s x%lu", kv.first.c_str(), kv.second);
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
+            }
+        }
+        {   // [hudpix] PS2X_HUDPIX=1: THE HUD, measured directly. The HUD is 290 sprites/frame
+            // sampling page 7168 as PSMT8H into the scene, and they are present and identical in
+            // the broken stream with no gate dropping them -- so they execute. Question: do they
+            // change any pixels? Read the destination band before and after each such draw.
+            static const bool s_hp = [](){ const char *v = std::getenv("PS2X_HUDPIX");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_hp && !c.isTransfer && !c.isTriangle && c.srcTbp0 == 7168u && c.srcPsm == 0x1bu
+                && (c.destFbp == 0u || c.destFbp == 112u))
+            {
+                extern double ps2xStripAlphaOf(uint32_t);
+                extern unsigned long g_hudPixN, g_hudPixChanged;
+                auto fit = g_fbos.find(c.destFbp);
+                if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
+                {
+                    const int fw = fit->second.rt.texture.width;
+                    const int fh = fit->second.rt.texture.height;
+                    const int sc = (fit->second.w > 0) ? (fw / fit->second.w) : 1;
+                    int x0 = (int)std::floor(std::min(c.dx0, c.dx1)) * sc;
+                    int y0 = (int)std::floor(std::min(c.dy0, c.dy1)) * sc;
+                    int w  = (int)std::ceil(std::fabs(c.dx1 - c.dx0)) * sc;
+                    int h  = (int)std::ceil(std::fabs(c.dy1 - c.dy0)) * sc;
+                    if (w > 0 && h > 0 && x0 >= 0 && y0 >= 0 && x0 + w <= fw && y0 + h <= fh
+                        && (long long)w * h <= 262144)
+                    {
+                        std::vector<uint32_t> before((size_t)w * h), after((size_t)w * h);
+                        auto grab = [&](std::vector<uint32_t> &dst) {
+                            rlDrawRenderBatchActive();
+                            int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
+                            rlEnableFramebuffer(fit->second.rt.id);
+                            glReadPixels(x0, fh - (y0 + h), w, h, 0x1908, 0x1401, dst.data());
+                            if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+                        };
+                        grab(before);
+                        extern std::vector<uint32_t> *g_hudPixAfter; extern int g_hudPixX, g_hudPixY, g_hudPixW, g_hudPixH;
+                        // the "after" read happens on the NEXT such draw; compare then
+                        static std::vector<uint32_t> s_prev; static int px0=0,py0=0,pw=0,ph=0; static uint32_t pfbp=0xFFFFFFFF;
+                        if (!s_prev.empty() && pfbp == c.destFbp && pw == w && ph == h)
+                        {
+                            std::vector<uint32_t> now((size_t)pw * ph);
+                            int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
+                            rlDrawRenderBatchActive(); rlEnableFramebuffer(fit->second.rt.id);
+                            glReadPixels(px0, fh - (py0 + ph), pw, ph, 0x1908, 0x1401, now.data());
+                            if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
+                            ++g_hudPixN;
+                            if (now != s_prev) ++g_hudPixChanged;
+                        }
+                        s_prev = before; px0=x0; py0=y0; pw=w; ph=h; pfbp=c.destFbp;
+                        if ((g_hudPixN % 500ul) == 1ul && g_hudPixN)
+                            std::fprintf(stderr, "[hudpix] HUD draws measured=%lu  that CHANGED pixels=%lu (%.1f%%)\n",
+                                         g_hudPixN, g_hudPixChanged, 100.0 * g_hudPixChanged / (double)g_hudPixN);
+                    }
+                }
+            }
+        }
+        {   // [f224bisect] PS2X_F224BISECT=1: the mask page's alpha sampled at 20 points across
+            // the frame's command list. Nothing IN the list writes that page (the 48 mask draws
+            // move it by 0.1), it is not recreated, and yet it flips 233 -> 255 at frame
+            // granularity -- so the writer is elsewhere in the frame. The step where the jump
+            // lands names the command index to look at.
+            static const bool s_fb = [](){ const char *v = std::getenv("PS2X_F224BISECT");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_fb && DC.size() >= 40)
+            {
+                extern double ps2xF224AlphaMean();
+                extern std::vector<double> g_f224Bis; extern uint32_t g_f224BisGen;
+                const size_t step = DC.size() / 20;
+                if (g_f224BisGen != frameGen) { g_f224BisGen = frameGen; g_f224Bis.clear(); }
+                if (step && (ci % step) == 0 && g_f224Bis.size() < 21)
+                    g_f224Bis.push_back(ps2xF224AlphaMean());
+            }
+        }
+        {   // [f224trace] PS2X_F224TRACE=1: the mask page's alpha at the START of the block of
+            // draws targeting it, paired with its value at PRESENT of the SAME frame. (The first
+            // version of this sampled "after" at the next frame's first 224-draw and "before"
+            // an instant later -- the same sample point, so the pair was equal by construction
+            // and said nothing. Both points must lie inside one frame.)
+            static const bool s_ft = [](){ const char *v = std::getenv("PS2X_F224TRACE");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_ft && !c.isTransfer && c.destFbp == 224u)
+            {
+                extern double ps2xF224AlphaMean();
+                extern double g_f224Before; extern uint32_t g_f224Gen; extern unsigned long g_f224Draws;
+                if (g_f224Gen != frameGen)
+                { g_f224Gen = frameGen; g_f224Draws = 0; g_f224Before = ps2xF224AlphaMean();
+                  extern double g_f224SrcA; g_f224SrcA = -1.0; }
+                ++g_f224Draws;
+                {   // [f224src] the textured mask draws read the SCENE page as PSMT8H and their
+                    // output IS the silhouette. Sample that source at the moment they run: if it
+                    // is empty on washed frames, the silhouette never reached the scene alpha and
+                    // the fault is upstream of the mask build entirely.
+                    extern double ps2xStripAlphaOf(uint32_t); extern double g_f224SrcA;
+                    if (g_f224SrcA < 0.0 && c.texKey && c.srcPsm == 0x1bu)
+                        g_f224SrcA = ps2xStripAlphaOf(c.srcTbp0 / 32u);
+                }
+            }
+            // every command touching the page, transfers and alias passes included -- the
+            // silhouettes are NOT written by the 48 ordinary draws, so the writer is elsewhere
+            if (s_ft && (c.destFbp == 224u || c.xDstFbp == 224u))
+            {
+                extern std::map<std::string, unsigned long> g_f224Writers;
+                char k[80];
+                // src page matters: BT3 alternates two scene buffers and only one of ours
+                // carries the silhouette alpha, so WHICH page this frame read should predict
+                // whether the mask comes out good or washed.
+                std::snprintf(k, sizeof k, "%s src=%u%s",
+                              c.isTransfer ? "TRANSFER" : (c.isVramBlit ? "VRAMBLIT" : "draw"),
+                              c.srcTbp0, c.texKey ? "" : "/untex");
+                ++g_f224Writers[k];
+            }
+        }
+        {   // [maskmix] PS2X_MASKMIX=1: census of the draws that BUILD page 224's alpha plane
+            // (the mask a PSMT8H read returns). Console rebuilds it with 192 alpha-only draws
+            // per frame, 64 of them untextured writing alpha 0 and 128 textured. If our mix
+            // shifts toward untextured full-alpha fills as the camera pulls back, the wash that
+            // kills the HUD/outline/character layer is coming from the draws themselves.
+            static const bool s_mx = [](){ const char *v = std::getenv("PS2X_MASKMIX");
+                                           return v && v[0] && v[0] != '0'; }();
+            if (s_mx && !c.isTransfer && c.destFbp == 224u)
+            {
+                static std::map<std::string, unsigned long> mix;
+                static auto t0 = std::chrono::steady_clock::now();
+                char k[64];
+                std::snprintf(k, sizeof k, "%s/a=%u/sx=%d-%d", c.texKey ? "tex" : "UNTEX",
+                              (unsigned)c.a, c.sx, c.sx + c.sw);
+                ++mix[k];
+                const auto now = std::chrono::steady_clock::now();
+                if (now - t0 >= std::chrono::seconds(1))
+                {
+                    t0 = now;
+                    std::fprintf(stderr, "[maskmix]");
+                    for (auto &kv : mix) std::fprintf(stderr, " %s=%lu", kv.first.c_str(), kv.second);
+                    std::fprintf(stderr, "\n");
+                    mix.clear();
+                }
+            }
+        }
+        // [gateall] PS2X_GATEALL=1: watch EVERY non-transfer draw, not one page's. The
+        // splitscreen texture loss is not confined to one source class (HUD, hair, beam and
+        // casing all go), so a per-page census cannot see it; this one reports, once a second,
+        // how many draws the loop saw, how many each gate ate, and which SOURCE pages lost them.
+        static const bool s_gateAll = [](){ const char *v = std::getenv("PS2X_GATEALL");
+                                            return v && v[0] && v[0] != '0'; }();
         const bool gateWatch = (!c.isTransfer &&
-                                ((s_gateDbg >= 0 && (int)c.destFbp == s_gateDbg) ||
+                                (s_gateAll ||
+                                 (s_gateDbg >= 0 && (int)c.destFbp == s_gateDbg) ||
                                  (s_gateSrc >= 0 && c.texKey != 0 &&
                                   (int)(c.srcTbp0 / 32u) == s_gateSrc)));
         (void)gateWatch;
         if (gateWatch) { static unsigned long s_seen = 0; ++s_seen;
             extern unsigned long g_gateSeen; g_gateSeen = s_seen;
+            ++g_gateSeenPage[c.srcTbp0 / 32u];
+            if (s_gateAll)
+            {   // [gateall] once-a-second DELTA census: cumulative totals hide a gate that
+                // starts eating draws halfway through a run, which is exactly the shape here.
+                static auto t0 = std::chrono::steady_clock::now();
+                static unsigned long prevSeen = 0;
+                static std::map<int, unsigned long> prevHits;
+                static std::map<uint32_t, unsigned long> prevPage, prevSeenPage;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - t0 >= std::chrono::seconds(1))
+                {
+                    unsigned long dropped = 0;
+                    for (auto &kv : g_gateHits) dropped += kv.second - prevHits[kv.first];
+                    std::fprintf(stderr, "[gateall] seen=%lu dropped=%lu survived=%lu | by-gate:",
+                                 s_seen - prevSeen, dropped, (s_seen - prevSeen) - dropped);
+                    for (auto &kv : g_gateHits)
+                    { const unsigned long d = kv.second - prevHits[kv.first];
+                      if (d) std::fprintf(stderr, " L%d=%lu", kv.first, d); }
+                    // the source pages that lost the most draws this second, with how many they sent
+                    std::vector<std::pair<unsigned long, uint32_t>> pv;
+                    for (auto &kv : g_gatePage)
+                    { const unsigned long d = kv.second - prevPage[kv.first]; if (d) pv.push_back({d, kv.first}); }
+                    std::sort(pv.rbegin(), pv.rend());
+                    std::fprintf(stderr, " | lost-by-src-page:");
+                    for (size_t i = 0; i < pv.size() && i < 8; ++i)
+                        std::fprintf(stderr, " p%u=%lu/%lu", pv[i].second, pv[i].first,
+                                     g_gateSeenPage[pv[i].second] - prevSeenPage[pv[i].second]);
+                    // and the pages that SENT the most, so a page that stops sending is visible too
+                    std::vector<std::pair<unsigned long, uint32_t>> sv;
+                    for (auto &kv : g_gateSeenPage)
+                    { const unsigned long d = kv.second - prevSeenPage[kv.first]; if (d) sv.push_back({d, kv.first}); }
+                    std::sort(sv.rbegin(), sv.rend());
+                    std::fprintf(stderr, " | top-src-pages:");
+                    for (size_t i = 0; i < sv.size() && i < 8; ++i)
+                        std::fprintf(stderr, " p%u=%lu", sv[i].second, sv[i].first);
+                    std::fprintf(stderr, "\n");
+                    prevSeen = s_seen; prevHits = g_gateHits; prevPage = g_gatePage; prevSeenPage = g_gateSeenPage;
+                    t0 = now;
+                }
+            }
             // Describe the watched draws once each: what a composite READS and how it BLENDS
             // decides whether its output is an outline or a full-screen wash.
             static const bool s_gs2 = [](){ const char *v = std::getenv("PS2X_GATEDESC");
@@ -9680,6 +10137,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (depthOn) applyDepth(true, 2 /* GS ZTST GEQUAL */, false); else rlDisableDepthTest();
                 const bool dbg = groundShadowMode() == 2;
                 rlSetTexture(dbg ? g_white.id : g_blobTex.id);
+                ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                 rlBegin(RL_QUADS);
                 // [gshadowtune] env-tunable without a rebuild: width factor, height/width, alpha, vertical offset (fraction of h
                 // above the feet line), depth nudge factor (>1 = nearer than the contact patch)
@@ -12551,10 +13009,32 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                              c.isTriangle ? 1 : 0, c.abe ? 1 : 0, (unsigned)c.blendMode, (unsigned)c.blendFix,
                              c.srcTexW, c.srcTexH, c.srcClutTbp, c.fbmsk, (unsigned)c.tcc, (unsigned)c.tfx); }
         }
-        else if (!zTexBind && !vramAliasRead && !s_noff && !c.srcIndexed && !alphaOnlyWantsVram
-                 && (!c.srcUploaded || destAlphaLerp
-                     || (s_createOnRead && (c.srcPsm == 0x30u || c.srcPsm == 0x31u || c.srcPsm == 0x32u)))
-                 && c.texKey != 0 && sfKey != dstKey && (c.srcTbp0 == sf * 32u) && g_fbos.count(sfKey) && g_fbos[sfKey].rt.texture.id != 0)
+        else if ([&]{
+                    // [fbowhy] PS2X_FBOWHY=1: the character/ink composite (triangles sampling
+                    // page 336) resolves via the FBO in a WORKING dump and via a stale-VRAM
+                    // decode in a BROKEN one. Report WHICH gate rejects it, per state.
+                    static const bool s_fw = [](){ const char *v = std::getenv("PS2X_FBOWHY");
+                                                   return v && v[0] && v[0] != '0'; }();
+                    if (s_fw && c.isTriangle && !c.isTransfer && (c.srcTbp0 / 32u) == 336u)
+                    {
+                        static unsigned long n = 0;
+                        if ((++n % 20000ul) == 1ul)
+                            std::fprintf(stderr, "[fbowhy] #%lu src=%u sf=%u sfKey=%u dstKey=%u psm=%02x | "
+                                         "zTexBind=%d vramAlias=%d noff=%d srcIndexed=%d alphaOnlyVram=%d "
+                                         "srcUploaded=%d texKey=%d sfKey!=dstKey=%d tbpMatch=%d hasFbo=%d texOk=%d\n",
+                                         n, c.srcTbp0, sf, sfKey, dstKey, (unsigned)c.srcPsm,
+                                         (int)zTexBind, (int)vramAliasRead, (int)s_noff, (int)c.srcIndexed,
+                                         (int)alphaOnlyWantsVram, (int)c.srcUploaded, (int)(c.texKey != 0),
+                                         (int)(sfKey != dstKey), (int)(c.srcTbp0 == sf * 32u),
+                                         (int)g_fbos.count(sfKey),
+                                         (int)(g_fbos.count(sfKey) && g_fbos[sfKey].rt.texture.id != 0));
+                    }
+                    return !zTexBind && !vramAliasRead && !s_noff && !c.srcIndexed && !alphaOnlyWantsVram
+                        && (!c.srcUploaded || destAlphaLerp
+                            || (s_createOnRead && (c.srcPsm == 0x30u || c.srcPsm == 0x31u || c.srcPsm == 0x32u)))
+                        && c.texKey != 0 && sfKey != dstKey && (c.srcTbp0 == sf * 32u)
+                        && g_fbos.count(sfKey) && g_fbos[sfKey].rt.texture.id != 0;
+                 }())
         {
             // Read-after-write fix: for a BIG RT (rendered+sampled same frame), sample its stable
             // COPY (snapshot) instead of the live FBO texture -- sampling the live one corrupts GL.
@@ -12648,6 +13128,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 static int n = 0; if (n < 12) { ++n; std::fprintf(stderr, "[evictdraw] DRAW of just-evicted key: dest f%u srcTbp %u psm %u %dx%d tri=%d\n", c.destFbp, c.srcTbp0, c.srcPsm, c.srcTexW, c.srcTexH, (int)c.isTriangle); }
             }
             auto it = gaServed ? g_glTex.end() : g_glTex.find(c.texKey);   // [gpualias] served draws keep the view texture
+            {   // [hudtrace] stage 1: texture resolved for a HUD-class draw
+                extern unsigned long g_hudTrace[3]; extern bool ps2xHudTraceOn();
+                extern bool g_hudTraceCur;
+                if (ps2xHudTraceOn() && g_hudTraceCur && (gaServed || it != g_glTex.end()))
+                    ++g_hudTrace[1];
+            }
             if (!gaServed && it == g_glTex.end())
             {
                 {   // [supdiag] PS2X_SUPDIAG=1: was this dropped draw's texture one the supersede reclaim freed?
@@ -15250,6 +15736,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
+                    ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                     rlBegin(RL_QUADS);
                     for (int k = 0; k < 4; ++k)
                     {
@@ -15611,6 +16098,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                 rlBegin(RL_QUADS);
                 {   // [emitA] PS2X_CMPWR=1: the vertex alpha actually emitted for the mask composites
                     static const bool s_ea = [](){ const char *v = std::getenv("PS2X_CMPWR"); return v && v[0] && v[0] != '0'; }();
@@ -15997,6 +16485,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     const uint8_t hr = 64 + (uint8_t)(h & 0xBF), hg = 64 + (uint8_t)((h >> 8) & 0xBF), hb = 64 + (uint8_t)((h >> 16) & 0xBF);
                     rlSetTexture(g_white.id);
                     rlCheckRenderBatchLimit(4);
+                    ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                     rlBegin(RL_QUADS);
                     const int q2[4] = {0, 1, 2, 2};
                     for (int k = 0; k < 4; ++k)
@@ -16064,6 +16553,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                     rlCheckRenderBatchLimit(4);
+                    ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                     rlBegin(RL_QUADS);
                     rlColor4ub(255, 255, 255, 255);
                     rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -16313,6 +16803,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
                         rlCheckRenderBatchLimit(4);
+                        ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                         rlBegin(RL_QUADS);
                         const int qd[4] = {0, 1, 2, 2};
                         for (int k = 0; k < 4; ++k) {
@@ -16415,6 +16906,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (tbad) continue;
                 if (et > 0u) rlCheckRenderBatchLimit(4);   // et == 0 was checked above with the region setup
             }
+            ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
             rlBegin(RL_QUADS);
             const int quad[4] = {0, 1, 2, 2};
             // PS2X_TRIWHITE: diagnostic — draw triangles with WHITE vertex color, exposing the raw
@@ -16648,6 +17140,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                        ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -16698,6 +17191,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                        ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                         rlBegin(RL_QUADS);
                         rlColor4ub(255, 255, 255, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -16751,6 +17245,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     // them blocky (pixelated far mountains under DoF). Bilinear smooths the
                     // upscale. Excludes index-as-data reads (idxRt) and mask writers.
                     || (rsN() > 1 && fromFbo && !idxRt && !(c.wsHudApplied && c.fbmsk == 0x00ffffffu))); rlSetTexture(tex.id);
+                        ps2xHudTraceEmit(c.texKey, c.destFbp, c.tri[0].y, c.tri[1].y, c.tri[2].y);   // [hudtrace] stage 2
                         rlBegin(RL_QUADS);
                         rlColor4ub(128, 128, 128, 255);
                         rlNormal3f(0.0f, 0.0f, 1.0f);
@@ -17094,6 +17589,59 @@ if (done.size() < 14 && !done.count(c.texKey))
     // (TEXTURE_FIXES.md fix 5 — conditional drawFBW!=dispFBW re-stride — was tried here
     // 2026-07-31 and reverted: broke rendering in testing, same as the blanket version.)
 
+    {   // [fboprobe] PS2X_FBOPROBE=1: is the HUD actually IN the display FBO at end of frame?
+        // The splitscreen texture loss has the draws provably in the GS stream and every drop
+        // counter at zero, and per-draw tracing proved too easy to get wrong (three filter bugs,
+        // three wrong readings). This asks the only question that matters, of the pixels:
+        //   green pixels present in the FBO's HUD band but absent on screen -> present/composite;
+        //   absent from the FBO too                                        -> the draws did not land.
+        static const bool s_fp = [](){ const char *v = std::getenv("PS2X_FBOPROBE");
+                                       return v && v[0] && v[0] != '0'; }();
+        if (s_fp)
+        {
+            // probe BOTH display buffers: if the HUD is missing from the presented one but
+            // present in its partner, the draws landed in the wrong buffer.
+            // The once-a-second decision must be made ONCE for the pair -- gating inside the
+            // loop let the second buffer reset the timer every frame, so the first never printed.
+            static auto fpT0 = std::chrono::steady_clock::now();
+            const auto fpNow = std::chrono::steady_clock::now();
+            const bool fpDue = std::chrono::duration<double>(fpNow - fpT0).count() >= 1.0;
+            if (fpDue) fpT0 = fpNow;
+            for (uint32_t probeFbp : {0u, 112u})
+            {
+            auto fit = g_fbos.find(probeFbp);
+            if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
+            {
+                // w/h are LOGICAL; glReadPixels works in PHYSICAL pixels, so scale both. (Reading
+                // the logical rect at render scale 4 sampled the wrong 360 rows and reported an
+                // empty HUD band for every frame, including ones where the HUD was plainly there.)
+                const int sc = fit->second.scale > 0 ? fit->second.scale : 1;
+                const int W = fit->second.w * sc, H = fit->second.h * sc;
+                const int bandH = std::min(H, 90 * sc);
+                if (W > 0 && bandH > 0)
+                {
+                    static std::vector<unsigned char> px;
+                    px.resize((size_t)W * bandH * 4);
+                    rlEnableFramebuffer(fit->second.rt.id);
+                    // GS row 0 is the TOP of the buffer; the GL texture is bottom-up.
+                    glReadPixels(0, H - bandH, W, bandH, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px.data());
+                    rlDisableFramebuffer();
+                    unsigned long green = 0, lit = 0;
+                    for (size_t i = 0; i + 3 < px.size(); i += 4)
+                    {
+                        if (px[i+1] > 150 && px[i] < 140 && px[i+2] < 140) ++green;
+                        if (px[i] > 24 || px[i+1] > 24 || px[i+2] > 24) ++lit;
+                    }
+                    if (fpDue)
+                    {
+                        std::fprintf(stderr, "[fboprobe] presented=fbp%u | fbp%u: hudGreen=%lu litPx=%lu\n",
+                                     displayFbp, probeFbp, green, lit);
+                    }
+                }
+            }
+            }
+        }
+    }
     // Diagnostic (PS2X_GPU_DIAG): dump the display FBO once at a settled frame.
     {
         static const bool s_fd = [](){ const char *v = std::getenv("PS2X_GPU_DIAG"); return v && v[0] && v[0] != '0'; }();
@@ -17190,6 +17738,122 @@ if (done.size() < 14 && !done.count(c.texKey))
                     for (auto &kv : g_atlasSlots) std::fprintf(stderr, " fbp%u=(%d,%d,%d,%d)", kv.first, kv.second.x, kv.second.y, kv.second.w, kv.second.h);
                     std::fprintf(stderr, "\n");
                 }
+            }
+        }
+    }
+
+    {   // [f224trace] pair the start-of-block sample with the value at PRESENT, same frame.
+        static const bool s_ft2 = [](){ const char *v = std::getenv("PS2X_F224TRACE");
+                                        return v && v[0] && v[0] != '0'; }();
+        if (s_ft2)
+        {
+            extern double ps2xF224AlphaMean();
+            extern double g_f224Before; extern uint32_t g_f224Gen; extern unsigned long g_f224Draws;
+            extern std::map<std::string, unsigned long> g_f224Writers;
+            if (g_f224Before >= 0.0)
+            {
+                extern double g_f224SrcA;
+                std::fprintf(stderr, "[f224trace] gen=%u draws=%lu alpha atblock=%.1f atpresent=%.1f srcAlpha=%.1f | writers:",
+                             g_f224Gen, g_f224Draws, g_f224Before, ps2xF224AlphaMean(), g_f224SrcA);
+                for (auto &kv : g_f224Writers) std::fprintf(stderr, " %s=%lu", kv.first.c_str(), kv.second);
+                {   extern std::map<std::string, unsigned long> g_f224Who;
+                    if (!g_f224Who.empty())
+                    {   std::fprintf(stderr, "  [f224who]");
+                        for (auto &kv : g_f224Who) std::fprintf(stderr, " | %s x%lu", kv.first.c_str(), kv.second);
+                        std::fprintf(stderr, "\n"); }
+                }
+                {   extern std::vector<double> g_f224Bis;
+                    if (!g_f224Bis.empty())
+                    {   std::fprintf(stderr, "  [f224bisect]");
+                        for (double d : g_f224Bis) std::fprintf(stderr, " %.0f", d);
+                        std::fprintf(stderr, "\n"); }
+                }
+                std::fprintf(stderr, "\n");
+                g_f224Before = -1.0; g_f224Writers.clear();
+            }
+        }
+    }
+
+    {   // [fbolive] PS2X_FBOLIVE=1 (or =<fbp>[,<fbp>...]): once a second, how much content each
+        // named FBO actually HOLDS. The splitscreen loss takes the character + HUD layer while
+        // terrain survives, and both lost classes are composited from a render-target page --
+        // so the question is whether the SOURCE buffer went empty (bug upstream of the composite)
+        // or is full while the composite still draws nothing (bug at the read).
+        static const char *s_fl = std::getenv("PS2X_FBOLIVE");
+        // "0" alone is off; a LIST may legitimately begin with page 0 (the scene buffer), so
+        // test the whole string rather than its first character.
+        if (s_fl && s_fl[0] && std::strcmp(s_fl, "0") != 0)
+        {
+            static auto t0 = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - t0 >= std::chrono::seconds(1))
+            {
+                t0 = now;
+                std::fprintf(stderr, "[fbolive]");
+                const char *q = (std::strcmp(s_fl, "1") == 0) ? "224,336,0,112" : s_fl;
+                for (; *q; )
+                {
+                    char *e = nullptr; unsigned long v = std::strtoul(q, &e, 10);
+                    if (e == q) break;
+                    q = (*e == ',') ? e + 1 : e;
+                    auto fit = g_fbos.find((uint32_t)v);
+                    if (fit == g_fbos.end() || fit->second.rt.texture.id == 0)
+                    { std::fprintf(stderr, " f%lu=none", v); continue; }
+                    Image img = LoadImageFromTexture(fit->second.rt.texture);
+                    const unsigned char *px0 = (const unsigned char *)img.data;
+                    unsigned long n = 0, nz = 0, na = 0; double sl = 0, sa = 0;
+                    if (px0 && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                        for (int y = 0; y < img.height; y += 4)
+                            for (int x = 0; x < img.width; x += 4)
+                            {
+                                const unsigned char *px = px0 + ((size_t)y * img.width + x) * 4;
+                                ++n; const int lum = (px[0] + px[1] + px[2]) / 3;
+                                if (lum > 8) ++nz;
+                                if (px[3] > 8) ++na;
+                                sl += lum; sa += px[3];
+                            }
+                    std::fprintf(stderr, " f%lu=%dx%d lit=%.1f%% a=%.1f%% lum=%.1f al=%.1f", v,
+                                 fit->second.w, fit->second.h,
+                                 n ? 100.0 * (double)nz / (double)n : -1.0,
+                                 n ? 100.0 * (double)na / (double)n : -1.0,
+                                 n ? sl / (double)n : -1.0, n ? sa / (double)n : -1.0);
+                    {   // alpha HISTOGRAM: the mean cannot tell a uniform wash from a gradient,
+                        // and that is exactly the distinction that matters for an INDEX page.
+                        unsigned long h8[8] = {0,0,0,0,0,0,0,0};
+                        if (px0 && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                            for (int y = 0; y < img.height; y += 4)
+                                for (int x = 0; x < img.width; x += 4)
+                                    ++h8[px0[((size_t)y * img.width + x) * 4 + 3] >> 5];
+                        std::fprintf(stderr, " ah=[");
+                        for (int b = 0; b < 8; ++b)
+                            std::fprintf(stderr, "%s%.0f", b ? "," : "", n ? 100.0 * (double)h8[b] / (double)n : 0.0);
+                        std::fprintf(stderr, "]");
+                    }
+                    {   // PS2X_FBOLIVE_DUMP=<dir>: write the ALPHA channel as greyscale every 5 s,
+                        // so a washed index page can be looked at rather than inferred from a mean.
+                        static const char *s_dd = std::getenv("PS2X_FBOLIVE_DUMP");
+                        static int s_tick = 0;
+                        if (s_dd && s_dd[0] && (s_tick % 5) == 0 && px0
+                            && img.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                        {
+                            Image a{}; a.width = img.width; a.height = img.height; a.mipmaps = 1;
+                            a.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                            a.data = RL_MALLOC((size_t)img.width * img.height * 4);
+                            unsigned char *dp = (unsigned char *)a.data;
+                            for (size_t i = 0; i < (size_t)img.width * img.height; ++i)
+                            { const unsigned char al8 = px0[i * 4 + 3];
+                              dp[i*4+0] = dp[i*4+1] = dp[i*4+2] = al8; dp[i*4+3] = 255; }
+                            ImageFlipVertical(&a);
+                            char pth[256];
+                            std::snprintf(pth, sizeof pth, "%s/alpha_f%lu_%04d.png", s_dd, v, s_tick);
+                            ExportImage(a, pth);
+                            RL_FREE(a.data);
+                        }
+                        if (v == 224u) ++s_tick;
+                    }
+                    UnloadImage(img);
+                }
+                std::fprintf(stderr, "\n");
             }
         }
     }

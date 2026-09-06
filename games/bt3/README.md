@@ -48,7 +48,14 @@ built in as defaults): `PS2X_GPU=0` falls back to the software rasterizer,
 `PS2X_DOFZFAR=<z>` tunes the depth-of-field reach (default 200000), and
 `PS2X_NODEFAULTS=1` starts the bare engine with no defaults (debugging); any
 individual `PS2X_*` flag can still be overridden or `=0`-disabled.
-`PS2X_ASYNC_KICK=1` raises average fps but adds 80–157 ms hitch frames — not recommended.
+`PS2X_ASYNC_KICK` runs the VIF/VU1 and GIF work on a worker thread so the guest, the
+geometry pipeline and the GS overlap the way they did on real hardware. **On by default
+since 2026-09-07**; `=0` opts out. It used to be off because it added 80–157 ms hitch
+frames, which is fixed — the guest was seeing every DMA complete instantly and running
+ahead of the work it had queued. Measured on an i5-12400: 22.7 → 29.9 fps in a 1P fight,
+16.8 → 22.6 in splitscreen.
+⚠ If you set `PS2X_ASYNC_KICK=0` in your environment while testing, DELETE the variable to
+get the new default — blanking it is not enough, an empty value still counts as set.
 
 ## How the port stays reproducible
 

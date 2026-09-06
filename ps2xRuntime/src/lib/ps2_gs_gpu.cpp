@@ -2891,6 +2891,32 @@ std::atomic<unsigned long> g_regWriteHist[0x63];   // [rectemplate] state-regist
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    {   // [recdirect] PS2X_GS_RECORD only tapped processGIFPacket, so GS registers written
+        // DIRECTLY -- the kernel draw-environment stubs in Kernel/Stubs/GS.cpp and
+        // Helpers/Support.h call gs().writeRegister() -- never reached the dump. FRAME, ZBUF,
+        // TEST and PRMODECONT arrive that way, so replays of our own dumps ran with a missing
+        // draw environment and diverged from live (measured: a third of the mask build came
+        // out untextured in replay and painted the page white, a class that does not exist
+        // live). Emit each direct write as a one-register PACKED A+D packet so the dump is
+        // self-contained and comparable with a PCSX2 dump.
+        static const bool s_rec = [](){ const char *v = std::getenv("PS2X_GS_RECORD");
+                                        return v && v[0]; }();
+        if (s_rec && t_gsStateHeld == 0)
+        {
+            uint64_t q[4];
+            q[0] = 1ull | (1ull << 15) | (1ull << 60);   // NLOOP=1, EOP, FLG=PACKED, NREG=1
+            q[1] = 0x0Eull;                              // REGS = A+D
+            q[2] = value;
+            q[3] = regAddr;
+            // Path byte 7 = "synthesised from a direct writeRegister". Do NOT use 2 here:
+            // 2 is a REAL GIF path (VIF1 DIRECT), so tagging these 2 made kernel-stub writes
+            // indistinguishable from the EE's DIRECT packets in every offline census.
+            uint8_t hdr[6] = {0u, 7u /*synthetic direct write*/, 0u, 0u, 0u, 0u};
+            const uint32_t nb = (uint32_t)sizeof q;
+            std::memcpy(hdr + 2, &nb, 4);
+            gsRecPush(hdr, 6, reinterpret_cast<const uint8_t *>(q), nb);
+        }
+    }
     auto applyPrimAttrs = [this](uint64_t v)
     {   // [prmode] attribute bits shared by PRIM and PRMODE
         m_prim.iip = ((v >> 3) & 1) != 0; m_prim.tme = ((v >> 4) & 1) != 0; m_prim.fge = ((v >> 5) & 1) != 0;

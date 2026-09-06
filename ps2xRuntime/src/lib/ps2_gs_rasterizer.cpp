@@ -4447,7 +4447,8 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
             {   // [guestprof] DEC = inline texture decode + the upload hand-off
                 gprof::Scope gpScope(gprof::DEC);
                 decodeTexRGBA(gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
-                int upW = subW, upH = texH;
+                int upW = subW, upH = texH, upFmt = 0, upScale = 1;   // [texreplace] upFmt != 0 => compressed DDS
+                float upAlpha = 1.0f;                                 // [texreplace] see PS2X_TEXPACKALPHA
                 {   // [texreplace] Swap in a PCSX2-pack replacement if one exists for this texture.
                     // Sampling is NORMALISED (texture(texture0, uv), not texelFetch), so a 4x
                     // replacement needs no UV rescaling -- just hand putTexture the bigger buffer
@@ -4459,7 +4460,25 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                     // writes rendered pixels to VRAM" (see srcRendered in ps2_gs_gpu_renderer.h),
                     // so render targets never reach this decode path in the first place. If a
                     // profile later shows RT hashing burning guest time, add the check then.
-                    if (GsGpuRenderer::texPackEnabled() && ps2tex::replacementsEnabled())
+                    // NEVER replace a SUB-DECODED texture. With [subdecode] active the upload is
+                    // only a subW-wide horizontal WINDOW of the texture (decodeTexRGBA:
+                    // `subW = src.subDxW ? src.subDxW : texW`) and the pipeline's UVs are set up
+                    // for that slice, so dropping in a full-size replacement rescales it wrongly
+                    // -- visible immediately as stretched/offset art.
+                    // It is also an IDENTITY bug, not just a scaling one: our hash is computed
+                    // from the full TW/TH and encodes no window, whereas PCSX2 distinguishes these
+                    // with its region filename variant ("%llx-%llx-r%ux%u-%08x") which we do not
+                    // implement. So a windowed decode has no correct name for us to look up.
+                    // Also NEVER replace a RAW-ALPHA decode -- an IDENTITY problem: texKey XORs a
+                    // constant for the [rawmask] variant while our PCSX2 identity encodes nothing,
+                    // so both variants would resolve to the SAME replacement file.
+                    // (The alpha RANGE is not the reason. A PCSX2-derived pack is in PS2 range
+                    // just like the raw decode -- measured over 400 matched dump/replacement
+                    // pairs, mean alpha identical and opaque art at exactly 128 in both. That is
+                    // what upAlpha/uAlphaRep below corrects for the NORMAL path, which expands to
+                    // 0..255 on the CPU and would otherwise draw every replacement half-transparent.)
+                    if (GsGpuRenderer::texPackEnabled() && ps2tex::replacementsEnabled()
+                        && g_subDxW == 0 && !rawAlphaDec)
                     {
                         ps2tex::TexIdent id;
                         const bool pal = (ctx.tex0.psm == 19 || ctx.tex0.psm == 20);
@@ -4467,20 +4486,108 @@ bool GSRasterizer::recordSpriteGPU(GS *gs)
                                              ctx.tex0.tw, ctx.tex0.th, pal ? gs->m_clutCache : nullptr,
                                              gs->m_texa.ta0, gs->m_texa.aem, gs->m_texa.ta1, id))
                         {
-                            std::vector<uint8_t> rep; int rw = 0, rh = 0;
-                            if (ps2tex::loadReplacement(id, rep, rw, rh))
+                            std::vector<uint8_t> rep; int rw = 0, rh = 0, rfmt = 0;
+                            const bool found = ps2tex::loadReplacement(id, rep, rw, rh, rfmt);
+                            {   // [texrepdiag] PS2X_TEXREPDIAG=1: every lookup, unthrottled, with the
+                                // palette we hashed -- so a draw that resolves to the WRONG CLUT
+                                // variant is visible as a name mismatch rather than guessed at.
+                                static const bool s_d = [](){ const char *v = std::getenv("PS2X_TEXREPDIAG"); return v && v[0] && v[0] != '0'; }();
+                                if (s_d)
+                                {
+                                    const uint32_t *cl = pal ? gs->m_clutCache : nullptr;
+                                    std::fprintf(stderr, "[texrepdiag] %s %s tbp0=%u psm=%u %dx%d clut[0..3]=%08x %08x %08x %08x clutKey=%llx\n",
+                                                 found ? "HIT " : "MISS", id.name().c_str(), ctx.tex0.tbp0, ctx.tex0.psm, subW, texH,
+                                                 cl ? cl[0] : 0u, cl ? cl[1] : 0u, cl ? cl[2] : 0u, cl ? cl[3] : 0u,
+                                                 (unsigned long long)gs->m_clutCacheKey);
+                                }
+                            }
+                            if (found)
                             {
-                                rgba = std::move(rep); upW = rw; upH = rh;
+                                // The UV path can only express an INTEGER, UNIFORM upscale
+                                // (rsTexScale is an int and one factor covers both axes). Anything
+                                // else would sample wrong, so refuse it rather than render it
+                                // stretched -- a skipped texture is a non-event, a stretched one
+                                // is a visible bug.
+                                const int sX = (subW > 0 && rw % subW == 0) ? rw / subW : 0;
+                                const int sY = (texH > 0 && rh % texH == 0) ? rh / texH : 0;
+                                if (sX <= 0 || sX != sY)
+                                {
+                                    static std::atomic<unsigned long> s_bad{0};
+                                    if (s_bad.fetch_add(1) < 5)
+                                        std::fprintf(stderr, "[texreplace] SKIP %s: %dx%d is not a "
+                                                     "uniform integer upscale of %dx%d\n",
+                                                     id.name().c_str(), rw, rh, subW, texH);
+                                }
+                                else {
+                                // [texreplace] Does the texture we stand in for use alpha as a GATE
+                                // rather than as shading? BT3 drives its partial HUD fills through the
+                                // GS destination-alpha test (verified: those draws carry TEST.DATE=1),
+                                // and our GL stand-in for that is exact only while framebuffer alpha
+                                // stays 0 or 0x80. A pack file is an UPSCALE, so its alpha edges are
+                                // interpolated -- those intermediate values half-open the gate, the
+                                // health bar paints over the "damage taken" wedge, and the bar looks
+                                // like it never drops.
+                                //
+                                // Decide from the NATIVE decode -- which is why this runs BEFORE `rgba`
+                                // is replaced below: if the game's own texture is strictly two-level AND
+                                // uses both levels, its alpha is structural. Real art with a gradient
+                                // fails this test and keeps its soft edges. PS2X_TEXPACKBIN=0 disables.
+                                static const bool s_binOn = [](){ const char *v = std::getenv("PS2X_TEXPACKBIN"); return !(v && v[0] == '0'); }();
+                                bool gateAlpha = false;
+                                if (s_binOn)
+                                {
+                                    bool clear = false, solid = false, mid = false;
+                                    for (size_t i = 3; i < rgba.size(); i += 4)
+                                    {
+                                        const uint8_t a = rgba[i];
+                                        if (a <= 4u)        clear = true;
+                                        else if (a >= 251u) solid = true;
+                                        else              { mid = true; break; }
+                                    }
+                                    gateAlpha = (!mid && clear && solid);
+                                }
+                                // Snapping in the SHADER is not equivalent and does not fix it (tried:
+                                // the gate reads what lands in the framebuffer, not the post-filter
+                                // texel), so rewrite the bytes. That is only possible while they are
+                                // plain RGBA8 -- a BC3 payload would have to be decompressed first, and
+                                // there is no decoder here. For a compressed one, keep the game's own
+                                // texture: a native-resolution gauge is right, an upscaled one that
+                                // breaks the health bar is not.
+                                if (gateAlpha && rfmt != 0)
+                                {
+                                    static std::atomic<unsigned long> s_skip{0};
+                                    if (s_skip.fetch_add(1) < 5)
+                                        std::fprintf(stderr, "[texreplace] SKIP %s: alpha is a DATE gate and the "
+                                                     "replacement is compressed (fmt %d) -- keeping the native decode\n",
+                                                     id.name().c_str(), rfmt);
+                                }
+                                else {
+                                if (gateAlpha)
+                                    for (size_t i = 3; i < rep.size(); i += 4)
+                                        rep[i] = (uint8_t)((std::min<unsigned>(rep[i] * 255u / 128u, 255u) >= 128u) ? 255u : 0u);
+                                rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = sX;
+                                // [texreplace] Alpha range. decodeTexRGBA expanded PS2 alpha
+                                // (0x80 == opaque) to 0..255 via kAlpha128To255, but these bytes
+                                // came straight out of the pack and skipped that -- and a
+                                // PCSX2-derived pack is itself in PS2 range. Hand the shader the
+                                // rescale instead of doing it here: most of a real pack is BC3,
+                                // whose alpha cannot be rewritten without decompressing it.
+                                // PS2X_TEXPACKALPHA=1 for a pack authored in full 0..255 range.
+                                static const float s_packA = [](){ const char *v = std::getenv("PS2X_TEXPACKALPHA");
+                                                                  return (v && v[0]) ? (float)std::atof(v) : 255.0f / 128.0f; }();
+                                upAlpha = s_packA;
                                 static std::atomic<unsigned long> s_hits{0};
                                 const unsigned long k = s_hits.fetch_add(1) + 1ul;
                                 if (k <= 5 || (k % 100ul) == 0ul)
-                                    std::fprintf(stderr, "[texreplace] hit #%lu %s -> %dx%d\n",
-                                                 k, id.name().c_str(), rw, rh);
+                                    std::fprintf(stderr, "[texreplace] hit #%lu %s -> %dx%d (%dx)\n",
+                                                 k, id.name().c_str(), rw, rh, sX);
+                                }
+                                }
                             }
                         }
                     }
                 }
-                r.putTexture(texKey, std::move(rgba), upW, upH, texPageLo, texPageHi);
+                r.putTexture(texKey, std::move(rgba), upW, upH, texPageLo, texPageHi, upFmt, upScale, upAlpha);
             }
             if (s_dcs)
             {

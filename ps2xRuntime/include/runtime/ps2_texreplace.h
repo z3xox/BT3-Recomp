@@ -40,6 +40,10 @@ namespace ps2tex
     // Look up a replacement for `id` and decode it to RGBA8. Matches on the HASH PAIR only --
     // the bits field is advisory (a real pack was built by an older PCSX2 whose TEXA convention
     // differs, so an exact-name match would silently find nothing). Returns false if absent.
-    bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h);
+    // `fmt` returns the raylib PixelFormat: RGBA8 for PNG (and uncompressed DDS), or a
+    // PIXELFORMAT_COMPRESSED_* for a BC-compressed DDS, which the GL upload hands to
+    // glCompressedTexImage2D unchanged. Keeping it compressed is the whole point: a 4x PNG
+    // replacement costs 16x the original's VRAM, where BC1 is 4:1 on top of that.
+    bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt);
 }
 #endif

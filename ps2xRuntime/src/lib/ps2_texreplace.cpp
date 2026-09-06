@@ -154,7 +154,8 @@ namespace
         {
             if (!it->is_regular_file(ec)) continue;
             const std::string stem = it->path().stem().string();
-            if (it->path().extension() != ".png") continue;
+            const std::string ext = it->path().extension().string();
+            if (ext != ".png" && ext != ".dds" && ext != ".DDS") continue;
             // "<tex0hash>-<cluthash>-<bits>" or "<tex0hash>-<bits>" (no palette).
             unsigned long long a = 0, b = 0; unsigned bits = 0;
             const char *cs = stem.c_str();
@@ -181,7 +182,7 @@ bool replacementsEnabled()
     return g_on;
 }
 
-bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h)
+bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt)
 {
     if (!replacementsEnabled()) return false;
     auto it = g_index.find(pairKey(id.tex0Hash, id.hasClut ? id.clutHash : 0ull));
@@ -191,10 +192,18 @@ bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int
     // decoding happens on the guest thread.
     Image img = LoadImage(it->second.c_str());
     if (img.data == nullptr || img.width <= 0 || img.height <= 0) { UnloadImage(img); return false; }
-    ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
-    w = img.width; h = img.height;
-    const size_t bytes = (size_t)w * (size_t)h * 4u;
-    rgba.assign((const uint8_t *)img.data, (const uint8_t *)img.data + bytes);
+
+    // KEEP a compressed DDS compressed. ImageFormat() silently REFUSES to convert compressed
+    // input (rtextures.c only converts when both formats are < PIXELFORMAT_COMPRESSED_DXT1_RGB),
+    // so calling it on BC data would no-op and we would then copy compressed bytes as if they
+    // were RGBA8 -- garbage textures with no error. Pass the format through instead and let
+    // rlLoadTexture route it to glCompressedTexImage2D.
+    const bool isCompressed = (img.format >= PIXELFORMAT_COMPRESSED_DXT1_RGB);
+    if (!isCompressed) ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    w = img.width; h = img.height; fmt = img.format;
+    const int bytes = GetPixelDataSize(w, h, img.format);
+    if (bytes <= 0) { UnloadImage(img); return false; }
+    rgba.assign((const uint8_t *)img.data, (const uint8_t *)img.data + (size_t)bytes);
     UnloadImage(img);
     return true;
 }

@@ -364,7 +364,7 @@ public:
 
     bool revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi,
                            const uint8_t *vram, uint32_t vramSize);
-    void putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi);
+    void putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt = 0, int texScale = 1, float alphaScale = 1.0f);
     void recordCmd(const DrawCmd &cmd);
     // [drawbatch] ---- plain-class triangle batching (guest thread only) ----
     // Batching lives entirely in the guest-owned staging buffer (PS2X_RECSTAGE > 0, the default):
@@ -417,8 +417,20 @@ public:
 private:
     struct CachedTex
     {
-        std::vector<uint8_t> rgba;  // linear RGBA8, w*h*4
+        std::vector<uint8_t> rgba;  // linear RGBA8 w*h*4, OR compressed blocks when fmt != RGBA8
         int w = 0, h = 0;
+        // [texreplace] raylib PixelFormat. RGBA8 for everything the GS decoder produces; a DDS
+        // replacement can be BC1/BC3/BC7, which rlLoadTexture uploads via glCompressedTexImage2D.
+        // 0 means "unset" -> treated as RGBA8.
+        int fmt = 0;
+        // [texreplace] Integer upscale factor of a replacement vs the LOGICAL PS2 texture.
+        // The GL path computes UVs as (logical texel) / (gl_size / rsTexScale), so a 4x
+        // replacement uploaded with scale 1 makes the divisor 4x too large and only the top-left
+        // quarter is sampled, magnified. Registering the scale is what makes hi-res line up.
+        int texScale = 1;
+        // [texreplace] Alpha-range rescale handed to the shader (uAlphaRep). 255/128 for a
+        // pack replacement, whose bytes bypass the decoder's kAlpha128To255 expansion; else 1.
+        float alphaScale = 1.0f;
         bool needsUpload = false;
         unsigned int glId = 0;      // GL texture id (present thread only)
         uint32_t decodeSeq = 0;     // m_writeSeq at decode time

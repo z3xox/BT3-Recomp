@@ -653,6 +653,14 @@ namespace
     unsigned long g_hashMemoHit = 0, g_hashMemoCompute = 0, g_hashMemoChecked = 0, g_hashMemoMiss = 0;   // [hashmemo]
     std::unordered_set<unsigned> g_deletedIds; unsigned long g_idReuse = 0;   // [supdiag] GL ids we deleted; reuse counter
     std::unordered_map<uint64_t, std::vector<Texture2D>> g_texPool; // (w<<32|h) -> free GL textures
+    // [texreplace] The pool is keyed by SIZE ALONE, and every reuse path writes it with
+    // UpdateTexture (glTexSubImage2D) from a w*h*4 RGBA8 buffer. A compressed DDS replacement
+    // therefore must never enter it: retire a 1024x1024 DXT5 texture into the pool and the next
+    // ordinary 1024x1024 upload pops it, calls UpdateTexture on BC3 storage, and raylib refuses
+    // it -- "Failed to update for current texture format (17)". The upload is silently dropped
+    // and the draw keeps the previous replacement's pixels, which is the wrong-texture-on-some-
+    // faces artifact (stage rocks: the faces that got a recycled object, not the ones that did not).
+    bool poolableTex(const Texture2D &t) { return t.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8; }
     uint32_t g_texUseGen = 0;
     inline uint64_t texPoolKey(int w, int h) { return (static_cast<uint64_t>(w) << 32) | static_cast<uint32_t>(h); }
 
@@ -810,6 +818,22 @@ namespace
     std::unordered_map<unsigned, int> g_rsTexScale;   // texture id -> scale (scaled FBOs only)
     std::unordered_map<unsigned, uint32_t> g_rsTexFbo;   // texture id -> fbp (scaled FBOs only)
     int rsTexScale(unsigned id) { auto it = g_rsTexScale.find(id); return it == g_rsTexScale.end() ? 1 : it->second; }
+    // [texreplace] texture id -> alpha-range rescale (255/128 for pack replacements). Keyed by GL
+    // id like g_rsTexScale and cleared on the same paths, so a recycled id cannot inherit a
+    // previous replacement's alpha scale.
+    using AlphaFix = std::array<float, 2>;   // {scale, snap}
+    std::unordered_map<unsigned, AlphaFix> g_texAlphaFix;
+    AlphaFix texAlphaFix(unsigned id) { auto it = g_texAlphaFix.find(id); return it == g_texAlphaFix.end() ? AlphaFix{1.0f, 0.0f} : it->second; }
+    // [texprops] Drop every id-keyed texture property when the GL id DIES. ps2xForgetTexId
+    // clears the filter/wrap/swizzle caches but not these, and GL reissues a deleted id to the
+    // next texture or FBO created -- which then inherits the dead texture's UV divisor. At
+    // render scale 1 an FBO registers no scale of its own, so nothing overwrites the stale
+    // entry and its render target is sampled with 4x-wrong UVs: seams at every tile boundary
+    // of the post-process composite, i.e. a grid over the whole frame.
+    //
+    // Latent until [texreplace]: replacements were the first textures to carry a scale, and
+    // while compressed ones were (wrongly) recycled through g_texPool their ids never died.
+    void forgetTexProps(unsigned id) { g_rsTexScale.erase(id); g_rsTexFbo.erase(id); g_texAlphaFix.erase(id); }
     // Rebind READ framebuffer to a 1x staging copy (area-downsampled) so logical-coordinate
     // glReadPixels reads stay exact for scaled FBOs.
     const RenderTexture2D &rsDownsampled(const Fbo &f)
@@ -905,7 +929,7 @@ namespace
         }
         if (f.w != w || f.h != h || f.rt.texture.id == 0)
         {
-            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
+            if (f.rt.texture.id != 0) { g_rsTexScale.erase(f.rt.texture.id); g_texAlphaFix.erase(f.rt.texture.id); ps2xForgetRtTexId(f.rt.texture.id); UnloadRenderTexture(f.rt); }
             const int rsA = rsScaledFbp(fbp) ? rsN() : 1;
             const int wA = w * rsA, hA = h * rsA;
             // PS2X_NODEPTH_RT: create COLOR-ONLY FBOs (no depth renderbuffer). raylib's
@@ -1042,6 +1066,28 @@ namespace
     bool g_shaderInit = false;
     int g_locAtst = -1, g_locAref = -1; // GS alpha-test uniforms in g_shader
     int g_locTcc = -1;                  // GS TEX0.TCC
+    int g_locAlphaFix = -1;             // [texreplace] replacement alpha rescale + two-level snap
+    AlphaFix g_curAlphaFix{1.0f, 0.0f}; // [texreplace] last value pushed to uAlphaFix
+    // [texreplace] Push uAlphaFix for the texture about to be BOUND -- a pack replacement is
+    // uploaded raw and still carries PS2 alpha (0x80 == opaque) while everything the GS decoder
+    // produced was already expanded to 0..255 on the CPU, so the rescale is per-texture.
+    //
+    // MUST be called BEFORE rlSetTexture, never after. rlDrawRenderBatchActive() ends by
+    // resetting every batch draw to RLGL.State.defaultTextureId, so a flush issued after the
+    // bind throws the binding away and the draw samples the 1x1 white default instead: black
+    // characters and stray white triangles. Flushing here is correct -- the queued vertices
+    // belong to the previous texture AND the previous uAlphaFix.
+    //
+    // Called at EVERY site that binds a decoded texture (the emit path has nine), because a
+    // stale scale would otherwise leak from a replacement draw into the next ordinary one.
+    void applyAlphaFix(unsigned texId)
+    {
+        const AlphaFix want = texAlphaFix(texId);
+        if (want == g_curAlphaFix || g_locAlphaFix < 0) return;
+        rlDrawRenderBatchActive();
+        SetShaderValue(g_shader, g_locAlphaFix, want.data(), SHADER_UNIFORM_VEC2);
+        g_curAlphaFix = want;
+    }
     int g_locPal = -1;                  // 256x1 CLUT sampler for indexed RT reads
     int g_locIdxMode = -1;              // >0.5: index comes from the FBO alpha
     int g_locFba = -1;                  // GS FBA: force bit 7 of the STORED alpha
@@ -1127,6 +1173,15 @@ namespace
         "uniform float uTfx;\n"   // GS TEX0.TFX: 0=MODULATE 1=DECAL
         "uniform float uProjClip;\n" // shadow decal: discard outside the projection
         "uniform float uAScale;\n" // 128/255: store alpha as a GS byte, not an opacity
+        // [texreplace] Alpha-range rescale for REPLACEMENT textures. The GS decoder expands PS2
+        // alpha (0x80 == opaque) to 0..255 on the CPU via kAlpha128To255, but a pack file is
+        // uploaded byte-for-byte and never passes through it -- and PCSX2-derived packs are in
+        // PS2 range: measured over 400 matched dump/replacement pairs, the mean alpha is
+        // IDENTICAL and opaque art sits at exactly 128 in both. Without this every replacement
+        // draws at half opacity, which is the uniform wash over the whole title screen.
+        // Must be a uniform, not a load-time fixup: the pack is 18,700 DXT5 files and BC3 alpha
+        // cannot be rewritten without decompressing it.
+        "uniform vec2 uAlphaFix;\n"   // x = alpha scale (255/128 for a replacement); y reserved
         "uniform float uAtst;\n"
         "uniform float uAref;\n"
         "layout(location = 0, index = 0) out vec4 finalColor;\n"
@@ -1158,6 +1213,10 @@ namespace
         "  if (uProjClip > 0.5 && (stq.x < 0.0 || stq.x > 1.0 ||\n"
         "                          stq.y < 0.0 || stq.y > 1.0)) discard;\n"
         "  vec4 t = texture(texture0, stq);\n"
+        // [texreplace] see uAlphaFix. Applied to the raw sample: a replacement is never an
+        // indexed (uIdxMode) or render-target (uFboOne/uTexa.w) source, so none of the alpha
+        // branches below overwrite it, and at the default 1.0 the min() is a no-op.
+        "  t.a = min(t.a * uAlphaFix.x, 1.0);\n"
         // uZTex: texture0 is the real DEPTH texture (PS2X_ZTEX). GL returns depth in .r; BT3's
         // depth->alpha pass wants that value in ALPHA, so broadcast it.
         // GL depth is normalised; BT3 wants the GS Z BYTE its pass extracts. Console's
@@ -3698,6 +3757,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     // needs -- a stale TCC=0 makes the quad paint solid vertex colour over the whole page.
     { const float one = 1.0f, zero = 0.0f;
       if (g_locTcc >= 0)      SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT);
+      if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
       if (g_locIdxMode >= 0)  SetShaderValue(g_shader, g_locIdxMode, &zero, SHADER_UNIFORM_FLOAT);
       if (g_locUViz >= 0)     SetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
       if (g_locSubScale >= 0) SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
@@ -4008,7 +4068,7 @@ bool GsGpuRenderer::revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pa
 }
 
 std::atomic<unsigned long> g_texDecodeCount{0};   // [decodes] real texture decodes (putTexture calls), fps line + replaybench
-void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi)
+void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt, int texScale, float alphaScale)
 {
     g_texDecodeCount.fetch_add(1u, std::memory_order_relaxed);
     {   // [decodecensus] PS2X_DECCENSUS=1: which textures get re-decoded, by (first page, w, h); top 8 every 2 s
@@ -4080,6 +4140,9 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     ct.rgba = std::move(rgba);
     ct.w = w;
     ct.h = h;
+    ct.fmt = fmt;   // [texreplace] 0 = RGBA8; non-zero = a compressed DDS replacement
+    ct.texScale = texScale;
+    ct.alphaScale = alphaScale;   // [texreplace]
     ct.decodeSeq = m_writeSeq;
     ct.needsUpload = true;
     m_upQueue.push_back(key);   // [upqueue] O(1) here instead of an O(cache) scan per chunk render
@@ -6388,6 +6451,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
         g_locAtst = GetShaderLocation(g_shader, "uAtst");
         g_locAref = GetShaderLocation(g_shader, "uAref");
         g_locTcc  = GetShaderLocation(g_shader, "uTcc");
+        g_locAlphaFix = GetShaderLocation(g_shader, "uAlphaFix");
         { int l2 = GetShaderLocation(g_shader, "uASplit");
           const float v2 = [](){ const char *v = std::getenv("PS2X_ASPLIT");
                                  return (v && v[0] && v[0] != '0') ? 1.0f : 0.0f; }();
@@ -6453,6 +6517,7 @@ void GsGpuRenderer::ensureGl(int w, int h)
         // to an invalid location segfaulted the game.
         if (g_locTcc >= 0) { float one = 1.0f; SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT); }
         else std::fprintf(stderr, "[shader] WARNING uTcc not found -- TCC handling inactive\n");
+        if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }
         float off = -1.0f, aref0 = 0.0f;
         SetShaderValue(g_shader, g_locAtst, &off, SHADER_UNIFORM_FLOAT);
         SetShaderValue(g_shader, g_locAref, &aref0, SHADER_UNIFORM_FLOAT);
@@ -6617,7 +6682,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         {   // [unloadmode] PS2X_UNLOADMODE: 1 delete (default), 0 leak (never delete), 2 flush the batch + glFinish before deleting
             static const int s_um = [](){ const char *v = std::getenv("PS2X_UNLOADMODE"); return v ? std::atoi(v) : 1; }();
             if (s_um == 2 && !g_pendingUnload.empty()) { rlDrawRenderBatchActive(); glFlush(); }   // [fencesync] UnloadTexture is driver-refcounted while in use; a full glFinish drain served no purpose
-            if (s_um != 0) for (Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); UnloadTexture(t); }
+            if (s_um != 0) for (Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); forgetTexProps(t.id); UnloadTexture(t); }
         }
         g_pendingUnload.clear();
     }
@@ -6660,7 +6725,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
         }
     } segSwapBack{this, cmds, m_chunkMode ? m_chunk : m_building, m_segMode, m_segMode && !m_chunkMode};
-    struct PendingUp { uint64_t key = 0; std::vector<uint8_t> rgba; int w = 0, h = 0; };   // [uploadout]
+    struct PendingUp { uint64_t key = 0; std::vector<uint8_t> rgba; int w = 0, h = 0; int fmt = 0; int texScale = 1; float alphaScale = 1.0f; };   // [uploadout]
     static std::vector<PendingUp> s_ups;
     ragStat.phase(1);
     std::vector<DrawCmd> prevCmds;
@@ -6772,9 +6837,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 auto qit = m_texCache.find(qk);
                 if (qit == m_texCache.end()) continue;
                 CachedTex &ct = qit->second;
-                if (!ct.needsUpload || ct.w <= 0 || ct.rgba.size() < (size_t)ct.w * ct.h * 4)
+                // [texreplace] the w*h*4 guard only applies to RGBA8; a compressed DDS block
+                // payload is far SMALLER than that (BC1 is w*h/2) and would be rejected.
+                if (!ct.needsUpload || ct.w <= 0 ||
+                    (ct.fmt ? ct.rgba.empty() : ct.rgba.size() < (size_t)ct.w * ct.h * 4))
                     continue;   // duplicate queue entry or invalid: the flag is the truth
-                PendingUp u; u.key = qk; u.w = ct.w; u.h = ct.h; u.rgba.swap(ct.rgba);
+                PendingUp u; u.key = qk; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.rgba.swap(ct.rgba);
                 ct.needsUpload = false;
                 spent += u.rgba.size();
                 s_ups.push_back(std::move(u));
@@ -6786,9 +6854,10 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         for (auto &kv : m_texCache)
         {
             CachedTex &ct = kv.second;
-            if ((!ct.needsUpload && !s_reup) || ct.w <= 0 || ct.rgba.size() < (size_t)ct.w * ct.h * 4)
+            if ((!ct.needsUpload && !s_reup) || ct.w <= 0 ||
+                (ct.fmt ? ct.rgba.empty() : ct.rgba.size() < (size_t)ct.w * ct.h * 4))
                 continue;
-            PendingUp u; u.key = kv.first; u.w = ct.w; u.h = ct.h; u.rgba.swap(ct.rgba);
+            PendingUp u; u.key = kv.first; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.rgba.swap(ct.rgba);
             ct.needsUpload = false;
             s_ups.push_back(std::move(u));
         }
@@ -6933,7 +7002,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                             {   // same disposal as the eviction: recycle through the pool when it is on, else delete
                                 static const bool s_poolR = [](){ const char *v = std::getenv("PS2X_TEXPOOL"); return !(v && v[0] == '0'); }();
                                 auto &pool = g_texPool[texPoolKey(g->second.width, g->second.height)];
-                                if (s_poolR && pool.size() < 8) pool.push_back(g->second);
+                                if (s_poolR && poolableTex(g->second) && pool.size() < 8) pool.push_back(g->second);   // [texreplace] never pool compressed
                                 else g_pendingUnload.push_back(g->second);   // drain forgets the id before deleting
                                 g_glTex.erase(g);
                             }
@@ -7112,12 +7181,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     auto g = g_glTex.find(k);
                     if (g != g_glTex.end())
                     {
-                        if (s_noPool) { ps2xForgetTexId(g->second.id); UnloadTexture(g->second); }
+                        if (s_noPool) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); }
                         else
                         {
                             auto &pool = g_texPool[texPoolKey(g->second.width, g->second.height)];
-                            if (pool.size() < 8) pool.push_back(g->second);
-                            else { ps2xForgetTexId(g->second.id); UnloadTexture(g->second); }
+                            if (poolableTex(g->second) && pool.size() < 8) pool.push_back(g->second);   // [texreplace] never pool compressed
+                            else { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); }
                         }
                         g_glTex.erase(g);
                     }
@@ -7177,17 +7246,37 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // [uploadout] GL uploads outside m_mtx, then hand the bytes back.
     auto glUploadOne = [&](PendingUp &u)   // [deferdec] also used mid-loop for a just-decoded texture
     {
+        // [texreplace] Per-GL-id properties a REPLACEMENT carries and an ordinary decoded
+        // texture does not: its integer upscale (UV divisor) and its alpha range (uAlphaFix).
+        // Both must be (re)stamped on EVERY upload path, not just fresh allocation -- a GL id
+        // is recycled by the pool and by the driver, so a stale entry would make an ordinary
+        // texture inherit a previous replacement's scale or half-alpha. Erase when 1/1.0f so
+        // the maps stay small and lookups fall through to the defaults.
+        auto stampTexProps = [](unsigned id, const PendingUp &up)
         {
+            if (up.texScale > 1) g_rsTexScale[id] = up.texScale;
+            else                 g_rsTexScale.erase(id);
+            if (up.alphaScale != 1.0f) g_texAlphaFix[id] = AlphaFix{up.alphaScale, 0.0f};
+            else                                             g_texAlphaFix.erase(id);
+        };
+        {
+            // [texreplace] UpdateTexture (glTexSubImage2D) and the size-keyed pool below both
+            // assume an uncompressed RGBA8 payload, so a compressed replacement must always take
+            // the fresh-allocation path -- rlLoadTexture routes it to glCompressedTexImage2D.
+            const bool compressed = (u.fmt != 0 && u.fmt != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
             auto glIt = g_glTex.find(u.key);
-            if (glIt != g_glTex.end() && glIt->second.width == u.w && glIt->second.height == u.h)
+            if (!compressed && glIt != g_glTex.end() && poolableTex(glIt->second)   // [texreplace] BC3 storage cannot take a glTexSubImage2D
+                && glIt->second.width == u.w && glIt->second.height == u.h)
             {
                 UpdateTexture(glIt->second, u.rgba.data());
+                stampTexProps(glIt->second.id, u);
             }
             else
             {
                 if (glIt != g_glTex.end())
                 {   // [filtercache] the GL id may be reused by the next allocation: drop its filter-state entry
                     ps2xForgetTexId(glIt->second.id);
+                    forgetTexProps(glIt->second.id);   // [texprops] the id is about to be reissued
                     UnloadTexture(glIt->second);
                 }
                 Image img{};
@@ -7195,12 +7284,12 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 img.width = u.w;
                 img.height = u.h;
                 img.mipmaps = 1;
-                img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                img.format = u.fmt ? u.fmt : PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;   // [texreplace]
                 // Recycle a same-size GL texture from the pool (avoids a fresh glTexImage2D
                 // alloc every fade frame); else allocate one.
                 Texture2D t{};
                 static const bool s_poolOn = [](){ const char *v = std::getenv("PS2X_TEXPOOL"); return !(v && v[0] == '0'); }();   // [nopool] default ON again: the pool-off "fix" only dodged the [idreuse] bug
-                auto pit = s_poolOn ? g_texPool.find(texPoolKey(u.w, u.h)) : g_texPool.end();
+                auto pit = (s_poolOn && !compressed) ? g_texPool.find(texPoolKey(u.w, u.h)) : g_texPool.end();
                 if (pit != g_texPool.end() && !pit->second.empty())
                 {
                     t = pit->second.back();
@@ -7211,11 +7300,17 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                     // frames rendered the same texture point- vs bilinear-sampled (menu/copyright
                     // "shimmer": f0 smooth, f112 quantized). Force a re-apply.
                     g_texFilterState.erase(t.id);
+                    stampTexProps(t.id, u);
                 }
                 else
                 {
                     t = LoadTextureFromImage(img);
                 ps2xForgetTexId(t.id);   // [filtercache] a recycled GL id must not inherit the previous object's filter state
+                // [texreplace] Register the replacement's upscale so the UV math treats su/sv as
+                // LOGICAL texels: the draw path computes u = su / (tw / rsTexScale), so without
+                // this a 4x texture makes the divisor 4x too big and only the top-left quarter is
+                // sampled, magnified. Alpha range goes with it -- see stampTexProps.
+                stampTexProps(t.id, u);
                     if (g_deletedIds.count(t.id)) { ++g_idReuse; g_deletedIds.erase(t.id); }   // [supdiag]
                     SetTextureFilter(t, TEXTURE_FILTER_POINT);
                     g_texFilterState.set(t.id, 0u);   // [filtercache] known state
@@ -7279,7 +7374,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if (it == m_texCache.end())
             {   // entry reclaimed/evicted meanwhile: drop the GL object we just made
                 auto g = g_glTex.find(u.key);
-                if (g != g_glTex.end()) { ps2xForgetTexId(g->second.id); UnloadTexture(g->second); g_glTex.erase(g); }
+                if (g != g_glTex.end()) { ps2xForgetTexId(g->second.id); forgetTexProps(g->second.id); UnloadTexture(g->second); g_glTex.erase(g); }
             }
             else if (!it->second.needsUpload && it->second.rgba.empty())
                 it->second.rgba.swap(u.rgba);   // no newer decode arrived: restore the bytes
@@ -9544,6 +9639,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         // happened. Pin the uniforms this draw needs.
                         { const float one = 1.0f, zero = 0.0f;
                           if (g_locTcc >= 0)      SetShaderValue(g_shader, g_locTcc, &one, SHADER_UNIFORM_FLOAT);
+                          if (g_locAlphaFix >= 0) { const AlphaFix d{1.0f, 0.0f}; SetShaderValue(g_shader, g_locAlphaFix, d.data(), SHADER_UNIFORM_VEC2); g_curAlphaFix = d; }   // [texreplace]
                           if (g_locIdxMode >= 0)  SetShaderValue(g_shader, g_locIdxMode, &zero, SHADER_UNIFORM_FLOAT);
                           if (g_locUViz >= 0)     SetShaderValue(g_shader, g_locUViz, &zero, SHADER_UNIFORM_FLOAT);
                           if (g_locSubScale >= 0) SetShaderValue(g_shader, g_locSubScale, &one, SHADER_UNIFORM_FLOAT);
@@ -10628,7 +10724,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             // placement both verified identity, snapshot vs live FBO 0.00%), but the state it
             // left behind for the draws after it.
             curSx = curSy = curSw = curSh = -999999;
-            curBlendOn = -1; curBlendEq = -1; curTcc = -1.0f; curDepthFunc = -1;
+            curBlendOn = -1; curBlendEq = -1; curTcc = -1.0f; curDepthFunc = -1; g_curAlphaFix = AlphaFix{-1.0f, -1.0f};
             continue;
         }
         applyBlend(c); // GS ALPHA-reg-aware: opaque / standard-alpha / FIX-opaque / subtractive
@@ -15739,6 +15835,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                     }
                 }
+                applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
                     // [datebin] snap binarizes the gate before every gated draw now, so
@@ -16102,6 +16199,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                     }
                 }
+                applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
                     // [datebin] snap binarizes the gate before every gated draw now, so
@@ -16325,6 +16423,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                     }
                 }
+            applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
             ps2xApplyTexFilter(tex, c.bilinear);
         if (c.destFbp == 224u && c.texKey != 0) g_f224Mark = 40;
             {   // [emit224] PS2X_REACH=1: does a textured fbp224 draw reach the actual GL call?
@@ -16556,6 +16655,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                     }
                 }
+                applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
                     // [datebin] snap binarizes the gate before every gated draw now, so
@@ -16806,6 +16906,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                     }
                 }
+                applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
                     // [datebin] snap binarizes the gate before every gated draw now, so
@@ -16869,6 +16970,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 }
             }
             if (c.texKey != 0 && c.srcTbp0 >= 13000u && c.srcTbp0 < 14100u) ++g_charSingleN;
+            applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
             ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
                     // [datebin] snap binarizes the gate before every gated draw now, so
@@ -17144,6 +17246,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                     }
                 }
+                applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
                     // [datebin] snap binarizes the gate before every gated draw now, so
@@ -17195,6 +17298,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                     }
                 }
+                applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
                     // [datebin] snap binarizes the gate before every gated draw now, so
@@ -17249,6 +17353,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                     }
                 }
+                applyAlphaFix(tex.id);   // [texreplace] BEFORE the bind -- see applyAlphaFix
                 ps2xApplyTexFilter(tex, c.bilinear
                     // [maskpoint] narrowed back to the alpha-only MASK writers: the per-draw
                     // [datebin] snap binarizes the gate before every gated draw now, so

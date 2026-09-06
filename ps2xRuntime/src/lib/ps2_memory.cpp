@@ -1308,7 +1308,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     // injected junk shifted the VIF stream and the unpacker consumed DMA tags as
                     // matrix rows -> saturated SPS wedges/slashes over the arena.
                     const bool tteEnabled = (chcr & (1u << 6)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // [chaincap] Runaway guard on how many DMA chain tags we follow. It was
+                    // 4096 and it exited SILENTLY, discarding the rest of the frame. BT3's
+                    // splitscreen fight exceeds 4096 tags once the fighters separate (~4600
+                    // truncations in one retreat) and the game draws its HUD as the LAST pass of
+                    // the frame (measured: kicks 99.7%-99.9% through), so the dropped tail took
+                    // the HUD, its CLUT uploads and the ink with it -- 0 HUD draws in 27 frames
+                    // where console emits them in 273/273 frames of the same retreat. Raised to
+                    // 65536 (still far above any legitimate chain) and a truncation now logs.
+                    // PS2X_MAXCHAINTAGS=<n> overrides, e.g. =4096 to reproduce the old behaviour.
+                    static const int kMaxChainTags = [](){ const char *v = std::getenv("PS2X_MAXCHAINTAGS");
+                                                           const int n = v && v[0] ? std::atoi(v) : 0;
+                                                           return (n > 0) ? n : 65536; }();
                     // Pre-size to the recent high-water mark: the chain assembly appends ~430
                     // tag payloads/kick and, starting from an empty vector, reallocated ~20x
                     // per kick (each realloc copies the whole growing buffer + malloc/free) --
@@ -1856,6 +1867,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+                    struct ChainCapWarn {
+                        const int &n; const int cap;
+                        ~ChainCapWarn() {
+                            if (n >= cap) {
+                                static unsigned long hits = 0;
+                                if ((++hits % 200ul) == 1ul)
+                                    std::fprintf(stderr, "[chaincap] DMA chain TRUNCATED at %d tags "
+                                                 "(hit #%lu) -- the tail of the frame was dropped\n", cap, hits);
+                            }
+                        }
+                    } _ccw{tagsProcessed, kMaxChainTags};
 
                     while (tagsProcessed < kMaxChainTags)
                     {

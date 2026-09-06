@@ -11,6 +11,14 @@ extern std::atomic<uint64_t> g_guestThreadCpuNs;
 // [framegate] vsync tick source, declared at file scope for the same reason as the above.
 namespace ps2_syscalls { uint64_t GetCurrentVSyncTick(); }
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
+
+// [guestbusy-tid] FILE SCOPE, not inside bt3FrameKick. Declaring this extern "C" inside a function
+// body -- which sits in this file's anonymous namespace -- builds silently on Linux clang and
+// FAILS on clang-cl, which is how the Windows build broke at 2026-09-06 23:0x. Same rule as
+// g_guestThreadCpuNs above and the note in bt3-windows-build: file-scope externs go at file scope.
+#if defined(_WIN32)
+extern "C" unsigned long long ps2xWinThreadCpuNs();
+#endif
 #include "ps2_runtime_calls.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -30,6 +38,8 @@ extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy 
 #include <set>
 #include <atomic>
 #include <chrono>
+#include <thread>   // [framegate] std::this_thread::sleep_for
+#include <ctime>    // [guestbusy-tid] clock_gettime on POSIX
 #include <optional>
 #include <vector>
 #include <unordered_map>
@@ -3895,7 +3905,6 @@ namespace
             // it always runs on the guest thread -- unlike swapFrame, which moves to the kick worker
             // under PS2X_ASYNC_KICK and made guest_ms measure the wrong thread there.
 #if defined(_WIN32)
-            extern "C" unsigned long long ps2xWinThreadCpuNs();
             g_guestThreadCpuNs.store((uint64_t)ps2xWinThreadCpuNs(), std::memory_order_relaxed);
 #else
             struct timespec tg; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tg);

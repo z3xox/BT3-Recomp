@@ -513,6 +513,48 @@ namespace
         static const bool s_on = [](){ const char *v = std::getenv("PS2X_FORGETRT"); return !(v && v[0] == '0'); }();
         if (s_on) ps2xForgetTexId(id);
     }
+
+    // [flushcensus] PS2X_FLUSHCENSUS=1: WHICH state change is forcing the GL batch flush?
+    // Splitscreen fights issue ~2,722 draw calls/frame with ~2,689 flushes -- 98.8%, i.e. no
+    // batching at all -- and `present` is 9.2 ms/frame of real (uncap-proof) work. Counting flushes
+    // by source line names the thrashing state instead of guessing at it. Off by default; when off
+    // this is one predicted branch on a static bool.
+    static std::unordered_map<int, unsigned long> g_flushHist;
+    static std::unordered_map<unsigned, unsigned long> g_maskTrans, g_blendTrans;   // [flushcensus] prev<<16|next
+    static bool flushCensusOn()
+    { static const bool v = [](){ const char *e = std::getenv("PS2X_FLUSHCENSUS"); return e && e[0] && e[0] != '0'; }(); return v; }
+    static inline void flushBatch(int line)
+    {
+        if (flushCensusOn()) ++g_flushHist[line];
+        rlDrawRenderBatchActive();
+    }
+    struct FlushCensusDump
+    {
+        ~FlushCensusDump()
+        {
+            if (!flushCensusOn() || g_flushHist.empty()) return;
+            std::vector<std::pair<int, unsigned long>> v(g_flushHist.begin(), g_flushHist.end());
+            std::sort(v.begin(), v.end(), [](auto &a, auto &b){ return a.second > b.second; });
+            unsigned long tot = 0; for (auto &kv : v) tot += kv.second;
+            std::fprintf(stderr, "[flushcensus] %lu batch flushes total, top sources:\n", tot);
+            for (size_t i = 0; i < v.size() && i < 20; ++i)
+                std::fprintf(stderr, "[flushcensus]   ps2_gs_gpu_renderer.cpp:%-6d %9lu  %5.1f%%\n",
+                             v[i].first, v[i].second, 100.0 * v[i].second / (double)tot);
+            auto dump2 = [](const char *name, std::unordered_map<unsigned, unsigned long> &m)
+            {
+                std::vector<std::pair<unsigned, unsigned long>> t(m.begin(), m.end());
+                std::sort(t.begin(), t.end(), [](auto &a, auto &b){ return a.second > b.second; });
+                unsigned long s2 = 0; for (auto &kv : t) s2 += kv.second;
+                for (size_t i = 0; i < t.size() && i < 8; ++i)
+                    std::fprintf(stderr, "[flushcensus]   %s %6d -> %-6d %9lu  %5.1f%%\n", name,
+                                 (int)(short)(t[i].first >> 16), (int)(short)(t[i].first & 0xFFFF),
+                                 t[i].second, 100.0 * t[i].second / (double)(s2 ? s2 : 1));
+            };
+            dump2("mask ", g_maskTrans);
+            dump2("blend", g_blendTrans);
+        }
+    };
+    static FlushCensusDump g_flushCensusDump;
     void ps2xApplyTexFilter(Texture2D &t, bool bilinear)
     {
         const bool s_on = GsGpuRenderer::bilinearEnabled();   // [uitoggles]
@@ -534,7 +576,7 @@ namespace
             static unsigned long nMiss = 0; ++nMiss;
             if (nMiss <= 20 || (nMiss % 500u) == 0u)
                 std::fprintf(stderr, "[filterchk] #%lu tex %u: cache says %s, GL says %s (%dx%d) -> corrected\n", nMiss, t.id, bilinear ? "bilinear" : "point", glBilinear ? "bilinear" : "point", t.width, t.height);
-            rlDrawRenderBatchActive();
+            flushBatch(__LINE__);
             SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
             g_texFilterState.set(t.id, bilinear ? 1u : 0u);
             return;
@@ -544,7 +586,7 @@ namespace
         // the same HUD glyph came out point- or bilinear-sampled depending on where the batch happened to break
         // (BARBLOCK's chunk pre-renders move the breaks -> the timer's left lobe alternated crisp/blurred).
         static const bool s_ff = [](){ const char *v = std::getenv("PS2X_FILTERFLUSH"); return !(v && v[0] == '0'); }();   // [filterflush] =0: old behaviour (A/B)
-        if (s_ff) rlDrawRenderBatchActive();
+        if (s_ff) flushBatch(__LINE__);
         SetTextureFilter(t, bilinear ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
         g_texFilterState.set(t.id, bilinear ? 1u : 0u);
     }
@@ -783,7 +825,7 @@ namespace
         const uint32_t seq = g_glEnterSeq[fbp];
         if (g_rtSnapSeq[fbp] != seq)
         {
-            rlDrawRenderBatchActive();
+            flushBatch(__LINE__);
             glBindFramebuffer(0x8CA8 /*READ*/, f.rt.id); glBindFramebuffer(0x8CA9 /*DRAW*/, snap.id);
             // [rscale] source rect is PHYSICAL; NEAREST decimation (snapshot consumers read
             // pixels as DATA -- palette indices -- so no blending of values).
@@ -850,7 +892,7 @@ namespace
     void rsBindReadDownsampled(const Fbo &f)
     {
         if (f.scale <= 1) return;
-        rlDrawRenderBatchActive();   // reader contexts are rlgl-safe; flush before raw binds
+        flushBatch(__LINE__);   // reader contexts are rlgl-safe; flush before raw binds
         const RenderTexture2D &st = rsDownsampled(f);
         glBindFramebuffer(0x8CA8 /*READ*/, st.id);
     }
@@ -1084,7 +1126,7 @@ namespace
     {
         const AlphaFix want = texAlphaFix(texId);
         if (want == g_curAlphaFix || g_locAlphaFix < 0) return;
-        rlDrawRenderBatchActive();
+        flushBatch(__LINE__);
         SetShaderValue(g_shader, g_locAlphaFix, want.data(), SHADER_UNIFORM_VEC2);
         g_curAlphaFix = want;
     }
@@ -1794,7 +1836,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             if (zTex == 0 && zf != g_fbos.end()) zTex = zf->second.depthTex;
             if (zTex != 0 && zf != g_fbos.end())
             {
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 const int zw = g_sharedDepthW > 0 ? g_sharedDepthW : zf->second.w;
                 const int zh = g_sharedDepthH > 0 ? g_sharedDepthH : zf->second.h;
                 static std::vector<float> zb;
@@ -1977,7 +2019,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             rectUsed = (rX1 > rX0 && rY1 > rY0);
         }
     }
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     rlEnableFramebuffer(it->second.rt.id);
     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
     {   // [rbsplit] PS2X_RBSPLIT=1: how much of a readback stall is the GPU finishing the segment (glFinish) vs the transfer
@@ -2436,7 +2478,7 @@ void GsGpuRenderer::flushPageToVram(uint32_t fbp)
             if (s_gaWb >= 1 && fbp == 336u && g_gaViewReady && g_barReqPsm == 0x02u &&
                 g_gaViewTex[g_gaCur].texture.id != 0)
             {
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture);
                 if (vi.data)
                 {
@@ -2637,7 +2679,7 @@ bool GsGpuRenderer::prerenderChunk()
         // driver may sit on the batched commands until the barrier's glReadPixels forces them, and
         // the GPU execution time lands on the critical path after all (scene barriers ~1.8 ms).
         static const bool s_pf = [](){ const char *v = std::getenv("PS2X_PREFLUSH"); return !(v && v[0] == '0'); }();
-        if (s_pf) { rlDrawRenderBatchActive(); glFlush(); }
+        if (s_pf) { flushBatch(__LINE__); glFlush(); }
     }
     return true;
 }
@@ -3485,7 +3527,7 @@ void GsGpuRenderer::reportFboAlpha(uint32_t fbp, const char *when)
     if (it == g_fbos.end() || it->second.rt.texture.id == 0) return;
     const int w = std::min(512, it->second.w), h = std::min(448, it->second.h);
     std::vector<uint32_t> px((size_t)w * h, 0u);
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     rlEnableFramebuffer(it->second.rt.id);
     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
     glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, px.data());
@@ -3658,7 +3700,7 @@ void GsGpuRenderer::swOutlineEnd()
         std::vector<uint32_t> &sn = *c.vramSnap;
         // The FBO as it stands right now -- everything recorded before this bracket, drawn.
         std::vector<uint32_t> fbo((size_t)w * h, 0u);
-        rlDrawRenderBatchActive();
+        flushBatch(__LINE__);
         rlEnableFramebuffer(it->second.rt.id);
         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
         glReadPixels(0, it->second.h - h, w, h, 0x1908, 0x1401, fbo.data());
@@ -3791,7 +3833,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
                 if (fi != g_fbos.end() && fi->second.rt.texture.id != 0)
                 {
                     std::vector<uint32_t> now((size_t)w * h, 0u);
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     glReadPixels(0, fi->second.h - h, w, h, 0x1908, 0x1401, now.data());
                     for (int y2 = 0; y2 < h / 2; ++y2)
                         std::swap_ranges(now.begin() + (size_t)y2 * w, now.begin() + (size_t)(y2 + 1) * w,
@@ -3807,7 +3849,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
             }
         }
     }
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     rlDisableScissorTest();
     // Standard alpha blend: the snapshot's alpha is the software pass's own coverage mask, so
     // only the pixels it wrote replace the FBO. RGB only -- the scene's alpha byte is the mask
@@ -3823,7 +3865,7 @@ void GsGpuRenderer::blitVramPageToBoundFbo(const DrawCmd &c)
     DrawTexturePro(s_tex, Rectangle{0.0f, 0.0f, (float)w, (float)h},
                    Rectangle{0.0f, 0.0f, (float)w, (float)h},
                    Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     {   // PS2X_SWOCMP=1: what did the DRAW itself do? Read the FBO back straight after and
         // compare with the pixels we handed it. With PS2X_SWOIDENT the upload IS the FBO, so
         // any difference here is produced by the draw call, not by the content.
@@ -3909,7 +3951,7 @@ double ps2xStripAlphaOf(uint32_t fbp)
 {
     auto it = g_fbos.find(fbp);
     if (it == g_fbos.end() || it->second.rt.texture.id == 0) return -1.0;
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     const int w = it->second.rt.texture.width, h = it->second.rt.texture.height;
     if (w <= 0 || h <= 8) return -1.0;
     const int y0 = (h * 55) / 100;
@@ -3929,7 +3971,7 @@ double ps2xF224AlphaMean()
 {
     auto it = g_fbos.find(224u);
     if (it == g_fbos.end() || it->second.rt.texture.id == 0) return -1.0;
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     Image img = LoadImageFromTexture(it->second.rt.texture);
     const unsigned char *p = (const unsigned char *)img.data;
     double sum = 0.0; unsigned long n = 0;
@@ -3944,7 +3986,7 @@ static void ps2xDbgCol0(const char *tag, int idx)
 {   // [segchk] helper: f224 column-0 mean alpha, printed with a tag
     extern bool g_replayInWindow; if (!g_replayInWindow) return;
     auto it = g_fbos.find(224u); if (it == g_fbos.end() || it->second.rt.texture.id == 0) return;
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     const int w = it->second.w, h = it->second.h; std::vector<uint32_t> b((size_t)w * h);
     int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
     rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, b.data());
@@ -3961,7 +4003,7 @@ void GsGpuRenderer::renderRange(int fbWidth, int fbHeight)
     static int sckN = 0;
     auto col0mean = [&]() -> double {
         auto it = g_fbos.find(224u); if (it == g_fbos.end() || it->second.rt.texture.id == 0) return -1.0;
-        rlDrawRenderBatchActive();
+        flushBatch(__LINE__);
         const int w = it->second.w, h = it->second.h; std::vector<uint32_t> b((size_t)w * h);
         int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
         rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, b.data());
@@ -4677,7 +4719,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
     }
     static const int s_flip = [](){ const char *v = std::getenv("PS2X_GPUALIAS_FLIP"); return v && v[0] ? std::atoi(v) : 1; }();
     const int srcFlip = s_flip;
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     const int dst = 1 - g_gaCur;
     const int rect[4] = { (int)c.dx0, 0, (int)c.dx1, 448 };
     BeginTextureMode(g_gaViewTex[dst]);
@@ -4750,7 +4792,7 @@ static bool gaExecAliasPass(const GsGpuRenderer::DrawCmd &c)
         {
             if (lastStage >= 1 && stage != lastStage && !done[lastStage])
             {
-                done[lastStage] = true; rlDrawRenderBatchActive();
+                done[lastStage] = true; flushBatch(__LINE__);
                 char nm[96]; std::snprintf(nm, sizeof nm, "/home/z3/Desktop/bt3/work/ga_stage%d.png", lastStage);
                 Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture); ExportImage(vi, nm); UnloadImage(vi);
                 std::fprintf(stderr, "[gpualias] stage-boundary dump: %s\n", nm);
@@ -4904,7 +4946,7 @@ static bool gaBuildReviewTex(const Texture2D &src, int srcH, int ta0, int ta1, i
         }
         std::fprintf(stderr, "[gpualias] raw review builder ready (prog %u)\n", prog);
     }
-    rlDrawRenderBatchActive();   // flush rlgl's pending batch BEFORE touching raw state
+    flushBatch(__LINE__);   // flush rlgl's pending batch BEFORE touching raw state
     // ---- save every piece of GL state this pass changes ----
     int prevProg = 0, prevFbo = 0, prevVp[4] = {0,0,0,0}, prevActive = 0, prevTex0 = 0;
     unsigned char prevCM[4] = {1,1,1,1};
@@ -5026,7 +5068,7 @@ static bool gaBuildP8hTwin(const Texture2D &src, int srcH, const Texture2D &pal,
         locH = GetShaderLocation(sh2, "uH"); locScl = GetShaderLocation(sh2, "uScl");
         std::fprintf(stderr, "[p8twin] builder ready (prog %u)\n", prog);
     }
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     int prevProg = 0, prevFbo = 0, prevVp[4] = {0,0,0,0}, prevActive = 0, prevTex0 = 0;
     unsigned char prevCM[4] = {1,1,1,1};
     glGetIntegerv(0x8B8D, &prevProg);
@@ -5162,7 +5204,7 @@ static bool gaDofMaskPass(uint32_t destFbp)
         locM = GetShaderLocation(sh2, "uZDiv");
         std::fprintf(stderr, "[dofmask] pass ready (prog %u, depthTex %u)\n", prog, g_sharedDepthTex);
     }
-    rlDrawRenderBatchActive();
+    flushBatch(__LINE__);
     ps2xTextureBarrier();   // prior scene writes must be visible to the same-texel RMW fetch
     int prevProg = 0, prevFbo = 0, prevVp[4] = {0,0,0,0}, prevActive = 0, prevTex0 = 0, prevVao = 0;
     unsigned char prevCM[4] = {1,1,1,1};
@@ -6681,7 +6723,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         extern std::vector<Texture2D> g_pendingUnload;
         {   // [unloadmode] PS2X_UNLOADMODE: 1 delete (default), 0 leak (never delete), 2 flush the batch + glFinish before deleting
             static const int s_um = [](){ const char *v = std::getenv("PS2X_UNLOADMODE"); return v ? std::atoi(v) : 1; }();
-            if (s_um == 2 && !g_pendingUnload.empty()) { rlDrawRenderBatchActive(); glFlush(); }   // [fencesync] UnloadTexture is driver-refcounted while in use; a full glFinish drain served no purpose
+            if (s_um == 2 && !g_pendingUnload.empty()) { flushBatch(__LINE__); glFlush(); }   // [fencesync] UnloadTexture is driver-refcounted while in use; a full glFinish drain served no purpose
             if (s_um != 0) for (Texture2D &t : g_pendingUnload) { g_deletedIds.insert(t.id); ps2xForgetTexId(t.id); forgetTexProps(t.id); UnloadTexture(t); }
         }
         g_pendingUnload.clear();
@@ -7878,7 +7920,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const int wantFunc = test ? static_cast<int>(func) : -1; // func irrelevant when test off
         const int wantWrite = write ? 1 : 0;
         if (wantTest == curDepthTest && wantFunc == curDepthFunc && wantWrite == curDepthWrite) return;
-        rlDrawRenderBatchActive(); // flush before changing GL depth state
+        flushBatch(__LINE__); // flush before changing GL depth state
         if (test) { rlEnableDepthTest(); glDepthFunc(glDepthFuncFor(func));
                     if (write) { extern unsigned long g_dbgDepthWriteDraws; ++g_dbgDepthWriteDraws; } }
         else rlDisableDepthTest();
@@ -7892,17 +7934,27 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     bool s_a44vizArmed = false;
     bool s_mbtaArmed = false;
     int curMask = -1; // -1 unknown, else 4-bit rgba write-enable
+    // [flushcoalesce] BT3 interleaves an opaque pass (blend off, write RGBA) with a blended one
+    // (blend on, alpha write off) per primitive: measured 125k mask flips 15<->7 and 125k blend
+    // flips 0<->17 over 65 frames, ~1,920 alternations a frame. Those are the SAME draws, and
+    // applyBlend/applyFbmsk each flushed the batch independently -- two flushes per draw where
+    // one does. Only the FIRST state change in a command needs to flush: it draws the queued
+    // verts under the fully-old state, and no vertices are emitted between the state
+    // applications (verified: nothing emits between applyBlend and applyFbmsk).
+    // Reset once per command, at the `const DrawCmd &c = ...` binding.
+    bool cmdFlushed = false;
     auto applyFbmsk = [&](uint32_t fbmsk) {
         const int want = ((fbmsk & 0x000000FFu) == 0x000000FFu ? 0 : 1)
                        | ((fbmsk & 0x0000FF00u) == 0x0000FF00u ? 0 : 2)
                        | ((fbmsk & 0x00FF0000u) == 0x00FF0000u ? 0 : 4)
                        | ((fbmsk & 0xFF000000u) == 0xFF000000u ? 0 : 8);
         if (want == curMask) return;
-        rlDrawRenderBatchActive(); // flush verts drawn under the previous mask
+        if (flushCensusOn()) ++g_maskTrans[((unsigned)(curMask & 0xFFFF) << 16) | (unsigned)(want & 0xFFFF)];
+        if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
         glColorMask((want & 1) ? 1 : 0, (want & 2) ? 1 : 0, (want & 4) ? 1 : 0, (want & 8) ? 1 : 0);
         curMask = want;
     };
-    auto endMode = [&]() { if (inMode) { rlDrawRenderBatchActive();
+    auto endMode = [&]() { if (inMode) { flushBatch(__LINE__);
         // Leave depth OFF at FBO/mode boundaries so transfer blits and the present pass are
         // never depth-tested; the next depth-using draw re-enables via applyDepth().
         if (depthOn && curDepthTest != 0) { rlDisableDepthTest(); rlEnableDepthMask(); curDepthTest = 0; curDepthFunc = -1; curDepthWrite = 1; }
@@ -8075,7 +8127,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             int w, h; fboSizeFor(fbp, w, h);
             AtlasSlot &s = atlasSlotFor(fbp, w, h);
             curFbp = fbp; curSlotX = s.x; curSlotY = s.y; curSlotW = s.w; curSlotH = s.h;
-            rlDrawRenderBatchActive();                 // flush prior slot's draws
+            flushBatch(__LINE__);                 // flush prior slot's draws
             curSx = -0x40000000;                        // force scissor recompute for the new slot
             return;
         }
@@ -8114,10 +8166,10 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         {   // [rtthazard] this FBO's texture was just sampled. PS2X_RTTHAZARD=barrier|finish|read|rebind|0 (A/B)
             static const std::string s_hz = [](){ const char *v = std::getenv("PS2X_RTTHAZARD"); return std::string(v ? v : "0"); }();
             g_lastSampledFboTex = 0;
-            if (s_hz == "barrier") { rlDrawRenderBatchActive(); glBindTexture(0x0DE1, 0); ps2xTextureBarrier(); }
-            else if (s_hz == "finish") { rlDrawRenderBatchActive(); glFinish(); }
-            else if (s_hz == "read") { rlDrawRenderBatchActive(); uint32_t px = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px); }
-            else if (s_hz == "rebind") { rlDrawRenderBatchActive(); EndTextureMode(); BeginTextureMode(f.rt);
+            if (s_hz == "barrier") { flushBatch(__LINE__); glBindTexture(0x0DE1, 0); ps2xTextureBarrier(); }
+            else if (s_hz == "finish") { flushBatch(__LINE__); glFinish(); }
+            else if (s_hz == "read") { flushBatch(__LINE__); uint32_t px = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px); }
+            else if (s_hz == "rebind") { flushBatch(__LINE__); EndTextureMode(); BeginTextureMode(f.rt);
                                           if (f.scale > 1) rlScalef((float)f.scale, (float)f.scale, 1.0f); }
         }
         // PS2X_FBO_CHECK: is this FBO actually complete? An incomplete big FBO would corrupt all
@@ -8154,7 +8206,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             : depthClearedFbps.insert(fbp).second;
         if (depthOn && wantDepthClear)
         {
-            rlDrawRenderBatchActive();
+            flushBatch(__LINE__);
             glClearDepth(0.0);
             glClear(GL_DEPTH_BUFFER_BIT);
             { extern unsigned long g_dbgDepthClears; ++g_dbgDepthClears; }
@@ -8171,7 +8223,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     auto applyScissor = [&](int sx, int sy, int sw, int sh) {
         if (sx != curSx || sy != curSy || sw != curSw || sh != curSh)
         {
-            rlDrawRenderBatchActive();
+            flushBatch(__LINE__);
             curSx = sx; curSy = sy; curSw = sw; curSh = sh;
             if (s_oneFbo) { rlDisableScissorTest(); return; } // ONE_FBO test: no scissor (content mashes)
             if (s_atlas) {
@@ -8223,7 +8275,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                         const int gx = le, gw = sx - le;               // the untouched columns
                         if (gw > 0 && gw <= 16)                        // a divider, not a real gap in coverage
                         {
-                            rlDrawRenderBatchActive();
+                            flushBatch(__LINE__);
                             rlEnableScissorTest();
                             rlScissor(gx * rsS, 0, gw * rsS, f.h * rsS);
                             rlClearColor(0, 0, 0, 255);
@@ -8483,7 +8535,13 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         const int fixNow = (eq == 2 || eq == 6) ? (int)bc.blendFix : -1;
         if (want == curBlendOn && (want == 0 || (eq == curBlendEq && fixNow == curBlendFix
                                                  && (bc.fba ? 1 : 0) == curBlendFba))) return;
-        rlDrawRenderBatchActive(); // flush verts drawn under the previous blend state
+        if (flushCensusOn())
+        {
+            const unsigned pk = ((unsigned)(curBlendOn & 0xF) << 4) | (unsigned)(curBlendEq & 0xF);
+            const unsigned nk = ((unsigned)(want & 0xF) << 4) | (unsigned)(eq & 0xF);
+            ++g_blendTrans[(pk << 16) | nk];
+        }
+        if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
         if (want)
         {
             rlEnableColorBlend();
@@ -8624,7 +8682,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         }
         if (atst == curAtst && (atst < 0.0f || aref == curAref))
             return;
-        rlDrawRenderBatchActive(); // flush verts queued under the previous test state
+        flushBatch(__LINE__); // flush verts queued under the previous test state
         SetShaderValue(g_shader, g_locAtst, &atst, SHADER_UNIFORM_FLOAT);
         SetShaderValue(g_shader, g_locAref, &aref, SHADER_UNIFORM_FLOAT);
         curAtst = atst; curAref = aref;
@@ -8637,7 +8695,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         static const bool s_tccOn = [](){ const char *v = std::getenv("PS2X_TCC"); return !(v && v[0] == '0'); }();
         const float want = (!s_tccOn || (tc.texKey != 0 && tc.tcc != 0)) ? 1.0f : 0.0f;
         if (want == curTcc || g_locTcc < 0) return;
-        rlDrawRenderBatchActive();
+        flushBatch(__LINE__);
         SetShaderValue(g_shader, g_locTcc, &want, SHADER_UNIFORM_FLOAT);
         curTcc = want;
     };
@@ -8727,7 +8785,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         DrawTexturePro(lit->second.rt.texture,
                        Rectangle{0, 0, (float)(cw * lit->second.scale), -(float)(ch * lit->second.scale)},   // [rscale] physical src
                        Rectangle{0, 0, (float)(cw * ls), (float)(ch * ls)}, Vector2{0, 0}, 0.0f, WHITE);
-        rlDrawRenderBatchActive();
+        flushBatch(__LINE__);
         rlEnableColorBlend();
         // Diag: dump the latch content itself (1st + 100th latch) + per-second count. If
         // the dump shows the fighters, present must too; if gray, the boundary is wrong.
@@ -9059,6 +9117,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             }
         }
         const DrawCmd &c = (nTri > 1u) ? batchView : DC[ci];
+        cmdFlushed = false;   // [flushcoalesce] one flush per command, not one per state change
         {   // [wshudlog] one-run census of widescreen sprite candidates: geometry + source
             // fields, to pick the HUD-vs-ink discriminator from data instead of guesses.
             static const bool s_wl = [](){ const char *v = std::getenv("PS2X_WSHUDLOG"); return v && v[0] && v[0] != '0'; }();
@@ -9149,7 +9208,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 && (c.destFbp == 0u || c.destFbp == 112u))
             {
                 dateSnapDone = true;
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 const float bw = (g_ps2xWsSrcW >= 320.0f && g_ps2xWsSrcW <= 1024.0f) ? g_ps2xWsSrcW : 512.0f;
                 rlColorMask(false, false, false, true);
                 // pass 1: dstA = clamp(dstA - 127/255)
@@ -9158,7 +9217,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                           0x8006 /*FUNC_ADD*/, 0x800B /*FUNC_REVERSE_SUBTRACT*/);
                 rlSetBlendMode(RL_BLEND_CUSTOM_SEPARATE);
                 DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 127});
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 // passes 2..9: dstA = clamp(2*dstA)
                 rlSetBlendMode(RL_BLEND_ALPHA);
                 rlSetBlendFactorsSeparate(1, 1, 0x0304 /*DST_ALPHA*/, 1 /*ONE*/,
@@ -9167,7 +9226,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 for (int dp = 0; dp < 8; ++dp)
                 {
                     DrawRectangle(0, 0, (int)bw + 2, 56, Color{0, 0, 0, 255});
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                 }
                 rlColorMask(true, true, true, true);
                 curBlendOn = -1; curBlendEq = -1; curBlendFix = -1;   // force blend reapply
@@ -9341,7 +9400,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 {
                     auto it = g_fbos.find(fbp);
                     if (it == g_fbos.end() || it->second.rt.texture.id == 0) { std::fprintf(stderr, "[dofdump] %s fbp%u: no FBO\n", tag, fbp); return; }
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     const int w = it->second.w, h = it->second.h;
                     std::vector<uint32_t> buf((size_t)w * h);
                     rlEnableFramebuffer(it->second.rt.id);
@@ -9441,7 +9500,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                            return v && v[0] && v[0] != '0'; }();
             if (s_dw && g_darkwFboId && g_darkwLogs < 64)
             {
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 int prevRead = 0; glGetIntegerv(0x8CAA /*READ_FRAMEBUFFER_BINDING*/, &prevRead);
                 glBindFramebuffer(0x8CA8 /*READ_FRAMEBUFFER*/, g_darkwFboId);
                 uint32_t px = 0;
@@ -9496,7 +9555,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         static int n3 = 0;
                         auto it3 = g_fbos.find(224u);
                         if (s_sck2 && g_replayInWindow && n3 < 40 && it3 != g_fbos.end() && it3->second.rt.texture.id != 0)
-                        {   ++n3; rlDrawRenderBatchActive();
+                        {   ++n3; flushBatch(__LINE__);
                             const int w3 = it3->second.w, h3 = it3->second.h; std::vector<uint32_t> b3((size_t)w3 * h3);
                             int prevFB3 = 0; glGetIntegerv(0x8CA6, &prevFB3);
                             rlEnableFramebuffer(it3->second.rt.id); glReadPixels(0, 0, w3, h3, 0x1908, 0x1401, b3.data());
@@ -9530,7 +9589,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             auto it = g_fbos.find((uint32_t)s_fdEnd);
                             if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                             {
-                                rlDrawRenderBatchActive();
+                                flushBatch(__LINE__);
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
                                 rlEnableFramebuffer(it->second.rt.id);
@@ -9588,7 +9647,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
                 if (ci == lastScene)
                 {
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     auto fit = g_fbos.find(c.destFbp);
                     if (fit != g_fbos.end() && fit->second.rt.id != 0)
                     {
@@ -9659,7 +9718,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         rlTexCoord2f(1.0f, 1.0f); rlVertex2f((float)ow, 0.0f);
                         rlEnd();
                         rlSetTexture(0);
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                     }
                 }
             }
@@ -9680,7 +9739,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (!done2 && lastF0 != SIZE_MAX && ci == lastF0 + 1)
                 {
                     done2 = true;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     auto zf0 = g_fbos.find(0u);
                     if (zf0 != g_fbos.end() && zf0->second.rt.id != 0)
                     {
@@ -9843,7 +9902,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     static std::vector<uint32_t> buf;
                     auto greens = [&]() -> long {
                         buf.resize((size_t)fw * bh);
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
                         rlEnableFramebuffer(fit->second.rt.id);
                         glReadPixels(0, fh - bh, fw, bh, 0x1908, 0x1401, buf.data());
@@ -9905,7 +9964,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     {
                         std::vector<uint32_t> before((size_t)w * h), after((size_t)w * h);
                         auto grab = [&](std::vector<uint32_t> &dst) {
-                            rlDrawRenderBatchActive();
+                            flushBatch(__LINE__);
                             int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
                             rlEnableFramebuffer(fit->second.rt.id);
                             glReadPixels(x0, fh - (y0 + h), w, h, 0x1908, 0x1401, dst.data());
@@ -9919,7 +9978,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         {
                             std::vector<uint32_t> now((size_t)pw * ph);
                             int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
-                            rlDrawRenderBatchActive(); rlEnableFramebuffer(fit->second.rt.id);
+                            flushBatch(__LINE__); rlEnableFramebuffer(fit->second.rt.id);
                             glReadPixels(px0, fh - (py0 + ph), pw, ph, 0x1908, 0x1401, now.data());
                             if (prevFB) rlEnableFramebuffer((unsigned)prevFB); else rlDisableFramebuffer();
                             ++g_hudPixN;
@@ -10242,7 +10301,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 blobEnsureTex();
                 const uint32_t sceneKey = viewKey(sceneFbp, 0);
                 if (sceneKey != curFbp) { beginFbp(sceneKey); curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; }
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 rlSetShader(rlGetShaderIdDefault(), rlGetShaderLocsDefault());
                 rlSetBlendMode(BLEND_ALPHA);
                 glColorMask(1, 1, 1, 0);
@@ -10272,7 +10331,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     rlTexCoord2f(1.0f, 0.0f); if (depthOn) rlVertex3f(x1, y0, -zq); else rlVertex2f(x1, y0);
                 }
                 rlEnd();
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 rlSetTexture(0);
                 rlSetShader(g_shader.id, g_shader.locs);
                 curMask = -1; curBlendOn = -1; curBlendEq = -1; curBlendFix = -1; curDepthTest = -1; curDepthFunc = -1; curDepthWrite = -1;
@@ -10565,7 +10624,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     }
                     if (curFbp == 336u && c.destFbp != 336u && s_snapN < 16)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         auto hit = g_fbos.find(336u);
                         if (hit != g_fbos.end() && hit->second.rt.texture.id != 0)
                         {
@@ -10585,7 +10644,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         // though end-of-replay dumps show the assembled title/scene).
                         if (s_logN == 1)
                         {
-                            rlDrawRenderBatchActive();
+                            flushBatch(__LINE__);
                             for (uint32_t sfd : {0u, 112u})
                             {
                                 auto it2 = g_fbos.find(sfd);
@@ -10628,7 +10687,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                                return v && v[0] && v[0] != '0'; }();
             if (s_dflush && !c.isTransfer && c.texKey == 0 && c.blendMode == 0x52
                 && (c.destFbp == 0u || c.destFbp == 112u))
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
         }
         {
             const uint32_t destKey = viewKey(c.destFbp, c.destPsm, (int)c.destFbw);
@@ -10661,7 +10720,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     c.vramSnap->size() == (size_t)bw2 * bh2)
                 {
                     std::vector<uint32_t> fbo2((size_t)bw2 * bh2, 0u);
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     glReadPixels(0, fi2->second.h - bh2, bw2, bh2, 0x1908, 0x1401, fbo2.data());
                     for (int y2 = 0; y2 < bh2 / 2; ++y2)
                         std::swap_ranges(fbo2.begin() + (size_t)y2 * bw2, fbo2.begin() + (size_t)(y2 + 1) * bw2,
@@ -10696,7 +10755,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     auto fiw = g_fbos.find(rfw);
                     if (fiw != g_fbos.end() && fiw->second.rt.id != 0)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         int prevRead = 0; glGetIntegerv(0x8CAA, &prevRead);
                         glBindFramebuffer(0x8CA8, fiw->second.rt.id);
                         uint32_t pxw = 0;
@@ -10737,7 +10796,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_fa224 != 0.0f && g_locForceA >= 0)
             {
                 const float want = (!c.isTransfer && c.destFbp == 224u && c.texKey) ? s_fa224 : 0.0f;
-                if (want != curFA) { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locForceA, &want, SHADER_UNIFORM_FLOAT); curFA = want; }
+                if (want != curFA) { flushBatch(__LINE__); SetShaderValue(g_shader, g_locForceA, &want, SHADER_UNIFORM_FLOAT); curFA = want; }
             }
         }
         {   // PS2X_PROJCLIP=1: clip the shadow-decal class to its projection. Identified as
@@ -10766,7 +10825,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (!c.isTransfer && c.destFbp != 336u && c.srcTbp0 != 10752u) s_afterPass1 = false;
             const float want = (s_pc && decal) ? 1.0f : 0.0f;
             if (want != curPC && g_locProjClip >= 0)
-            { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locProjClip, &want, SHADER_UNIFORM_FLOAT); curPC = want; }
+            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locProjClip, &want, SHADER_UNIFORM_FLOAT); curPC = want; }
         }
         {   // PS2X_TRIHALF (default ON): the GS addresses texel CORNERS, GL centres. We already
             // correct that for same-size FBO copies (the shipped blur fix) but never did for
@@ -10797,7 +10856,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const float want = (c.abe && c.blendMode == 0x62 && c.srcTbp0 == 15680u) ? 1.0f : 0.0f;
                     static float cur = 0.0f;
                     if (want != cur)
-                    { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locUViz, &want, SHADER_UNIFORM_FLOAT); cur = want; }
+                    { flushBatch(__LINE__); SetShaderValue(g_shader, g_locUViz, &want, SHADER_UNIFORM_FLOAT); cur = want; }
                 }
             }
             {   // PS2X_SUBSCALE applied ONLY to the 0x62 subtractive pass (magnitude A/B).
@@ -10808,14 +10867,14 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     const float want = (c.abe && c.blendMode == 0x62) ? s_ss : 1.0f;
                     static float cur = 1.0f;
                     if (want != cur)
-                    { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locSubScale, &want, SHADER_UNIFORM_FLOAT); cur = want; }
+                    { flushBatch(__LINE__); SetShaderValue(g_shader, g_locSubScale, &want, SHADER_UNIFORM_FLOAT); cur = want; }
                 }
             }
             static const bool s_tfxOn = [](){ const char *v = std::getenv("PS2X_TFX"); return v && v[0] && v[0] != '0'; }();
             static float curTfx = -1.0f;
             const float want = (s_tfxOn && c.texKey != 0 && c.tfx == 1u) ? 1.0f : 0.0f;
             if (want != curTfx && g_locTfx >= 0)
-            { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locTfx, &want, SHADER_UNIFORM_FLOAT); curTfx = want; }
+            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locTfx, &want, SHADER_UNIFORM_FLOAT); curTfx = want; }
         }
         {   // [f224] PS2X_F224=1: fbp224 (the MASK) reads as a pristine clear, yet chaindiag
             // counts 96 draws INTO it. Find where they die: count entry vs the emit.
@@ -10977,7 +11036,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     if (fit != g_fbos.end() && fit->second.rt.texture.id != 0)
                     {
                         ++nt;
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         const int rw = std::min(512, fit->second.w), rh = std::min(448, fit->second.h);
                         static std::vector<uint32_t> tp; tp.assign((size_t)rw * rh, 0u);
                         glReadPixels(0, fit->second.h - rh, rw, rh, 0x1908, 0x1401, tp.data());
@@ -11322,7 +11381,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_a44o && !c.isTransfer && c.isTriangle && c.abe && c.blendMode == 0x44 &&
                 c.srcPsm == 0x00u && c.tcc == 0u && c.texKey != 0)
             {
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 rlDisableColorBlend();
                 curBlendOn = -1; curBlendEq = -1;
             }
@@ -11337,7 +11396,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_a44v && g_locUViz >= 0 && !c.isTransfer && c.isTriangle && c.abe &&
                 c.blendMode == 0x44 && c.srcPsm == 0x00u && c.tcc == 0u && c.texKey != 0)
             {
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 const float on = 1.0f;
                 SetShaderValue(g_shader, g_locUViz, &on, SHADER_UNIFORM_FLOAT);
                 s_a44vizArmed = true;
@@ -11378,7 +11437,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 static std::map<std::pair<uint32_t,uint32_t>,int> n;
                 if (n[{frameGen, c.destFbp}]++ < 20)
                 {
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     const int w = 512, h = 448;
                     std::vector<uint32_t> px((size_t)w * h, 0u);
                     uint32_t rf = c.destFbp;
@@ -11482,7 +11541,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_mbta && g_locForceA >= 0 && !c.isTransfer && c.destFbp == 224u &&
                 c.srcPsm == 0x00u && c.texKey != 0)
             {
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 const float two = 2.0f;
                 SetShaderValue(g_shader, g_locForceA, &two, SHADER_UNIFORM_FLOAT);
                 s_mbtaArmed = true;
@@ -11584,7 +11643,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (s_ew && !c.depthOnly && c.destFbp == 336u && c.blendMode == 0x44 && c.fbmsk == 0xFF000000u && c.srcPsm == 27u && c.texKey && c.dx0 < 1.0f && c.dx1 > 1.0f)
             {   // first DECAL column: fill B=255 so unpainted background is the ramp's inverse too
                 // (console's wrap makes bg(0) - inside(8k) an edge; clamped GL needs bg.B=255 - 0).
-                rlDrawRenderBatchActive(); glColorMask(0, 0, 1, 0); glClearColor(0.f, 0.f, 1.f, 0.f); glClear(0x4000u); curMask = -1;
+                flushBatch(__LINE__); glColorMask(0, 0, 1, 0); glClearColor(0.f, 0.f, 1.f, 0.f); glClear(0x4000u); curMask = -1;
             }
             applyFbmsk(fm); // GS FRAME.FBMSK -> color write mask
         }
@@ -11684,7 +11743,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     auto it0 = g_fbos.find(0u);
                     if (it0 != g_fbos.end() && it0->second.rt.texture.id != 0)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         rlEnableFramebuffer(it0->second.rt.id);
                         rlDisableScissorTest();               // glClear obeys the scissor; a leftover
                                                               // strip scissor clipped this to 1474 px
@@ -11727,7 +11786,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (++seen == s_sa2 && !done)
                 {
                     done = 1;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     auto it = g_fbos.find(c.destFbp);
                     if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                     {
@@ -11761,7 +11820,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (++seen2 == s_sa && !done2)
                 {
                     done2 = 1;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     for (uint32_t sfbp : {0u, 112u})
                     {
                         auto it = g_fbos.find(sfbp);
@@ -11805,7 +11864,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (++seen == s_ma && !done)
                 {
                     done = 1;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     auto it = g_fbos.find(224u);
                     if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                     {
@@ -11901,7 +11960,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (n < 24)
                 {
                     ++n;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     auto it = g_fbos.find(502u);
                     if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                     {
@@ -11944,7 +12003,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (!done)
                 {
                     done = 1;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     const uint32_t sf2 = (c.srcTbp0 / 32u);
                     auto it = g_fbos.find(sf2);
                     if (it != g_fbos.end() && it->second.rt.texture.id != 0)
@@ -11981,7 +12040,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (!done)
                 {
                     done = 1;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     auto it = g_fbos.find(502u);
                     if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                     {
@@ -12019,7 +12078,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (++seen == s_a16 && !done)
                 {
                     done = 1;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     const int x0 = 150, y0 = 160, w = 124, h = 128;
                     std::vector<uint32_t> buf((size_t)w * h);
                     glReadPixels(x0, y0, w, h, 0x1908, 0x1401, buf.data());
@@ -12045,7 +12104,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (done < 3)
                 {
                     ++done;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     for (uint32_t sf : {0u, 112u})
                     {
                         auto it = g_fbos.find(sf);
@@ -12131,7 +12190,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 ++n;
                 if (!wrongBuf && shown < 40)
                 {
-                    rlDrawRenderBatchActive();          // make prior draws visible to the read
+                    flushBatch(__LINE__);          // make prior draws visible to the read
                     unsigned char pix[4] = {0,0,0,0};
                     glReadPixels(px, py, 1, 1, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, pix);
                     const int a = pix[3];
@@ -12639,7 +12698,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     if (s_gd && !dumped && n == 99)
                     {
                         dumped = true;
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         Image vi = LoadImageFromTexture(g_gaViewTex[g_gaCur].texture);
                         ExportImage(vi, "/home/z3/Desktop/bt3/work/ga_view.png"); UnloadImage(vi);
                         auto sit2 = g_fbos.find(224u);
@@ -12803,7 +12862,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         {
                             static std::vector<uint32_t> wpx;
                             wpx.resize((size_t)ww * wh);
-                            rlDrawRenderBatchActive();
+                            flushBatch(__LINE__);
                             rlEnableFramebuffer(wit->second.rt.id);
                             rsBindReadDownsampled(wit->second);
                             glReadPixels(0, 0, ww, wh, 0x1908, 0x1401, wpx.data());
@@ -12841,7 +12900,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                     return (v && v[0]) ? std::atof(v) : 0.0; }();
                             extern double g_zwbZMax;
                             const double s_zwbMax2_use = (s_zwbMax2 > 0.0) ? s_zwbMax2 : g_zwbZMax;
-                            rlDrawRenderBatchActive();
+                            flushBatch(__LINE__);
                             // MUST size by the DEPTH TEXTURE (it is shared and may be larger than
                             // this FBO): glGetTexImage writes the whole texture. Sizing by the
                             // FBO overflowed the heap -- "free(): invalid size".
@@ -12885,7 +12944,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         std::fprintf(stderr, "[ztex] bound depth texture %u (%dx%d) for src=%u psm=%u -> dest f%u\n",
                                      tex.id, zf->second.w, zf->second.h, c.srcTbp0, (unsigned)c.srcPsm, c.destFbp);
                         // is our depth buffer actually populated?
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         const size_t np = (size_t)(g_sharedDepthW > 0 ? g_sharedDepthW : zf->second.w)
                                         * (size_t)(g_sharedDepthH > 0 ? g_sharedDepthH : zf->second.h);
                         std::vector<float> zb(np, -1.0f);
@@ -12929,7 +12988,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     if (s_seedFbo2 && git != g_glTex.end() && git->second.id != 0
                         && nit != g_fbos.end() && nit->second.rt.texture.id != 0)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         BeginTextureMode(nit->second.rt);
                         rlDisableScissorTest();
                         rlDisableColorBlend();
@@ -12937,7 +12996,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                        Rectangle{0.0f, 0.0f, (float)git->second.width, (float)git->second.height},
                                        Rectangle{0.0f, 0.0f, (float)cw, (float)ch},
                                        Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         EndTextureMode();
                         curRealFbp = 0xFFFFFFFFu; inMode = false;
                         std::fprintf(stderr, "[seedfbo] seeded-at-create fbp%u (%dx%d) from decoded tex %u\n",
@@ -13341,7 +13400,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     auto fit9 = g_fbos.find(sfKey);
                     if (fit9 != g_fbos.end() && fit9->second.rt.texture.id != 0 && seeded.insert(sfKey).second)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         const int fw9 = fit9->second.w, fh9 = fit9->second.h;
                         BeginTextureMode(fit9->second.rt);
                         rlDisableScissorTest();
@@ -13349,7 +13408,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         DrawTexturePro(tex, Rectangle{0.0f, 0.0f, (float)tex.width, (float)tex.height},
                                        Rectangle{0.0f, 0.0f, (float)fw9, (float)fh9},
                                        Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         EndTextureMode();
                         std::fprintf(stderr, "[seedfbo] seeded fbp%u (%dx%d) from decoded VRAM tex %u (%dx%d)\n",
                                      sfKey, fw9, fh9, tex.id, tex.width, tex.height);
@@ -13381,7 +13440,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 static bool inDark = false, doneAfter = false;
                 const bool isDark = !c.isTransfer && !c.texKey && c.abe && c.blendMode == 0x52 && (c.destFbp == 0u || c.destFbp == 112u);
                 auto dumpRgb = [&](uint32_t fbp, const char *tag) {
-                    if (!g_fbos.count(fbp)) return; rlDrawRenderBatchActive(); auto &fb = g_fbos[fbp]; if (!fb.rt.texture.id) return;
+                    if (!g_fbos.count(fbp)) return; flushBatch(__LINE__); auto &fb = g_fbos[fbp]; if (!fb.rt.texture.id) return;
                     const int w = fb.w, h = fb.h; std::vector<uint32_t> buf((size_t)w * h); int pf = 0; glGetIntegerv(0x8CA6, &pf);
                     rlEnableFramebuffer(fb.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); if (pf) rlEnableFramebuffer((unsigned)pf);
                     char pth[256]; std::snprintf(pth, sizeof pth, "%s/dark_%s.ppm", std::getenv("PS2X_GS_REPLAY_OUT") ? std::getenv("PS2X_GS_REPLAY_OUT") : ".", tag);
@@ -13434,7 +13493,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 && (c.destFbp == 0u || c.destFbp == 112u) && g_fbos.count(c.destFbp))
             {
                 ++dkN;
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 auto &fb = g_fbos[c.destFbp];
                 if (fb.rt.texture.id != 0)
                 {
@@ -13470,7 +13529,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 && g_fbos.count(224u) && g_fbos[224u].rt.texture.id != 0)
             {
                 ++cwN;
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 auto &fb = g_fbos[224u];
                 const int w = fb.w, h = fb.h;
                 std::vector<uint32_t> buf((size_t)w * h);
@@ -13501,7 +13560,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                  fbBound, fb.rt.id, rf, curRealFbp, vp[0], vp[1], vp[2], vp[3], scOn ? "ON" : "off", sc[0], sc[1], sc[2], sc[3], offY);
                 }
                 {   // [glstate] full state dump at this composite: blend, masks, depth, stencil, uniforms
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     int bsrc = 0, bdst = 0, bsrcA = 0, bdstA = 0, beq = 0, beqA = 0, dfunc = 0, dmask = 0, sten = 0; unsigned char cm[4] = {0,0,0,0};
                     unsigned char blendOn = glIsEnabled(0x0BE2), depthOn2 = glIsEnabled(0x0B71), stenOn = glIsEnabled(0x0B90), cull = glIsEnabled(0x0B44);
                     glGetIntegerv(0x80C9, &bsrc); glGetIntegerv(0x80C8, &bdst); glGetIntegerv(0x80CB, &bsrcA); glGetIntegerv(0x80CA, &bdstA);
@@ -13554,7 +13613,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             static uint32_t s_preFbp = 0;
             auto bandRead = [&](uint32_t fbp2, std::vector<unsigned char> &out) {
                 auto f2 = g_fbos.find(fbp2); if (f2 == g_fbos.end() || !f2->second.rt.texture.id) return false;
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 const int bw = 360, bh = 150; out.resize((size_t)bw * bh * 4);
                 int pf = 0; glGetIntegerv(0x8CA6, &pf);
                 glBindFramebuffer(0x8D40u, f2->second.rt.id);
@@ -13567,7 +13626,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 auto f3 = g_fbos.find(c.destFbp);
                 if (f3 != g_fbos.end() && f3->second.rt.texture.id)
                 {
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     const int w3 = f3->second.w, h3 = f3->second.h;
                     std::vector<unsigned char> px3((size_t)w3 * h3 * 4);
                     int pf3 = 0; glGetIntegerv(0x8CA6, &pf3);
@@ -13613,7 +13672,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 && c.blendMode == 0x54 && (c.destFbp == 0u || c.destFbp == 112u) && g_fbos.count(c.destFbp))
             {
                 ++daN;
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 auto &fb = g_fbos[c.destFbp];
                 if (fb.rt.texture.id != 0)
                 {
@@ -13661,7 +13720,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 && c.srcTexW == 256 && c.srcTexH == 256 && tex.id != 0)
             {
                 ++btN;
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 const int tw = tex.width, th = tex.height;
                 std::vector<uint8_t> px((size_t)tw * th * 4u);
                 {   // rlgl readback (RGBA8 assumed for FBO/decoded textures)
@@ -14024,7 +14083,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
         if (s_srcDiag && !s_midSnapDone && c.isTriangle && c.texKey != 0 &&
             c.srcTbp0 >= 13000u && c.srcTbp0 < 14100u && ++midSnapCharCount == 2000)
         {
-            rlDrawRenderBatchActive();
+            flushBatch(__LINE__);
             int fh = 448; { auto fit = g_fbos.find(c.destFbp); if (fit != g_fbos.end()) fh = fit->second.h; }
             dumpBoundFbo("/home/z3/Desktop/bt3/work/probefb_mid.ppm", 512, fh);
             s_midSnapDone = true;
@@ -14071,7 +14130,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 if (!s_done[mi] && ci >= kMarks[mi])
                 {
                     s_done[mi] = true;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     int fh = 448; { auto fit = g_fbos.find(curFbp); if (fit != g_fbos.end()) fh = fit->second.h; }
                     char sp[160];
                     std::snprintf(sp, sizeof sp, "/home/z3/Desktop/bt3/work/probefb_m%zu_f%u.ppm", kMarks[mi], curFbp);
@@ -14175,7 +14234,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const uint8_t want = static_cast<uint8_t>((c.wrapU << 1) | c.wrapV);
             if (s_wrapState.get(tex.id) != (int)want)
             {
-                rlDrawRenderBatchActive(); // flush queued verts before changing texture params
+                flushBatch(__LINE__); // flush queued verts before changing texture params
                 rlTextureParameters(tex.id, RL_TEXTURE_WRAP_S, c.wrapU ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
                 rlTextureParameters(tex.id, RL_TEXTURE_WRAP_T, c.wrapV ? RL_TEXTURE_WRAP_CLAMP : RL_TEXTURE_WRAP_REPEAT);
                 s_wrapState.set(tex.id, want);
@@ -14210,7 +14269,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const bool keepCt32Alpha = s_fo32 || ps2xGlowFix();   // [glowfix]
             const float want = (fromFbo && !idxRt && !(keepCt32Alpha && ct32src)) ? 1.0f : 0.0f;
             if (want != curFO && g_locFboOne >= 0)
-            { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locFboOne, &want, SHADER_UNIFORM_FLOAT); curFO = want; }
+            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locFboOne, &want, SHADER_UNIFORM_FLOAT); curFO = want; }
         }
         {   // PS2X_ADGS=1: our framebuffer alpha stores the GS BYTE, but GL_DST_ALPHA divides it
             // by 255 where the GS divides Ad by 128 -- so EVERY dest-alpha blend runs at 128/255
@@ -14243,7 +14302,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const float wantAdgs = destAlphaCoef ? (float)GsGpuRenderer::inkStrengthPct() * 0.01f : 1.0f;
             if (wantAdgs != curAdgs && g_locSubScale >= 0)
             {
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 SetShaderValue(g_shader, g_locSubScale, &wantAdgs, SHADER_UNIFORM_FLOAT);
                 curAdgs = wantAdgs;
             }
@@ -14257,7 +14316,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
               if ((nT % 20000ul) == 0ul)
                   std::fprintf(stderr, "[fba] draws with FBA=1: %lu of %lu\n", nF, nT); }
             if (want != curF && g_locFba >= 0)
-            { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locFba, &want, SHADER_UNIFORM_FLOAT); curF = want; }
+            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locFba, &want, SHADER_UNIFORM_FLOAT); curF = want; }
         }
         {   // Index scale follows the SOURCE page's provenance (see g_fbpAlphaIsGsByte).
             // PS2X_IDXSCALE overrides it for A/B; negative still means "bypass the palette".
@@ -14270,7 +14329,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                  : ((spg < 512u && g_fbpAlphaIsGsByte[spg]) ? 255.0f : 128.0f);
                 static float curS = -12345.0f;
                 if (want != curS)
-                { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locIdxScale, &want, SHADER_UNIFORM_FLOAT); curS = want; }
+                { flushBatch(__LINE__); SetShaderValue(g_shader, g_locIdxScale, &want, SHADER_UNIFORM_FLOAT); curS = want; }
             }
             // Record what THIS draw leaves in the destination's alpha, for whoever reads it next.
             if (!c.isTransfer && c.destFbp < 512u && (c.fbmsk & 0xFF000000u) != 0xFF000000u)
@@ -14347,7 +14406,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
                 if (idxRt && c.destFbp == 336u)
                 {   // [dlx] ACTUAL GL state at a served import: write mask + blend factors.
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     unsigned char wm[4] = {9,9,9,9}; int bs=-1, bd=-1, bsa=-1, bda=-1, be=-1;
                     glGetBooleanv(0x0C23u /*GL_COLOR_WRITEMASK*/, wm);
                     glGetIntegerv(0x80C9u /*GL_BLEND_SRC_RGB*/, &bs);
@@ -14388,7 +14447,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const float want = idxRt ? 1.0f : 0.0f;
             if (want != g_curIdxMode && g_locIdxMode >= 0)
             {
-                rlDrawRenderBatchActive();          // the mode changes how texels are read
+                flushBatch(__LINE__);          // the mode changes how texels are read
                 SetShaderValue(g_shader, g_locIdxMode, &want, SHADER_UNIFORM_FLOAT);
                 g_curIdxMode = want;
             }
@@ -14420,7 +14479,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     // the units raylib's batch binds/unbinds (0..4), so the binding survives to
                     // the draw.
                     static const int kPalUnit = 8;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     glActiveTexture(0x84C0u + kPalUnit);   // GL_TEXTURE0 + 8
                     glBindTexture(0x0DE1u, pal.id);
                     glActiveTexture(0x84C0u);              // leave unit 0 current for everything else
@@ -14442,7 +14501,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                 }
                 else if (g_locIdxMode >= 0 && g_curIdxMode != 0.0f)
                 {   // no palette published yet -> do not sample garbage, fall back to normal
-                    float z = 0.0f; rlDrawRenderBatchActive();
+                    float z = 0.0f; flushBatch(__LINE__);
                     SetShaderValue(g_shader, g_locIdxMode, &z, SHADER_UNIFORM_FLOAT); g_curIdxMode = 0.0f;
                 }
             }
@@ -14468,7 +14527,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             const uint8_t wantA = fromFbo ? 1u : c.tcc;
             if (s_swzState.get(tex.id) != (int)wantA)
             {
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 glBindTexture(0x0DE1 /*GL_TEXTURE_2D*/, tex.id);
                 glTexParameteri(0x0DE1, 0x8E45 /*GL_TEXTURE_SWIZZLE_A*/, wantA ? 0x1906 /*GL_ALPHA*/ : 1 /*GL_ONE*/);
                 glBindTexture(0x0DE1, 0);
@@ -14559,7 +14618,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                     if (s_lc && s_ln < 40u && curFbp == c.destFbp)
                     {
                         ++s_ln;
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         auto fit2 = g_fbos.find(c.destFbp);
                         if (fit2 != g_fbos.end())
                         {
@@ -14745,7 +14804,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             static bool d2 = false; static unsigned long n2 = 0;
             if (s_gd2 && !d2 && !c.srcIndexed && c.srcTbp0 == 336u * 32u && (c.srcPsm == 0x02u || c.srcPsm == 0x0Au) && ++n2 == 99)
             {
-                d2 = true; rlDrawRenderBatchActive();
+                d2 = true; flushBatch(__LINE__);
                 if (tex.id != 0) { Image ti = LoadImageFromTexture(tex); ExportImage(ti, "/home/z3/Desktop/bt3/work/ga_ctl_tex.png"); UnloadImage(ti); }
                 std::fprintf(stderr, "[gpualias] dumped consumer-bound texture (id=%u %dx%d fromFbo=%d)\n", tex.id, tex.width, tex.height, fromFbo ? 1 : 0);
             }
@@ -14760,7 +14819,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                         // fbp336, then fighter B's decal samples fbp336). Without a barrier the sampler saw the pre-mesh contents
                         // (the far fighter's decal painted a band = the live "wedge"); a full readback at that point fixed it.
                         static const bool s_tb = [](){ const char *v = std::getenv("PS2X_TEXBARRIER"); return !(v && v[0] == '0'); }();
-                        if (s_tb) { rlDrawRenderBatchActive(); ps2xTextureBarrier(); }
+                        if (s_tb) { flushBatch(__LINE__); ps2xTextureBarrier(); }
                         g_lastRenderedFboTex = 0;
                     }
                     // [alphaonlyfbo] the scene-alpha extraction reads (fbmsk 00FFFFFF, CT32 scene src)
@@ -14778,7 +14837,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                          g_rtSnap.count(c.srcTbp0 / 32u) ? g_rtSnap[c.srcTbp0 / 32u].texture.id : 0u);
                             if (tex.id != 0)
                             {   // what alpha does the serve's texture ACTUALLY hold right now?
-                                rlDrawRenderBatchActive();
+                                flushBatch(__LINE__);
                                 int tw = 0, th = 0, pt = 0; glGetIntegerv(0x8069, &pt);
                                 glBindTexture(0x0DE1u, tex.id);
                                 glGetTexLevelParameteriv(0x0DE1u, 0, 0x1000 /*WIDTH*/, &tw);
@@ -14815,7 +14874,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                                               // and the HUD gauge palettes (11472/11476). Sky/clouds land at G0.98 with this.
                         static float cur128 = -1.0f;
                         if (g_locABl128 >= 0 && want128 != cur128)
-                        { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
+                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locABl128, &want128, SHADER_UNIFORM_FLOAT); cur128 = want128; }
                     }
                     const float mode = aofKeep ? 4.0f
                                      : (s_texaFbo && fromFbo && c.tcc && tex.id != 0
@@ -14865,7 +14924,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             auto it = g_fbos.find((uint32_t)s_fd2);
                             if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                             {
-                                rlDrawRenderBatchActive();
+                                flushBatch(__LINE__);
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
                                 rlEnableFramebuffer(it->second.rt.id);
@@ -14930,7 +14989,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
                             auto it = g_fbos.find((uint32_t)s_fd3);
                             if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                             {
-                                rlDrawRenderBatchActive();
+                                flushBatch(__LINE__);
                                 const int w = it->second.w, h = it->second.h;
                                 std::vector<uint32_t> buf((size_t)w * h);
                                 rlEnableFramebuffer(it->second.rt.id);
@@ -14958,7 +15017,7 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
 if (done.size() < 6 && !done.count(c.texKey))
                             {
 done.insert(c.texKey);
-                                rlDrawRenderBatchActive();
+                                flushBatch(__LINE__);
                                 Image im = LoadImageFromTexture(tex);
                                 if (im.data && im.width >= 16)
                                 {
@@ -14990,7 +15049,7 @@ done.insert(c.texKey);
                         static float curPQ = -1.0f;
                         const float want = (c.isTriangle && c.tri[0].q != 1.0f) ? 1.0f : 0.0f;
                         if (g_locPerspQ >= 0 && want != curPQ)
-                        { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locPerspQ, &want, SHADER_UNIFORM_FLOAT); curPQ = want; }
+                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locPerspQ, &want, SHADER_UNIFORM_FLOAT); curPQ = want; }
                     }
                     {   // [bilin] PS2X_BILINDBG=1: is the GS MMAG=1 bilinear flag actually
                         // reaching the character draws? Console sets MMAG=1 on every scene draw;
@@ -15026,7 +15085,7 @@ done.insert(c.texKey);
 if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 done.insert(c.texKey);
-                                rlDrawRenderBatchActive();
+                                flushBatch(__LINE__);
                                 Image im = LoadImageFromTexture(tex);
                                 if (im.data)
                                 {
@@ -15064,7 +15123,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                                            return v && v[0] && v[0] != '0'; }();
                             if (s_tl && (n7 % s_aa) == 0)
                             {
-                                rlDrawRenderBatchActive();
+                                flushBatch(__LINE__);
                                 auto it2 = g_fbos.find(0u);
                                 if (it2 != g_fbos.end() && it2->second.rt.texture.id != 0)
                                 {
@@ -15107,7 +15166,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             if (!s_tl && n7 >= s_aa && dumped < 1)
                             {
                                 dumped = 1;
-                                rlDrawRenderBatchActive();
+                                flushBatch(__LINE__);
                                 auto it = g_fbos.find(0u);
                                 if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                                 {
@@ -15185,7 +15244,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             static const char *ovr = std::getenv("PS2X_ZBYTE");
                             const float zs = (ovr && ovr[0]) ? (float)std::atof(ovr)
                                                              : (float)(g_zwbZMax / (16384.0 * 255.0));
-                            rlDrawRenderBatchActive();
+                            flushBatch(__LINE__);
                             SetShaderValue(g_shader, g_locZScale, &zs, SHADER_UNIFORM_FLOAT);
                             std::fprintf(stderr, "[zbyte] zMax=%.0f -> uZScale=%.4f%s\n", g_zwbZMax, zs,
                                          (ovr && ovr[0]) ? " (PS2X_ZBYTE override)" : " (derived)");
@@ -15194,7 +15253,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {   static float curZT = -1.0f;
                         const float wantZ = zTexBind ? 1.0f : 0.0f;
                         if (g_locZTex >= 0 && wantZ != curZT)
-                        { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locZTex, &wantZ, SHADER_UNIFORM_FLOAT); curZT = wantZ; }
+                        { flushBatch(__LINE__); SetShaderValue(g_shader, g_locZTex, &wantZ, SHADER_UNIFORM_FLOAT); curZT = wantZ; }
                     }
                     {   // [celu] PS2X_CELU=1: histogram the ramp coordinate the cel/outline pass
                         // (tbp 15680, bm 0x62) actually samples. A toon ramp should put most of
@@ -15301,7 +15360,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (g_locTexa >= 0 && (tv[0] != curTexa[0] || tv[1] != curTexa[1] ||
                                            tv[2] != curTexa[2] || tv[3] != curTexa[3]))
                     {
-                        rlDrawRenderBatchActive(); // TEXA changes sampled alpha: flush pending verts
+                        flushBatch(__LINE__); // TEXA changes sampled alpha: flush pending verts
                         SetShaderValue(g_shader, g_locTexa, tv, SHADER_UNIFORM_VEC4);
                         curTexa[0] = tv[0]; curTexa[1] = tv[1]; curTexa[2] = tv[2]; curTexa[3] = tv[3];
                     }
@@ -15460,14 +15519,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                              z2, c.dx0, c.dy0, c.dx1, c.dy1, c.sx, c.sy, c.sw, c.sh, ax0, ax1, ay0, ay1, area);
         }
         if (s_mbtaArmed)
-        {   rlDrawRenderBatchActive();
+        {   flushBatch(__LINE__);
             const float off4 = 0.0f;
             if (g_locForceA >= 0) SetShaderValue(g_shader, g_locForceA, &off4, SHADER_UNIFORM_FLOAT);
             s_mbtaArmed = false;
         }
         if (s_a44vizArmed)
         {   // disarm from the PREVIOUS draw before this one is submitted
-            rlDrawRenderBatchActive();
+            flushBatch(__LINE__);
             const float off = 0.0f;
             if (g_locUViz >= 0) SetShaderValue(g_shader, g_locUViz, &off, SHADER_UNIFORM_FLOAT);
             s_a44vizArmed = false;
@@ -15545,7 +15604,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     auto sit = g_fbos.find(tbp0ToFbp(c.srcTbp0));
                     if (sit != g_fbos.end() && sit->second.rt.texture.id != 0)
                     {
-                        rlDrawRenderBatchActive(); rlEnableFramebuffer(sit->second.rt.id); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
+                        flushBatch(__LINE__); rlEnableFramebuffer(sit->second.rt.id); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                         // PS2X_DECALSYNC=2: also drain the GPU + texture barrier after the rebind. =3: SNAPSHOT -- blit the
                         // silhouette FBO into a private texture (a blit is a hard sync point) and sample the decal from that.
                         static const int s_dsMode = [](){ const char *v = std::getenv("PS2X_DECALSYNC"); return v && v[0] ? std::atoi(v) : 3; }();   // default 3 (snapshot): measured band 41 -> 0 px, shadows byte-identical
@@ -15579,7 +15638,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     else if (c.destFbp == 336u) kind = c.isTransfer ? 3 : (c.isTriangle ? 0 : 1);
                     if (kind == 1 && frames < 2 && !c.isTransfer)
                     {
-                        rlDrawRenderBatchActive();   // the previous sprite is now drawn under the CURRENT GL state: read it
+                        flushBatch(__LINE__);   // the previous sprite is now drawn under the CURRENT GL state: read it
                         int fb = -1, sc[4] = {0,0,0,0}, vp[4] = {0,0,0,0}; unsigned char cm[4] = {0,0,0,0};
                         glGetIntegerv(0x8CA6, &fb); glGetIntegerv(0x0C10, sc); glGetIntegerv(0x0BA2, vp); glGetBooleanv(0x0C23, cm);
                         std::fprintf(stderr, "[f336census]     spr rect (%.1f,%.1f)-(%.1f,%.1f) rgba=%u,%u,%u,%u abe=%d | GL: fbo=%d scissor=(%d,%d %dx%d) sc_on=%d viewport=(%d,%d %dx%d) mask=%d%d%d%d blend=%d depth=%d curFbp=%u curRealFbp=%u\n",
@@ -15596,7 +15655,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 auto it = g_fbos.find(336u);
                                 if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                                 {
-                                    rlDrawRenderBatchActive(); rlEnableFramebuffer(it->second.rt.id);
+                                    flushBatch(__LINE__); rlEnableFramebuffer(it->second.rt.id);
                                     if (s_cmode == 6) { uint32_t px1 = 0; glReadPixels(0, 0, 1, 1, 0x1908, 0x1401, &px1); }
                                     curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                                 }
@@ -15606,7 +15665,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                 auto it = g_fbos.find(336u);
                                 if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     const int w = it->second.w, h = it->second.h; std::vector<uint32_t> buf((size_t)w * h);
                                     rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                                     rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
@@ -15682,7 +15741,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             }
             if (!isShadowDecal && g_curReg[3] > 0.5f && g_locRegion >= 0)
             {   // [region] the clamp uniform persists across draws; disable it before any non-decal command (sprites never set it)
-                rlDrawRenderBatchActive(); const float off[4] = {1.f, 0.f, 1.f, 0.f};
+                flushBatch(__LINE__); const float off[4] = {1.f, 0.f, 1.f, 0.f};
                 SetShaderValue(g_shader, g_locRegion, off, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, off, sizeof off);
                 // [decalend] the FIRST sprite after a decal batch was lost (the second fighter's 336 clear missed its first
                 // 32-px column -> 17 px of fighter A's silhouette survived -> fighter B's decal projected them = the sliver).
@@ -15699,7 +15758,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     auto it = g_fbos.find(curRealFbp);
                     if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         const int h = it->second.h;
                         glScissor(0, h - 256, 256, 256); glEnable(0x0C11 /*GL_SCISSOR_TEST*/);
                         glColorMask(1, 1, 1, 1); glClearColor(0.f, 0.f, 0.f, 0.f); glClear(0x00004000u);
@@ -15712,7 +15771,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             {   // [decaldbg 6] the visualiser uniform persists too: turn it off before any non-decal command
                 static int loc = -2; if (loc == -2) loc = GetShaderLocation(g_shader, "uUViz");
                 static bool on = false;
-                if (loc >= 0) { rlDrawRenderBatchActive(); const float z = 0.f; SetShaderValue(g_shader, loc, &z, SHADER_UNIFORM_FLOAT); on = false; }
+                if (loc >= 0) { flushBatch(__LINE__); const float z = 0.f; SetShaderValue(g_shader, loc, &z, SHADER_UNIFORM_FLOAT); on = false; }
             }
             {   // [decaldbg] PS2X_DECALDBG=1: draw the shadow-decal tiles UNTEXTURED (vertex colour, no alpha test) to see
                 // their screen coverage; =2: textured but alpha test off; =3: like 1 but depth test off too.
@@ -15740,7 +15799,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     auto it = g_fbos.find(s_afterDest);
                     if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         const int w = it->second.w, h = it->second.h; std::vector<uint32_t> buf((size_t)w * h);
                         rlEnableFramebuffer(it->second.rt.id); glReadPixels(0, 0, w, h, 0x1908, 0x1401, buf.data()); curFbp = 0xFFFFFFFFu; curRealFbp = 0xFFFFFFFFu;
                         rsBindReadDownsampled(it->second);   // [rscale] logical-coordinate reads below
@@ -15764,7 +15823,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         auto it = g_fbos.find(336u);
                         if (it != g_fbos.end() && it->second.rt.texture.id != 0)
                         {
-                            rlDrawRenderBatchActive();
+                            flushBatch(__LINE__);
                             const int w = it->second.w, h = it->second.h;
                             std::vector<uint32_t> buf((size_t)w * h);
                             rlEnableFramebuffer(it->second.rt.id);
@@ -15826,7 +15885,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 if (sf.stagSeq != g_glEnterSeq[fIt->second])
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     rsDownsampled(sf);
                                     sf.stagSeq = g_glEnterSeq[fIt->second];
                                 }
@@ -15930,7 +15989,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     static int lastKind = -2; static int runN = 0;
                     auto flushRun = [&]() {
                         if (lastKind == -2 || runN == 0 || lines >= 40) return;
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         auto fi3 = g_fbos.find((uint32_t)s_tr);
                         if (fi3 == g_fbos.end() || fi3->second.rt.texture.id == 0) return;
                         const int rw = std::min(fi3->second.w, 256), rh = std::min(fi3->second.h, 256);
@@ -15995,7 +16054,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         int fh = 512; auto fi2 = g_fbos.find(c.destFbp);
                         if (fi2 != g_fbos.end() && fi2->second.h > 0) fh = fi2->second.h;
                         uint32_t before = 0, after = 0;
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         glReadPixels(mx, fh - 1 - my, 1, 1, 0x1908, 0x1401, &before);
                         // let the sprite draw, then read the same pixel again
                         struct Post { int mx, my, fh; uint32_t before; int *n; } ;
@@ -16057,7 +16116,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             int dqFboH = 0, dqBoundAtPre = 0; unsigned dqFboId = 0;
             if (dqThis && s_dqN < 4096)
             {
-                rlDrawRenderBatchActive();      // everything queued BEFORE the darkener executes now
+                flushBatch(__LINE__);      // everything queued BEFORE the darkener executes now
                 uint32_t rfq = c.destFbp;
                 { auto itq = g_realFbpMap.find(c.destFbp); if (itq != g_realFbpMap.end()) rfq = itq->second; }
                 auto fiq = g_fbos.find(rfq);
@@ -16171,7 +16230,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 static const bool s_ixf = [](){ const char *v = std::getenv("PS2X_IDXFLUSH"); return v && v[0] && v[0] != '0'; }();
                 static const bool s_iso224 = [](){ const char *v = std::getenv("PS2X_ISO224"); return v && v[0] && v[0] != '0'; }();
                 const bool isolateDraw = (s_ixf && idxRt) || (s_iso224 && c.destFbp == 224u);
-                if (isolateDraw) rlDrawRenderBatchActive();   // flush everything queued BEFORE this draw
+                if (isolateDraw) flushBatch(__LINE__);   // flush everything queued BEFORE this draw
                 if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
                                  c.destFbp, c.fbmsk, fromFbo?1:0, tex.id); }
@@ -16190,7 +16249,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 if (sf.stagSeq != g_glEnterSeq[fIt->second])
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     rsDownsampled(sf);
                                     sf.stagSeq = g_glEnterSeq[fIt->second];
                                 }
@@ -16240,7 +16299,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 }
                 rlEnd();
                 rlSetTexture(0);
-                if (isolateDraw) rlDrawRenderBatchActive();   // and submit it before anything can change the uniforms
+                if (isolateDraw) flushBatch(__LINE__);   // and submit it before anything can change the uniforms
                 {   // [edgestage] PS2X_EDGESTAGE=1: dump the base f336 FBO when the edge generator moves from one
                     // stage to the next (DECAL -> R-sub -> G-sub -> stamps), classified by fbmsk; logs the fields too.
                     static const bool s_es = [](){ const char *v = std::getenv("PS2X_EDGESTAGE"); return v && v[0] && v[0] != '0'; }();
@@ -16255,7 +16314,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                         if (stage != lastStage && lastStage != 0 && !dumpedS[lastStage] && g_fbos.count(336u))
                         {
-                            dumpedS[lastStage] = true; rlDrawRenderBatchActive();
+                            dumpedS[lastStage] = true; flushBatch(__LINE__);
                             static const char *names[4] = {"none", "decal", "rsub", "gsub"};
                             auto &fb3 = g_fbos[336u]; const int w3 = fb3.w, h3 = fb3.h;
                             std::vector<uint32_t> b3((size_t)w3 * h3); int pf = 0; glGetIntegerv(0x8CA6, &pf);
@@ -16275,7 +16334,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     static const uint32_t s_ecDest = (s_ecKey >= 512u) ? (s_ecKey >> 8) : s_ecKey;   // relocated view key -> its base fbp
                     if (s_ec && g_replayInWindow && ecn < 4 && c.destFbp == s_ecDest && c.srcPsm == 27u && c.texKey && g_fbos.count(s_ecKey))
                     {
-                        ++ecn; rlDrawRenderBatchActive();
+                        ++ecn; flushBatch(__LINE__);
                         auto &fb2 = g_fbos[s_ecKey]; const int w2 = fb2.w, h2 = fb2.h;
                         std::vector<uint32_t> buf2((size_t)w2 * h2);
                         int prevFB = 0; glGetIntegerv(0x8CA6, &prevFB);
@@ -16367,7 +16426,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     {
                         ++gn;
                         int tw2 = 0, th2 = 0, abits = 0;
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         glBindTexture(0x0DE1u, tex.id);
                         glGetTexLevelParameteriv(0x0DE1u, 0, 0x1000u, &tw2);
                         glGetTexLevelParameteriv(0x0DE1u, 0, 0x1001u, &th2);
@@ -16414,7 +16473,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 if (sf.stagSeq != g_glEnterSeq[fIt->second])
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     rsDownsampled(sf);
                                     sf.stagSeq = g_glEnterSeq[fIt->second];
                                 }
@@ -16462,7 +16521,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             if (dqArmed)
             {   // [darkq] execute THIS sprite's quad now, close the query, and census the
                 // complete discard surface as it stood for that very glDraw.
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 glEndQuery(0x8914);
                 unsigned int samples = 0xFFFFFFFFu;
                 glGetQueryObjectuiv(s_dqQ, 0x8866 /*GL_QUERY_RESULT*/, &samples);
@@ -16646,7 +16705,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 if (sf.stagSeq != g_glEnterSeq[fIt->second])
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     rsDownsampled(sf);
                                     sf.stagSeq = g_glEnterSeq[fIt->second];
                                 }
@@ -16784,7 +16843,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     const float cy = (c.tri[0].y + c.tri[1].y + c.tri[2].y) / 3.0f + offY;
                     if (zn < 8 && cx >= 4.0f && cx <= 500.0f && cy >= 4.0f && cy <= 440.0f)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         int fboH = m_fboH;
                         { auto fit = g_fbos.find(c.destFbp); if (fit != g_fbos.end() && fit->second.h > 0) fboH = fit->second.h; }
                         float dz = -1.0f;
@@ -16830,7 +16889,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     const float cy = (c.tri[0].y + c.tri[1].y + c.tri[2].y) / 3.0f + offY;
                     if (zn2 < 48 && cx >= 4.0f && cx <= 500.0f && cy >= 4.0f && cy <= 440.0f)
                     {
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         int fboH = m_fboH;
                         { auto fit = g_fbos.find(c.destFbp); if (fit != g_fbos.end() && fit->second.h > 0) fboH = fit->second.h; }
                         float dz = -1.0f;
@@ -16897,7 +16956,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 if (sf.stagSeq != g_glEnterSeq[fIt->second])
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     rsDownsampled(sf);
                                     sf.stagSeq = g_glEnterSeq[fIt->second];
                                 }
@@ -16950,7 +17009,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         }
                         rlEnd();
                         rlSetTexture(0);
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         uint32_t px = 0;
                         // glReadPixels is BOTTOM-UP while our screen coords are top-down; reading
                         // at cy sampled a mirrored row that nothing had drawn into yet, which read
@@ -16986,7 +17045,7 @@ if (done.size() < 14 && !done.count(c.texKey))
             rlCheckRenderBatchLimit(4);
             {   // [region] declared/actual clamp for RT-sourced draws (see uRegion)
                 static int s_locUViz = -2; if (s_locUViz == -2) s_locUViz = GetShaderLocation(g_shader, "uUViz");
-                { const float v = (g_decalUViz && g_curDecalCmd == &c) ? g_decalUVizMode : 0.f; if (s_locUViz >= 0 && v > 0.5f) { rlDrawRenderBatchActive(); SetShaderValue(g_shader, s_locUViz, &v, SHADER_UNIFORM_FLOAT); } }
+                { const float v = (g_decalUViz && g_curDecalCmd == &c) ? g_decalUVizMode : 0.f; if (s_locUViz >= 0 && v > 0.5f) { flushBatch(__LINE__); SetShaderValue(g_shader, s_locUViz, &v, SHADER_UNIFORM_FLOAT); } }
                         float reg[4] = {1.f, 0.f, 1.f, 0.f};
             if (g_curDecalCmd == &c && fromFbo && c.srcTexW > 0 && c.srcTexH > 0 && tex.width > 0 && tex.height > 0 && (tex.width != c.srcTexW || tex.height != c.srcTexH))
             {   // clamp INSIDE the declared region by half a texel: the texel just past the region is live FBO data
@@ -16995,7 +17054,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         const float hu = s_inset / (float)tex.width, hv = s_inset / (float)tex.height;
                         reg[0] = ku - hu; reg[1] = vflip ? 1.0f - kv + hv : hv; reg[2] = vflip ? 1.0f - hv : kv - hv; reg[3] = 1.f; }
             if (g_locRegion >= 0 && (reg[0] != g_curReg[0] || reg[1] != g_curReg[1] || reg[2] != g_curReg[2] || reg[3] != g_curReg[3]))
-            { rlDrawRenderBatchActive(); SetShaderValue(g_shader, g_locRegion, reg, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, reg, sizeof reg); }
+            { flushBatch(__LINE__); SetShaderValue(g_shader, g_locRegion, reg, SHADER_UNIFORM_VEC4); std::memcpy(g_curReg, reg, sizeof reg); }
             }
             // [glhoist] one pass per triangle of the run (nEmit == 1 for an ordinary command). Everything
             // above ran ONCE; only the vertices differ, so only this loop repeats -- and it must redo every
@@ -17126,7 +17185,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (s_n < 16)
                 {
                     ++s_n;
-                    rlDrawRenderBatchActive();
+                    flushBatch(__LINE__);
                     // Live GL blend state at the flush that just drew this triangle: the pixel
                     // alpha decays 255->1 across frames = SRC_ALPHA blending, yet applyBlend
                     // computed constant-alpha opaque. Read what GL actually had.
@@ -17217,7 +17276,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                     if (s_n == 2)
                     {
                         glBindTexture(0x0DE1, (unsigned)prevBind);
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         rlDisableColorBlend();
                         if (g_zpassWatch && c.srcPsm == g_zpassPsm) { static int z1=0; if (++z1<=3)
                     std::fprintf(stderr, "[zpass] EMITTED (sprite path) dest=f%u fbmsk=%08x fromFbo=%d tex=%u\n",
@@ -17237,7 +17296,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 if (sf.stagSeq != g_glEnterSeq[fIt->second])
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     rsDownsampled(sf);
                                     sf.stagSeq = g_glEnterSeq[fIt->second];
                                 }
@@ -17289,7 +17348,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 if (sf.stagSeq != g_glEnterSeq[fIt->second])
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     rsDownsampled(sf);
                                     sf.stagSeq = g_glEnterSeq[fIt->second];
                                 }
@@ -17321,7 +17380,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         rlTexCoord2f(0.02f, -0.75f); rlVertex2f(38, 10);
                         rlEnd();
                         rlSetTexture(0);
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         rlEnableColorBlend();
                         // Third twin at (50,10): drawn under the CHAR DRAW'S OWN blend state
                         // (constant-alpha k=FIX/128 was just applied for this very cmd) — the
@@ -17344,7 +17403,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                             {
                                 if (sf.stagSeq != g_glEnterSeq[fIt->second])
                                 {
-                                    rlDrawRenderBatchActive();
+                                    flushBatch(__LINE__);
                                     rsDownsampled(sf);
                                     sf.stagSeq = g_glEnterSeq[fIt->second];
                                 }
@@ -17376,7 +17435,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                         rlTexCoord2f(0.02f, -0.75f); rlVertex2f(58, 10);
                         rlEnd();
                         rlSetTexture(0);
-                        rlDrawRenderBatchActive();
+                        flushBatch(__LINE__);
                         unsigned char q[4] = {9, 9, 9, 9};
                         unsigned char qn[4] = {9, 9, 9, 9};
                         unsigned char qb[4] = {9, 9, 9, 9};
@@ -17403,7 +17462,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         // batch state carried across the FBO switch when actual pixels are written, this clears it.
         {
             static const bool s_fr = [](){ const char *v = std::getenv("PS2X_FLUSH_RT"); return v && v[0] && v[0] != '0'; }();
-            if (s_fr && c.destFbp != displayFbp) rlDrawRenderBatchActive();
+            if (s_fr && c.destFbp != displayFbp) flushBatch(__LINE__);
         }
     }
     ragStat.markEnd();
@@ -17441,12 +17500,12 @@ if (done.size() < 14 && !done.count(c.texKey))
         rlTexCoord2f(1.0f, 0.0f); rlVertex2f(250.0f, 300.0f);
         rlEnd();
         rlSetTexture(0);
-        rlDrawRenderBatchActive();
+        flushBatch(__LINE__);
     }
 
     if (wantEndSnap)
     {
-        rlDrawRenderBatchActive();
+        flushBatch(__LINE__);
         int fh = 448; { auto fit = g_fbos.find(curFbp); if (fit != g_fbos.end()) fh = fit->second.h; }
         dumpBoundFbo("/home/z3/Desktop/bt3/work/probefb_end.ppm", 512, fh);
         if (FILE *f = srcDiagFile()) { std::fprintf(f, "[endsnap] taken, lastFbp=%u\n", curFbp); std::fflush(f); }
@@ -17499,7 +17558,7 @@ if (done.size() < 14 && !done.count(c.texKey))
         BeginTextureMode(g_atlas);
         rlDisableScissorTest();
         DrawRectangle(ts.x + 40, ts.y + 40, 200, 160, Color{255, 0, 255, 255});
-        rlDrawRenderBatchActive();
+        flushBatch(__LINE__);
         EndTextureMode();
     }
 
@@ -18056,7 +18115,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 BeginTextureMode(kv.second.rt);
                 rlDisableScissorTest();
                 DrawRectangle(60, 60, 120, 120, Color{255, 0, 255, 255});
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 EndTextureMode();
                 break;
             }
@@ -18120,7 +18179,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                 if (vw <= 0 || vh <= 0) continue;
                 static std::vector<uint32_t> vpx;
                 vpx.assign((size_t)vw * vh, 0u);
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 rlEnableFramebuffer(vfbo.rt.id);
                 glReadPixels(0, vfbo.h - vh, vw, vh, 0x1908, 0x1401, vpx.data());
                 rlDisableFramebuffer();
@@ -18163,7 +18222,7 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     return (v && v[0]) ? std::atof(v) : 0.0; }();
                             extern double g_zwbZMax;
                 const double s_zwbMax_use = (s_zwbMax > 0.0) ? s_zwbMax : g_zwbZMax;
-                rlDrawRenderBatchActive();
+                flushBatch(__LINE__);
                 const int zw = g_sharedDepthW > 0 ? g_sharedDepthW : zf->second.w;
                 const int zh = g_sharedDepthH > 0 ? g_sharedDepthH : zf->second.h;
                 static std::vector<float> zbuf;

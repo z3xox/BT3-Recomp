@@ -7914,13 +7914,22 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     // Apply per-draw depth state, flushing the pending batch first so the GL state change
     // takes effect between draws (raylib batches). No-op unless depth is enabled.
     ragStat.phase(6);
+    // [flushcoalesce] BT3 interleaves an opaque pass (blend off, write RGBA) with a blended one
+    // (blend on, alpha write off) per primitive: measured 125k mask flips 15<->7 and 125k blend
+    // flips 0<->17 over 65 frames, ~1,920 alternations a frame. Those are the SAME draws, and
+    // applyBlend/applyFbmsk each flushed the batch independently -- two flushes per draw where
+    // one does. Only the FIRST state change in a command needs to flush: it draws the queued
+    // verts under the fully-old state, and no vertices are emitted between the state
+    // applications (verified: nothing emits between applyBlend and applyFbmsk).
+    // Reset once per command, at the `const DrawCmd &c = ...` binding.
+    bool cmdFlushed = false;
     auto applyDepth = [&](bool test, uint8_t func, bool write) {
         if (!depthOn) return;
         const int wantTest = test ? 1 : 0;
         const int wantFunc = test ? static_cast<int>(func) : -1; // func irrelevant when test off
         const int wantWrite = write ? 1 : 0;
         if (wantTest == curDepthTest && wantFunc == curDepthFunc && wantWrite == curDepthWrite) return;
-        flushBatch(__LINE__); // flush before changing GL depth state
+        if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]   // was: flush before changing GL depth state
         if (test) { rlEnableDepthTest(); glDepthFunc(glDepthFuncFor(func));
                     if (write) { extern unsigned long g_dbgDepthWriteDraws; ++g_dbgDepthWriteDraws; } }
         else rlDisableDepthTest();
@@ -7934,15 +7943,6 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     bool s_a44vizArmed = false;
     bool s_mbtaArmed = false;
     int curMask = -1; // -1 unknown, else 4-bit rgba write-enable
-    // [flushcoalesce] BT3 interleaves an opaque pass (blend off, write RGBA) with a blended one
-    // (blend on, alpha write off) per primitive: measured 125k mask flips 15<->7 and 125k blend
-    // flips 0<->17 over 65 frames, ~1,920 alternations a frame. Those are the SAME draws, and
-    // applyBlend/applyFbmsk each flushed the batch independently -- two flushes per draw where
-    // one does. Only the FIRST state change in a command needs to flush: it draws the queued
-    // verts under the fully-old state, and no vertices are emitted between the state
-    // applications (verified: nothing emits between applyBlend and applyFbmsk).
-    // Reset once per command, at the `const DrawCmd &c = ...` binding.
-    bool cmdFlushed = false;
     auto applyFbmsk = [&](uint32_t fbmsk) {
         const int want = ((fbmsk & 0x000000FFu) == 0x000000FFu ? 0 : 1)
                        | ((fbmsk & 0x0000FF00u) == 0x0000FF00u ? 0 : 2)
@@ -8223,7 +8223,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
     auto applyScissor = [&](int sx, int sy, int sw, int sh) {
         if (sx != curSx || sy != curSy || sw != curSw || sh != curSh)
         {
-            flushBatch(__LINE__);
+            if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
             curSx = sx; curSy = sy; curSw = sw; curSh = sh;
             if (s_oneFbo) { rlDisableScissorTest(); return; } // ONE_FBO test: no scissor (content mashes)
             if (s_atlas) {
@@ -8695,7 +8695,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         static const bool s_tccOn = [](){ const char *v = std::getenv("PS2X_TCC"); return !(v && v[0] == '0'); }();
         const float want = (!s_tccOn || (tc.texKey != 0 && tc.tcc != 0)) ? 1.0f : 0.0f;
         if (want == curTcc || g_locTcc < 0) return;
-        flushBatch(__LINE__);
+        if (!cmdFlushed) { flushBatch(__LINE__); cmdFlushed = true; }   // [flushcoalesce]
         SetShaderValue(g_shader, g_locTcc, &want, SHADER_UNIFORM_FLOAT);
         curTcc = want;
     };

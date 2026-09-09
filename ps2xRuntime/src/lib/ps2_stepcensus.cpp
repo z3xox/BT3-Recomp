@@ -175,8 +175,11 @@ bool ps2HalfStepFightActive()
 namespace
 {
     uint8_t *g_hs = nullptr;                      // 0 none, 1 float-halve, 2 int-every-other-frame
-    struct HsRing { uint32_t addr[8]; uint32_t frame[8]; uint8_t pos; };   // per site: last frame per address
-    HsRing *g_hsLast = nullptr;                   // one-shot guard, keyed per (site, address)
+    // one-shot guard keyed per (site, address): a hash table over all addresses (fd11: a smoke-particle lifetime
+    // site touches 29 slots, >10 per frame -- an 8-entry per-site ring thrashed and re-doubled live particles)
+    struct HsEntry { uint32_t addr, frame, pc; };
+    constexpr uint32_t kHsBits = 22, kHsSize = 1u << kHsBits;
+    HsEntry *g_hsLast = nullptr;
     std::atomic<uint64_t> g_hsOneShot{0};
     std::atomic<const R5900Context *> g_hsCtx{nullptr};
     std::atomic<uint64_t> g_hsFloat{0}, g_hsIntSkip{0}, g_hsIntPass{0};
@@ -202,12 +205,10 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     // unmodified: skipping it on an odd frame LOSES it (the half2 freeze: the fight intro polled a flag whose
     // one increment fell on an odd frame). The first tick after a gap therefore passes through at full rate.
     static std::atomic<uint32_t> s_log{0}, s_logD{0};   // [halfstep] the first modifications after the gate opens, for the post-mortem
-    HsRing &rg = g_hsLast[(pc - kBase) >> 2];
-    int slot = -1;
-    for (int i = 0; i < 8; ++i) if (rg.addr[i] == a) { slot = i; break; }
+    HsEntry &e = g_hsLast[((a * 2654435761u) ^ (pc * 40503u)) >> (32u - kHsBits)];
     uint32_t last = 0xFFFF0000u;
-    if (slot >= 0) { last = rg.frame[slot]; rg.frame[slot] = frame; }
-    else { slot = rg.pos; rg.pos = (uint8_t)((rg.pos + 1u) & 7u); rg.addr[slot] = a; rg.frame[slot] = frame; }
+    if (e.addr == a && e.pc == pc) last = e.frame;
+    e.addr = a; e.pc = pc; e.frame = frame;
     const bool firstAfterGap = frame - last > 1u;
     if (k == 3)
     {   // countdown timer ('d'): exact half rate with NO register/memory mismatch. The first decrement after a gap
@@ -251,8 +252,8 @@ void ps2HalfStepEnable(const char *sitesPath)
     FILE *f = std::fopen(sitesPath, "r");
     if (!f) { std::fprintf(stderr, "[halfstep] cannot read %s\n", sitesPath); return; }
     g_hs = new uint8_t[(kEnd - kBase) >> 2]();
-    g_hsLast = new HsRing[(kEnd - kBase) >> 2];
-    for (uint32_t i = 0; i < ((kEnd - kBase) >> 2); ++i) { for (int j = 0; j < 8; ++j) { g_hsLast[i].addr[j] = 0xFFFFFFFFu; g_hsLast[i].frame[j] = 0xFFFF0000u; } g_hsLast[i].pos = 0; }
+    g_hsLast = new HsEntry[kHsSize];
+    for (uint32_t i = 0; i < kHsSize; ++i) { g_hsLast[i].addr = 0xFFFFFFFFu; g_hsLast[i].frame = 0xFFFF0000u; g_hsLast[i].pc = 0; }
     char line[128]; unsigned nf = 0, ni = 0, nd = 0;
     while (std::fgets(line, sizeof line, f))
     {

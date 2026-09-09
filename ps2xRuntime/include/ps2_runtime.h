@@ -259,6 +259,7 @@ void ps2StepCensusDump();
 // [halfstep] PS2X_HALFSTEP=<sites.txt>: run the fight at step 1 (60 Hz) with the census-classified per-frame
 // accumulators advancing by half (floats) or every other frame (integer counters). Zero cost when off.
 extern std::atomic<int> g_ps2HalfStep;
+extern std::atomic<uint64_t> g_ps2HalfStepLogicFrame;   // render frame of the last fight update: the gate
 uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint32_t value, const R5900Context *ctx);
 void ps2HalfStepEnable(const char *sitesPath);
 void ps2HalfStepFrame(const R5900Context *ctx);

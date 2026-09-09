@@ -3376,6 +3376,7 @@ namespace
         const auto now = std::chrono::steady_clock::now();
         const double dt = std::chrono::duration<double>(now - s_t0).count();
         if (dt >= 5.0) { std::fprintf(stderr, "[logicrate] %.1f fight updates/s (%u in %.1f s)\n", (double)n / dt, n, dt); s_n.store(0u); s_t0 = now; }
+        g_ps2HalfStepLogicFrame.store(g_bt3FrameCount.load(std::memory_order_relaxed), std::memory_order_relaxed);   // [halfstep] gate
         if (g_orig115950) g_orig115950(rdram, ctx, runtime);
     }
     // [vf3probe] PS2X_VF3PROBE=1: print the persistent VU0 basis rows (vf1-vf3) as seen by

@@ -153,9 +153,13 @@ void ps2StepCensusFrame(const R5900Context *ctx)
 // old + (new-old)/2; i = integer counter: apply the store on even render frames only, keep the old value on odd
 // ones). Only the render-kick thread's stores are touched; everything else is untouched.
 std::atomic<int> g_ps2HalfStep{0};
+std::atomic<uint64_t> g_ps2HalfStepLogicFrame{0};
 namespace
 {
     uint8_t *g_hs = nullptr;                      // 0 none, 1 float-halve, 2 int-every-other-frame
+    struct HsRing { uint32_t addr[8]; uint32_t frame[8]; uint8_t pos; };   // per site: last frame per address
+    HsRing *g_hsLast = nullptr;                   // one-shot guard, keyed per (site, address)
+    std::atomic<uint64_t> g_hsOneShot{0};
     std::atomic<const R5900Context *> g_hsCtx{nullptr};
     std::atomic<uint64_t> g_hsFloat{0}, g_hsIntSkip{0}, g_hsIntPass{0};
     uint64_t g_hsLastReport = 0;
@@ -169,8 +173,24 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     if (!k) return value;
     const uint32_t a = guestAddr & 0x1FFFFFFFu;
     if (a + size > 32u * 1024u * 1024u) return value;
+    // Gate: only frames on which the fight update ran. The loader, the fight intro and the menus run per-frame
+    // counters on the same thread, and halving those crashed the loader (half3: wild jump to 0x10000000).
+    const uint32_t frame = (uint32_t)g_bt3FrameCount.load(std::memory_order_relaxed);
+    if (frame - (uint32_t)g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) > 2u) return value;
     const uint32_t old = readOld(rdram, a, size);
     if (old == value) return value;
+    // One-shot guard: a per-frame quantity is advanced on consecutive frames. A store at a listed site after a gap
+    // of more than one frame is a one-shot event (a flag set, a state advance, a timer armed) and must land
+    // unmodified: skipping it on an odd frame LOSES it (the half2 freeze: the fight intro polled a flag whose
+    // one increment fell on an odd frame). The first tick after a gap therefore passes through at full rate.
+    HsRing &rg = g_hsLast[(pc - kBase) >> 2];
+    int slot = -1;
+    for (int i = 0; i < 8; ++i) if (rg.addr[i] == a) { slot = i; break; }
+    uint32_t last = 0xFFFF0000u;
+    if (slot >= 0) { last = rg.frame[slot]; rg.frame[slot] = frame; }
+    else { slot = rg.pos; rg.pos = (uint8_t)((rg.pos + 1u) & 7u); rg.addr[slot] = a; rg.frame[slot] = frame; }
+    // an address this site did not touch on the previous frame (or never): a one-shot event, land it unmodified
+    if (frame - last > 1u) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return value; }
     if (k == 1)
     {
         if (size != 4u) return value;
@@ -182,7 +202,7 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
         return bits;
     }
     // integer counter: keep the old value on odd render frames
-    if (g_bt3FrameCount.load(std::memory_order_relaxed) & 1u) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
+    if (frame & 1u) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
     g_hsIntPass.fetch_add(1, std::memory_order_relaxed);
     return value;
 }
@@ -191,6 +211,8 @@ void ps2HalfStepEnable(const char *sitesPath)
     FILE *f = std::fopen(sitesPath, "r");
     if (!f) { std::fprintf(stderr, "[halfstep] cannot read %s\n", sitesPath); return; }
     g_hs = new uint8_t[(kEnd - kBase) >> 2]();
+    g_hsLast = new HsRing[(kEnd - kBase) >> 2];
+    for (uint32_t i = 0; i < ((kEnd - kBase) >> 2); ++i) { for (int j = 0; j < 8; ++j) { g_hsLast[i].addr[j] = 0xFFFFFFFFu; g_hsLast[i].frame[j] = 0xFFFF0000u; } g_hsLast[i].pos = 0; }
     char line[128]; unsigned nf = 0, ni = 0;
     while (std::fgets(line, sizeof line, f))
     {
@@ -211,7 +233,8 @@ void ps2HalfStepFrame(const R5900Context *ctx)
     if (fr - g_hsLastReport >= 600u)
     {
         g_hsLastReport = fr;
-        std::fprintf(stderr, "[halfstep] frame %llu: float halved %llu, int skipped %llu / passed %llu\n", (unsigned long long)fr,
-                     (unsigned long long)g_hsFloat.exchange(0), (unsigned long long)g_hsIntSkip.exchange(0), (unsigned long long)g_hsIntPass.exchange(0));
+        std::fprintf(stderr, "[halfstep] frame %llu: float halved %llu, int skipped %llu / passed %llu, one-shot passthrough %llu\n", (unsigned long long)fr,
+                     (unsigned long long)g_hsFloat.exchange(0), (unsigned long long)g_hsIntSkip.exchange(0), (unsigned long long)g_hsIntPass.exchange(0),
+                     (unsigned long long)g_hsOneShot.exchange(0));
     }
 }

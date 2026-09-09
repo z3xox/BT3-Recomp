@@ -3975,9 +3975,10 @@ namespace
             if (!s_probes.empty() && ps2HalfStepFightActive())
             {
                 static uint32_t s_n = 0; static std::vector<float> s_prev(s_probes.size(), 0.f);
-                if (s_n < 600u)
+                static const uint32_t s_every = [](){ const char *v = std::getenv("PS2X_ANIMPROBE_EVERY"); const int n = v && v[0] ? std::atoi(v) : 10; return (uint32_t)(n < 1 ? 1 : n); }();
+                if (s_n < 60u * s_every)
                 {
-                    if ((s_n % 10u) == 0u)
+                    if ((s_n % s_every) == 0u)
                     {
                         std::string line;
                         for (size_t k = 0; k < s_probes.size(); ++k)

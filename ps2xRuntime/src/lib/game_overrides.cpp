@@ -3864,7 +3864,7 @@ namespace
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
         if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
-        if (g_ps2HalfStep.load(std::memory_order_relaxed)) ps2HalfStepFrame(ctx);        // [halfstep]
+        ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
         {   // [framegate] PS2X_FRAMEGATE (default ON when async is on, =0 disables): require two
             // vsync ticks between render kicks.
             //

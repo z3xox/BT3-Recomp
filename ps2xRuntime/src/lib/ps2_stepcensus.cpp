@@ -152,7 +152,8 @@ void ps2StepCensusFrame(const R5900Context *ctx)
 // [halfstep] the experiment the census exists for. sites.txt lines: "<pc-hex> f|i" (f = float accumulator: store
 // old + (new-old)/2; i = integer counter: apply the store on even render frames only, keep the old value on odd
 // ones). Only the render-kick thread's stores are touched; everything else is untouched.
-std::atomic<int> g_ps2HalfStep{0};
+std::atomic<int> g_ps2HalfStep{0};          // the macros' switch: raised by ps2HalfStepFrame only on fight frames
+static std::atomic<int> g_hsEnabled{0};     // the experiment is configured
 std::atomic<uint64_t> g_ps2HalfStepLogicFrame{0};
 namespace
 {
@@ -222,14 +223,19 @@ void ps2HalfStepEnable(const char *sitesPath)
         else if (kind == 'i') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
     }
     std::fclose(f);
-    g_ps2HalfStep.store(1, std::memory_order_relaxed);
+    g_hsEnabled.store(1, std::memory_order_relaxed);   // the macro switch itself is raised per fight frame (zero cost elsewhere)
     std::fprintf(stderr, "[halfstep] ON: %u float sites halved, %u integer sites on even frames only (%s)\n", nf, ni, sitesPath);
 }
 void ps2HalfStepFrame(const R5900Context *ctx)
 {
-    if (!g_hs) return;
+    if (!g_hs || !g_hsEnabled.load(std::memory_order_relaxed)) return;
     if (!g_hsCtx.load(std::memory_order_relaxed)) g_hsCtx.store(ctx);
     const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+    // raise the macros' switch only while the fight update is running (last update within 2 render frames), so the
+    // loader / intro / menus run the untouched fast path -- not even the hook call (half4 froze in the loader with
+    // every modification gated off: the per-store call overhead alone shifts the loader's timing)
+    const bool active = fr - g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) <= 2u;
+    g_ps2HalfStep.store(active ? 1 : 0, std::memory_order_relaxed);
     if (fr - g_hsLastReport >= 600u)
     {
         g_hsLastReport = fr;

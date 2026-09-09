@@ -3976,7 +3976,8 @@ namespace
             {
                 static uint32_t s_n = 0; static std::vector<float> s_prev(s_probes.size(), 0.f);
                 static const uint32_t s_every = [](){ const char *v = std::getenv("PS2X_ANIMPROBE_EVERY"); const int n = v && v[0] ? std::atoi(v) : 10; return (uint32_t)(n < 1 ? 1 : n); }();
-                if (s_n < 60u * s_every)
+                static const uint32_t s_count = [](){ const char *v = std::getenv("PS2X_ANIMPROBE_N"); const int n = v && v[0] ? std::atoi(v) : 60; return (uint32_t)(n < 1 ? 1 : n); }();
+                if (s_n < s_count * s_every)
                 {
                     if ((s_n % s_every) == 0u)
                     {

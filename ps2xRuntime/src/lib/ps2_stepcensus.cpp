@@ -1,0 +1,149 @@
+// [stepcensus] PS2X_STEPCENSUS=<out.csv>: classify every recompiled STORE SITE by how it advances guest memory
+// from frame to frame. The 60 fps question ("which per-frame quantities would have to advance by half?") cannot
+// be answered statically -- the fight has ~2500 accumulate-in-place sites -- but it can be answered by watching a
+// real fight: for each store PC we track whether the value it overwrites is the value the same site wrote to that
+// address last time (an accumulator chain), and whether the delta is constant (a counter / timer / velocity).
+// Recording is restricted to the thread that runs the per-frame render kick (the game's main thread), keyed on
+// g_bt3FrameCount. The table is a direct-mapped array over the EE code range, so the per-store cost is a few
+// loads; expect the guest to run several times slower while it is on.
+#include "ps2_runtime.h"
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+
+std::atomic<int> g_ps2StepCensus{0};
+extern std::atomic<uint64_t> g_bt3FrameCount;
+
+namespace
+{
+    struct Site
+    {
+        uint32_t count = 0, framesSeen = 0, lastFrame = 0xFFFFFFFFu, sizeMask = 0;
+        uint32_t addrLo = 0xFFFFFFFFu, addrHi = 0;
+        uint32_t ringAddr[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+        uint32_t ringVal[4] = {};
+        uint8_t ringPos = 0;
+        uint32_t chain = 0;      // old value == what this site last wrote to that address (accumulator)
+        uint32_t fplaus = 0;     // both old and new plausible floats
+        float dMode = 0.f; uint32_t dModeN = 0, dOtherN = 0;     // float delta: first-seen mode and its share
+        int32_t iMode = 0; uint32_t iModeN = 0, iOtherN = 0;     // integer delta
+        uint32_t zeroDelta = 0;  // new == old (rewrite of the same value)
+    };
+    constexpr uint32_t kBase = 0x100000u, kEnd = 0x340000u;
+    Site *g_sites = nullptr;
+    std::atomic<const R5900Context *> g_ctx{nullptr};
+    std::string g_out;
+    std::mutex g_dumpMtx;
+    uint64_t g_lastDumpFrame = 0;
+
+    inline bool plausibleFloat(uint32_t bits, float &f)
+    {
+        std::memcpy(&f, &bits, 4);
+        if (!std::isfinite(f)) return false;
+        const float a = std::fabs(f);
+        return bits == 0u || (a >= 1e-6f && a <= 1e6f);
+    }
+    inline uint32_t readOld(const uint8_t *rdram, uint32_t a, uint32_t size)
+    {
+        uint32_t v = 0;
+        if (size == 1) v = rdram[a];
+        else if (size == 2) { uint16_t h; std::memcpy(&h, rdram + a, 2); v = h; }
+        else std::memcpy(&v, rdram + a, 4);
+        return v;
+    }
+    inline int32_t sext(uint32_t v, uint32_t size)
+    {
+        if (size == 1) return (int8_t)v;
+        if (size == 2) return (int16_t)v;
+        return (int32_t)v;
+    }
+}
+
+void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, const R5900Context *ctx)
+{
+    if (!g_sites || !rdram || !ctx || ctx != g_ctx.load(std::memory_order_relaxed)) return;
+    if (size != 1u && size != 2u && size != 4u) return;
+    const uint32_t pc = ctx->pc;
+    if (pc < kBase || pc >= kEnd) return;
+    const uint32_t a = guestAddr & 0x1FFFFFFFu;
+    if (a + size > 32u * 1024u * 1024u) return;
+    Site &s = g_sites[(pc - kBase) >> 2];
+    const uint32_t old = readOld(rdram, a, size);
+    const uint32_t nw = size == 4 ? (uint32_t)valueLo : size == 2 ? (uint32_t)(valueLo & 0xFFFFu) : (uint32_t)(valueLo & 0xFFu);
+    const uint32_t frame = (uint32_t)g_bt3FrameCount.load(std::memory_order_relaxed);
+    s.count++; s.sizeMask |= size;
+    if (frame != s.lastFrame) { s.lastFrame = frame; s.framesSeen++; }
+    if (a < s.addrLo) s.addrLo = a;
+    if (a > s.addrHi) s.addrHi = a;
+    // accumulator chain: did this site write the value we are overwriting?
+    int slot = -1;
+    for (int i = 0; i < 4; ++i) if (s.ringAddr[i] == a) { slot = i; break; }
+    if (slot >= 0) { if (s.ringVal[slot] == old) s.chain++; s.ringVal[slot] = nw; }
+    else { slot = s.ringPos; s.ringPos = (uint8_t)((s.ringPos + 1u) & 3u); s.ringAddr[slot] = a; s.ringVal[slot] = nw; }
+    if (nw == old) { s.zeroDelta++; return; }
+    if (size == 4u)
+    {
+        float fo, fn;
+        if (plausibleFloat(old, fo) && plausibleFloat(nw, fn))
+        {
+            s.fplaus++;
+            const float d = fn - fo;
+            if (s.dModeN == 0u) { s.dMode = d; s.dModeN = 1u; }
+            else if (std::fabs(d - s.dMode) <= 1e-5f * std::fmax(1.f, std::fabs(s.dMode))) s.dModeN++;
+            else s.dOtherN++;
+        }
+    }
+    const int32_t di = sext(nw, size) - sext(old, size);
+    if (s.iModeN == 0u) { s.iMode = di; s.iModeN = 1u; }
+    else if (di == s.iMode) s.iModeN++;
+    else s.iOtherN++;
+}
+
+void ps2StepCensusDump()
+{
+    if (!g_sites || g_out.empty()) return;
+    std::lock_guard<std::mutex> lk(g_dumpMtx);
+    FILE *f = std::fopen(g_out.c_str(), "w");
+    if (!f) { std::fprintf(stderr, "[stepcensus] cannot write %s\n", g_out.c_str()); return; }
+    std::fprintf(f, "pc,count,frames,per_frame,size,addr_lo,addr_hi,chain_pct,same_pct,fplaus_pct,fdelta,fdelta_pct,idelta,idelta_pct\n");
+    uint32_t n = 0;
+    const uint32_t total = (kEnd - kBase) >> 2;
+    for (uint32_t i = 0; i < total; ++i)
+    {
+        const Site &s = g_sites[i];
+        if (s.count < 20u || s.framesSeen < 5u) continue;
+        const double c = s.count;
+        const double nz = c - s.zeroDelta;
+        std::fprintf(f, "0x%06x,%u,%u,%.2f,%u,0x%x,0x%x,%.0f,%.0f,%.0f,%.6g,%.0f,%d,%.0f\n",
+                     kBase + i * 4u, s.count, s.framesSeen, c / (double)s.framesSeen, s.sizeMask, s.addrLo, s.addrHi,
+                     100.0 * s.chain / c, 100.0 * s.zeroDelta / c, nz > 0 ? 100.0 * s.fplaus / nz : 0.0,
+                     (double)s.dMode, s.fplaus ? 100.0 * s.dModeN / (double)s.fplaus : 0.0,
+                     s.iMode, nz > 0 ? 100.0 * s.iModeN / nz : 0.0);
+        ++n;
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "[stepcensus] wrote %u store sites to %s (frame %llu)\n", n, g_out.c_str(), (unsigned long long)g_bt3FrameCount.load());
+}
+
+void ps2StepCensusEnable(const char *outPath)
+{
+    if (!outPath || !outPath[0]) return;
+    g_out = outPath;
+    g_sites = new Site[(kEnd - kBase) >> 2];
+    std::atexit([]() { ps2StepCensusDump(); });
+    g_ps2StepCensus.store(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[stepcensus] store census ON -> %s (%.0f MB table; the main thread's stores only; dump every 600 render frames + at exit)\n",
+                 outPath, (double)sizeof(Site) * ((kEnd - kBase) >> 2) / 1e6);
+}
+
+void ps2StepCensusFrame(const R5900Context *ctx)
+{
+    if (!g_sites) return;
+    if (!g_ctx.load(std::memory_order_relaxed)) { g_ctx.store(ctx); std::fprintf(stderr, "[stepcensus] recording thread bound at frame %llu\n", (unsigned long long)g_bt3FrameCount.load()); }
+    const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+    if (fr - g_lastDumpFrame >= 600u) { g_lastDumpFrame = fr; ps2StepCensusDump(); }
+}

@@ -250,6 +250,13 @@ extern std::atomic<uint32_t> g_bt3DrawMethod;
 void ps2ValueWatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo,
                          const char *op, const R5900Context *ctx);
 
+// [stepcensus] per-store-site census (see ps2_stepcensus.cpp); zero cost when off.
+extern std::atomic<int> g_ps2StepCensus;
+void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, const R5900Context *ctx);
+void ps2StepCensusEnable(const char *outPath);
+void ps2StepCensusFrame(const R5900Context *ctx);
+void ps2StepCensusDump();
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -259,6 +266,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
+    if (g_ps2StepCensus.load(std::memory_order_relaxed) != 0) ps2StepCensusStore(rdram, guestAddr, size, valueLo, ctx);   // [stepcensus]
     const uint32_t _wlo = g_ps2WatchLo.load(std::memory_order_relaxed);
     if (_wlo != 0u)
     {

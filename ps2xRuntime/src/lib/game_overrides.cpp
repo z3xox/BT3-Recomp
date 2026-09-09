@@ -3862,6 +3862,7 @@ namespace
         // would only advance when the next SE command happened to arrive.
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
+        if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
         {   // [framegate] PS2X_FRAMEGATE (default ON when async is on, =0 disables): require two
             // vsync ticks between render kicks.
             //
@@ -4474,6 +4475,7 @@ namespace
         // Camera view-matrix builder probe (PS2X_CAMPROBE).
         // Demo scene-tree recursion-depth guard: default ON (prevents the cyclic-tree stack
         // overflow crash). Disable with PS2X_NO_DEMO_GUARD. The PS2X_DEMOPROBE dump rides on it.
+        if (const char *sc = std::getenv("PS2X_STEPCENSUS"); sc && sc[0]) ps2StepCensusEnable(sc);   // [stepcensus]
         if (std::getenv("PS2X_VSTEP"))
         {   // [vstep] [logicrate]
             g_orig102060 = runtime.lookupFunction(0x00102060u);

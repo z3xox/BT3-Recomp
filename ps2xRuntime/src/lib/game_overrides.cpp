@@ -11,6 +11,9 @@ extern std::atomic<uint64_t> g_guestThreadCpuNs;
 
 // [framegate] vsync tick source, declared at file scope for the same reason as the above.
 namespace ps2_syscalls { uint64_t GetCurrentVSyncTick(); }
+// [fightgate] FILE SCOPE (a block-scope extern inside this file's anonymous namespace would declare a different symbol).
+bool ps2HalfStepFightActive();
+void ps2HalfStepNoteLogic(uint64_t frame);
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
 // [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
 // then owns the frame rate, so the busy-bit pacing and the sceGsSyncPath drain can let the guest run ahead.
@@ -3346,10 +3349,13 @@ namespace
     // counter reaches a0)). n=1 = render every vblank. [logicrate] counts func_115950 (the per-frame fight
     // update) per second so a step-1 run can be checked for double-speed logic.
     PS2Runtime::RecompiledFunction g_orig102060 = nullptr, g_orig115950 = nullptr;
+    // [fightgate] the step override applies only while the fight is underway (see ps2_stepcensus.cpp): the intro at
+    // step 1 corrupted memory in four runs out of five. PS2X_VSTEP_ALWAYS=1 restores the ungated behaviour.
     void bt3VStep(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static const int s_step = [](){ const char *v = std::getenv("PS2X_VSTEP"); return v && v[0] ? std::atoi(v) : 0; }();
-        if (s_step > 0 && getRegU32(ctx, 4) == 2u) ctx->r[4] = _mm_set_epi64x(0, (int64_t)s_step);   // $a0 = step
+        static const bool s_always = [](){ const char *v = std::getenv("PS2X_VSTEP_ALWAYS"); return v && v[0] && v[0] != '0'; }();
+        if (s_step > 0 && getRegU32(ctx, 4) == 2u && (s_always || ps2HalfStepFightActive())) ctx->r[4] = _mm_set_epi64x(0, (int64_t)s_step);   // $a0 = step
         if (g_orig102060) g_orig102060(rdram, ctx, runtime);
     }
     // [vstepprobe] func_264D98(a0): the frame wait. Print a0, the per-frame vblank counter [gp-0x5148] at entry,
@@ -3376,7 +3382,7 @@ namespace
         const auto now = std::chrono::steady_clock::now();
         const double dt = std::chrono::duration<double>(now - s_t0).count();
         if (dt >= 5.0) { std::fprintf(stderr, "[logicrate] %.1f fight updates/s (%u in %.1f s)\n", (double)n / dt, n, dt); s_n.store(0u); s_t0 = now; }
-        g_ps2HalfStepLogicFrame.store(g_bt3FrameCount.load(std::memory_order_relaxed), std::memory_order_relaxed);   // [halfstep] gate
+        ps2HalfStepNoteLogic(g_bt3FrameCount.load(std::memory_order_relaxed));   // [fightgate]
         if (g_orig115950) g_orig115950(rdram, ctx, runtime);
     }
     // [vf3probe] PS2X_VF3PROBE=1: print the persistent VU0 basis rows (vf1-vf3) as seen by

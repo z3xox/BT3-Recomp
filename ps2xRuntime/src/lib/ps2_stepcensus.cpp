@@ -155,6 +155,23 @@ void ps2StepCensusFrame(const R5900Context *ctx)
 std::atomic<int> g_ps2HalfStep{0};          // the macros' switch: raised by ps2HalfStepFrame only on fight frames
 static std::atomic<int> g_hsEnabled{0};     // the experiment is configured
 std::atomic<uint64_t> g_ps2HalfStepLogicFrame{0};
+// [fightgate] the fight is "underway" once the per-frame fight update has run on 60 consecutive render frames and
+// is still running (last update within 2 frames). The fight intro runs the same main loop but not the update, and
+// running the intro at step 1 corrupts memory (half2..half5: DMA tags over the main stack, garbage pointers in the
+// sound stream block) -- the loader/sound-stream race the loading-stall notes describe.
+static std::atomic<uint32_t> g_hsStreak{0};
+static std::atomic<uint64_t> g_hsPrevLogic{0};
+void ps2HalfStepNoteLogic(uint64_t frame)
+{
+    const uint64_t prev = g_hsPrevLogic.exchange(frame, std::memory_order_relaxed);
+    if (frame - prev <= 2u) g_hsStreak.fetch_add(1, std::memory_order_relaxed); else g_hsStreak.store(0, std::memory_order_relaxed);
+    g_ps2HalfStepLogicFrame.store(frame, std::memory_order_relaxed);
+}
+bool ps2HalfStepFightActive()
+{
+    const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+    return fr - g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) <= 2u && g_hsStreak.load(std::memory_order_relaxed) >= 60u;
+}
 namespace
 {
     uint8_t *g_hs = nullptr;                      // 0 none, 1 float-halve, 2 int-every-other-frame
@@ -234,7 +251,7 @@ void ps2HalfStepFrame(const R5900Context *ctx)
     // raise the macros' switch only while the fight update is running (last update within 2 render frames), so the
     // loader / intro / menus run the untouched fast path -- not even the hook call (half4 froze in the loader with
     // every modification gated off: the per-store call overhead alone shifts the loader's timing)
-    const bool active = fr - g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) <= 2u;
+    const bool active = ps2HalfStepFightActive();
     g_ps2HalfStep.store(active ? 1 : 0, std::memory_order_relaxed);
     if (fr - g_hsLastReport >= 600u)
     {

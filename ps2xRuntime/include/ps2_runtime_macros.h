@@ -442,9 +442,14 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store128(rdram, ctx, _addr, _value);                            \
         else                                                                         \
         {                                                                            \
-            const uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value)); \
-            const uint64_t _hi = static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(_value)); \
+            uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value));       \
+            uint64_t _hi = static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(_value));       \
             ps2TraceGuestWrite(rdram, _addr, 16u, _lo, _hi, "WRITE128", ctx);        \
+            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0)                  \
+            {                                                                        \
+                ps2HalfStepWrite128(rdram, _addr, _lo, _hi, ctx);                    \
+                _value = _mm_set_epi64x((long long)_hi, (long long)_lo);             \
+            }                                                                        \
             FAST_WRITE128(_addr, _value);                                            \
         }                                                                            \
     } while (0)

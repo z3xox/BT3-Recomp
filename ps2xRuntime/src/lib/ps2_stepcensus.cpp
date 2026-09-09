@@ -63,9 +63,42 @@ namespace
     }
 }
 
-void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, const R5900Context *ctx)
+void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx)
 {
     if (!g_sites || !rdram || !ctx || ctx != g_ctx.load(std::memory_order_relaxed)) return;
+    // 128-bit stores (sqc2: a VU0 vector, e.g. position/velocity) are recorded as their x lane, with the site's
+    // size mask flagging 16 so the classifier knows it is a vector; the half-step then halves every float lane
+    if (size == 16u)
+    {
+        const uint32_t pc = ctx->pc;
+        if (pc < kBase || pc >= kEnd) return;
+        const uint32_t a = guestAddr & 0x1FFFFFFFu;
+        if (a + 16u > 32u * 1024u * 1024u) return;
+        Site &s = g_sites[(pc - kBase) >> 2];
+        uint32_t oldv[4]; std::memcpy(oldv, rdram + a, 16);
+        const uint32_t nw[4] = { (uint32_t)valueLo, (uint32_t)(valueLo >> 32), (uint32_t)valueHi, (uint32_t)(valueHi >> 32) };
+        const uint32_t frame = (uint32_t)g_bt3FrameCount.load(std::memory_order_relaxed);
+        s.count++; s.sizeMask |= 16u;
+        if (frame != s.lastFrame) { s.lastFrame = frame; s.framesSeen++; }
+        if (a < s.addrLo) s.addrLo = a;
+        if (a > s.addrHi) s.addrHi = a;
+        int slot = -1;
+        for (int i = 0; i < 4; ++i) if (s.ringAddr[i] == a) { slot = i; break; }
+        if (slot >= 0) { if (s.ringVal[slot] == oldv[0]) s.chain++; s.ringVal[slot] = nw[0]; }
+        else { slot = s.ringPos; s.ringPos = (uint8_t)((s.ringPos + 1u) & 3u); s.ringAddr[slot] = a; s.ringVal[slot] = nw[0]; }
+        if (nw[0] == oldv[0] && nw[1] == oldv[1] && nw[2] == oldv[2]) { s.zeroDelta++; return; }
+        float fo[3], fn[3]; bool ok = true;
+        for (int i = 0; i < 3; ++i) ok = ok && plausibleFloat(oldv[i], fo[i]) && plausibleFloat(nw[i], fn[i]);
+        if (ok)
+        {
+            s.fplaus++;
+            const float d = fn[0] - fo[0];
+            if (s.dModeN == 0u) { s.dMode = d; s.dModeN = 1u; }
+            else if (std::fabs(d - s.dMode) <= 1e-5f * std::fmax(1.f, std::fabs(s.dMode))) s.dModeN++;
+            else s.dOtherN++;
+        }
+        return;
+    }
     if (size != 1u && size != 2u && size != 4u) return;
     const uint32_t pc = ctx->pc;
     if (pc < kBase || pc >= kEnd) return;
@@ -246,6 +279,36 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     if (skip) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
     g_hsIntPass.fetch_add(1, std::memory_order_relaxed);
     return value;
+}
+void ps2HalfStepWrite128(uint8_t *rdram, uint32_t guestAddr, uint64_t &lo, uint64_t &hi, const R5900Context *ctx)
+{
+    if (!g_hs || !ctx || ctx != g_hsCtx.load(std::memory_order_relaxed)) return;
+    const uint32_t pc = ctx->pc;
+    if (pc < kBase || pc >= kEnd) return;
+    if (g_hs[(pc - kBase) >> 2] != 1) return;     // vector sites are float accumulators ('f')
+    const uint32_t a = guestAddr & 0x1FFFFFFFu;
+    if (a + 16u > 32u * 1024u * 1024u) return;
+    const uint32_t frame = (uint32_t)g_bt3FrameCount.load(std::memory_order_relaxed);
+    if (frame - (uint32_t)g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) > 2u) return;
+    HsEntry &e = g_hsLast[((a * 2654435761u) ^ (pc * 40503u)) >> (32u - kHsBits)];
+    uint32_t last = 0xFFFF0000u;
+    if (e.addr == a && e.pc == pc) last = e.frame;
+    e.addr = a; e.pc = pc; e.frame = frame;
+    if (frame - last > 1u) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return; }
+    uint32_t oldv[4]; std::memcpy(oldv, rdram + a, 16);
+    uint32_t nw[4] = { (uint32_t)lo, (uint32_t)(lo >> 32), (uint32_t)hi, (uint32_t)(hi >> 32) };
+    bool any = false;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (nw[i] == oldv[i]) continue;
+        float fo, fn;
+        if (!plausibleFloat(oldv[i], fo) || !plausibleFloat(nw[i], fn)) continue;
+        const float h = fo + (fn - fo) * 0.5f;
+        std::memcpy(&nw[i], &h, 4); any = true;
+    }
+    if (!any) return;
+    g_hsFloat.fetch_add(1, std::memory_order_relaxed);
+    lo = (uint64_t)nw[0] | ((uint64_t)nw[1] << 32); hi = (uint64_t)nw[2] | ((uint64_t)nw[3] << 32);
 }
 void ps2HalfStepEnable(const char *sitesPath)
 {

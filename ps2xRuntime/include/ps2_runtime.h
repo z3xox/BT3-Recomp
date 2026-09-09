@@ -252,7 +252,7 @@ void ps2ValueWatchReport(uint32_t guestAddr, uint32_t size, uint64_t valueLo,
 
 // [stepcensus] per-store-site census (see ps2_stepcensus.cpp); zero cost when off.
 extern std::atomic<int> g_ps2StepCensus;
-void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, const R5900Context *ctx);
+void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx);
 void ps2StepCensusEnable(const char *outPath);
 void ps2StepCensusFrame(const R5900Context *ctx);
 void ps2StepCensusDump();
@@ -261,6 +261,7 @@ void ps2StepCensusDump();
 extern std::atomic<int> g_ps2HalfStep;
 extern std::atomic<uint64_t> g_ps2HalfStepLogicFrame;   // render frame of the last fight update: the gate
 uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint32_t value, const R5900Context *ctx);
+void ps2HalfStepWrite128(uint8_t *rdram, uint32_t guestAddr, uint64_t &lo, uint64_t &hi, const R5900Context *ctx);   // sqc2: 4 float lanes
 void ps2HalfStepEnable(const char *sitesPath);
 void ps2HalfStepFrame(const R5900Context *ctx);
 
@@ -273,7 +274,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    if (g_ps2StepCensus.load(std::memory_order_relaxed) != 0) ps2StepCensusStore(rdram, guestAddr, size, valueLo, ctx);   // [stepcensus]
+    if (g_ps2StepCensus.load(std::memory_order_relaxed) != 0) ps2StepCensusStore(rdram, guestAddr, size, valueLo, valueHi, ctx);   // [stepcensus]
     const uint32_t _wlo = g_ps2WatchLo.load(std::memory_order_relaxed);
     if (_wlo != 0u)
     {

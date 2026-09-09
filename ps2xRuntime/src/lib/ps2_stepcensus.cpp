@@ -75,7 +75,7 @@ static uint32_t g_addrWatchList[6] = {0}; static int g_addrWatchCnt = 0;
 // PS2X_ADDRWATCH_TRIG=<hex addr>:<delta>: hold the log until the float at addr has moved more than delta from its
 // value when the fight gate opened -- so the 500-line budget per slot lands on the move under study (a takeoff,
 // a dash) instead of the idle frames before it
-static uint32_t g_awTrigAddr = 0; static float g_awTrigDelta = 0.f;
+static uint32_t g_awTrigAddr = 0; static float g_awTrigDelta = 0.f; static uint32_t g_awTrigAddr2 = 0;
 void ps2AddrWatchEnable(const char *list)
 {   // comma-separated hex addresses (up to 3 requested; helper sources fill the remaining slots)
     std::string t(list); size_t p0 = 0;
@@ -84,7 +84,8 @@ void ps2AddrWatchEnable(const char *list)
     if (const char *tr = std::getenv("PS2X_ADDRWATCH_TRIG"); tr && tr[0])
     {
         char *end = nullptr; g_awTrigAddr = (uint32_t)std::strtoul(tr, &end, 16) & 0x1FFFFFFFu;
-        g_awTrigDelta = (end && *end == ':') ? std::strtof(end + 1, nullptr) : 1.f;
+        g_awTrigDelta = (end && *end == ':') ? std::strtof(end + 1, &end) : 1.f;
+        if (end && *end == ',') g_awTrigAddr2 = (uint32_t)std::strtoul(end + 1, nullptr, 16) & 0x1FFFFFFFu;   // "addr:delta,addr2": either slot fires it
     }
     std::fprintf(stderr, "[addrwatch] ON %d slot(s), first 0x%x; logging CHANGING stores only%s\n", g_addrWatchCnt, g_addrWatch, g_awTrigAddr ? " (held until the trigger slot moves)" : "");
 }
@@ -99,13 +100,18 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
         if (s_cnt == 0) { for (int k = 0; k < g_addrWatchCnt; ++k) s_w[k] = g_addrWatchList[k]; s_cnt = g_addrWatchCnt; }
         const uint32_t a = guestAddr & 0x1FFFFFFFu;
         const bool active = ps2HalfStepFightActive();
-        static bool s_trig = (g_awTrigAddr == 0); static bool s_haveBase = false; static float s_base = 0.f;
+        static bool s_trig = (g_awTrigAddr == 0); static bool s_haveBase = false; static float s_base[2] = {0.f, 0.f};
         if (!s_trig && active)
         {
-            float cur; std::memcpy(&cur, rdram + g_awTrigAddr, 4);
-            if (!s_haveBase) { s_base = cur; s_haveBase = true; }
-            else if (std::isfinite(cur) && std::fabs(cur - s_base) > g_awTrigDelta)
-            { s_trig = true; std::fprintf(stderr, "[addrwatch] TRIGGERED: slot 0x%x moved %g -> %g at frame %llu\n", g_awTrigAddr, s_base, cur, (unsigned long long)g_bt3FrameCount.load()); }
+            const uint32_t ta[2] = { g_awTrigAddr, g_awTrigAddr2 };
+            for (int t = 0; t < 2 && ta[t]; ++t)
+            {
+                float cur; std::memcpy(&cur, rdram + ta[t], 4);
+                if (!s_haveBase) { s_base[t] = cur; continue; }
+                if (std::isfinite(cur) && std::fabs(cur - s_base[t]) > g_awTrigDelta)
+                { s_trig = true; std::fprintf(stderr, "[addrwatch] TRIGGERED: slot 0x%x moved %g -> %g at frame %llu\n", ta[t], s_base[t], cur, (unsigned long long)g_bt3FrameCount.load()); break; }
+            }
+            s_haveBase = true;
         }
         for (int k = 0; s_trig && k < s_cnt; ++k)
         {

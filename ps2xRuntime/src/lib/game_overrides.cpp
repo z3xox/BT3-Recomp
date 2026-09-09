@@ -3362,23 +3362,17 @@ namespace
     void bt3ClipPassGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121A10
     {
         const uint32_t nin = getRegU32(ctx, 6); const uint32_t poly = getRegU32(ctx, 4);
-        if (nin > 9u)
-        {   // do not even run the pass on a runaway polygon
-            static std::atomic<uint32_t> s_n{0}; if (s_n.fetch_add(1u) < 40u)
-                std::fprintf(stderr, "[clipguard] func_121A10 input count=%u (>9) ra=0x%x poly=0x%x frame=%llu -> pass skipped, count 9\n", nin, getRegU32(ctx, 31), poly, (unsigned long long)g_bt3FrameCount.load());
-            ctx->r[2] = _mm_set_epi64x(0, 9);
-            return;
-        }
+        // LOG ONLY: guard3 showed the recompiled clipper re-entering itself through the function table (ra inside
+        // 0x121a10..0x121d48) with registers that are not this function's arguments -- clamping there would corrupt it.
         if (g_orig121a10) g_orig121a10(rdram, ctx, runtime);
-        const uint32_t nout = getRegU32(ctx, 2);
-        if (nout > 9u)
+        const uint32_t nout = getRegU32(ctx, 2); const uint32_t ra = getRegU32(ctx, 31);
+        if (nout > 9u && (ra < 0x121a10u || ra >= 0x121d48u))
         {
             static std::atomic<uint32_t> s_m{0}; if (s_m.fetch_add(1u) < 40u)
             {
                 float v[4] = {}; if (const uint8_t *q = getMemPtr(rdram, poly & 0x1FFFFFFFu)) std::memcpy(v, q, 16);
-                std::fprintf(stderr, "[clipguard] func_121A10 in=%u out=%u (>9) ra=0x%x poly=0x%x v0=(%g %g %g %g) frame=%llu -> clamped to 9\n", nin, nout, getRegU32(ctx, 31), poly, v[0], v[1], v[2], v[3], (unsigned long long)g_bt3FrameCount.load());
+                std::fprintf(stderr, "[clipguard] func_121A10 in=%u out=%u (>9) ra=0x%x poly=0x%x v0=(%g %g %g %g) frame=%llu (log only)\n", nin, nout, ra, poly, v[0], v[1], v[2], v[3], (unsigned long long)g_bt3FrameCount.load());
             }
-            ctx->r[2] = _mm_set_epi64x(0, 9);
         }
     }
     void bt3ClipXformGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121D48

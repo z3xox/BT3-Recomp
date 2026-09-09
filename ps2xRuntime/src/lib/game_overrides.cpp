@@ -14,6 +14,7 @@ namespace ps2_syscalls { uint64_t GetCurrentVSyncTick(); }
 // [fightgate] FILE SCOPE (a block-scope extern inside this file's anonymous namespace would declare a different symbol).
 bool ps2HalfStepFightActive();
 void ps2HalfStepNoteLogic(uint64_t frame);
+void ps2AddrWatchEnable(const char *hex);
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
 // [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
 // then owns the frame rate, so the busy-bit pacing and the sceGsSyncPath drain can let the guest run ahead.
@@ -4603,7 +4604,7 @@ namespace
         // Demo scene-tree recursion-depth guard: default ON (prevents the cyclic-tree stack
         // overflow crash). Disable with PS2X_NO_DEMO_GUARD. The PS2X_DEMOPROBE dump rides on it.
         if (const char *sc = std::getenv("PS2X_STEPCENSUS"); sc && sc[0]) ps2StepCensusEnable(sc);   // [stepcensus]
-        { extern void ps2AddrWatchEnable(const char *); if (const char *aw = std::getenv("PS2X_ADDRWATCH"); aw && aw[0]) ps2AddrWatchEnable(aw); }   // [addrwatch]
+        if (const char *aw = std::getenv("PS2X_ADDRWATCH"); aw && aw[0]) ps2AddrWatchEnable(aw);   // [addrwatch]
         if (const char *hs = std::getenv("PS2X_HALFSTEP"); hs && hs[0]) ps2HalfStepEnable(hs);        // [halfstep]
         if (std::getenv("PS2X_VSTEP"))
         {   // [vstep] [logicrate]

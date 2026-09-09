@@ -3349,6 +3349,44 @@ namespace
     // counter reaches a0)). n=1 = render every vblank. [logicrate] counts func_115950 (the per-frame fight
     // update) per second so a step-1 run can be checked for double-speed logic.
     PS2Runtime::RecompiledFunction g_orig102060 = nullptr, g_orig115950 = nullptr;
+    // [clipguard] armed with PS2X_VSTEP. sub_00139D78 clips an effect polygon against 5 planes (func_121A10) into a
+    // stack polygon, then func_121D48(out0=sp, out1=sp+0x90, src, count) transforms `count` vertices into two
+    // 9-entry stack buffers. A polygon with blown-up/NaN coordinates makes the clipper return a garbage count, the
+    // transform overruns the buffers and the saved $ra becomes vertex data -> the 0x10000000 wild jumps of
+    // half3/half5/half6. func_11F548 (wrap angle into [-r, r] by repeated +-2r) never terminates on a huge angle
+    // (half4's hang). Both get a guard + a probe naming the caller and the data.
+    PS2Runtime::RecompiledFunction g_orig121d48 = nullptr, g_orig11f548 = nullptr;
+    void bt3ClipXformGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121D48
+    {
+        const uint32_t n = getRegU32(ctx, 7);
+        if (n > 9u)
+        {
+            static std::atomic<uint32_t> s_n{0}; const uint32_t k = s_n.fetch_add(1u);
+            if (k < 40u)
+            {
+                const uint32_t src = getRegU32(ctx, 6);
+                float v[8] = {};
+                if (const uint8_t *q = getMemPtr(rdram, src & 0x1FFFFFFFu)) { std::memcpy(v, q, 16); std::memcpy(v + 4, q + 0x30, 16); }
+                std::fprintf(stderr, "[clipguard] func_121D48 count=%u (>9: stack overrun) ra=0x%x src=0x%x v0=(%g %g %g %g) v1=(%g %g %g %g) frame=%llu -> clamped to 9\n",
+                             n, getRegU32(ctx, 31), src, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], (unsigned long long)g_bt3FrameCount.load());
+            }
+            ctx->r[7] = _mm_set_epi64x(0, 9);
+        }
+        if (g_orig121d48) g_orig121d48(rdram, ctx, runtime);
+    }
+    void bt3AngleWrapGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_11F548(f12 angle, f13 half-range) -> f0
+    {
+        const float a = ctx->f[12], r = ctx->f[13];
+        if (!(std::fabs(a) < 1.0e6f) || !(r > 1.0e-6f))
+        {
+            static std::atomic<uint32_t> s_n{0}; const uint32_t k = s_n.fetch_add(1u);
+            if (k < 40u) std::fprintf(stderr, "[wrapguard] func_11F548 angle=%g range=%g ra=0x%x frame=%llu -> returning 0 (would spin)\n",
+                                       a, r, getRegU32(ctx, 31), (unsigned long long)g_bt3FrameCount.load());
+            ctx->f[0] = 0.0f; ctx->f[12] = 0.0f;
+            return;
+        }
+        if (g_orig11f548) g_orig11f548(rdram, ctx, runtime);
+    }
     // [fightgate] the step override applies only while the fight is underway (see ps2_stepcensus.cpp): the intro at
     // step 1 corrupted memory in four runs out of five. PS2X_VSTEP_ALWAYS=1 restores the ungated behaviour.
     void bt3VStep(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -4490,6 +4528,11 @@ namespace
             g_orig102060 = runtime.lookupFunction(0x00102060u);
             if (g_orig102060) runtime.replaceFunction(0x00102060u, &bt3VStep);
             g_orig115950 = runtime.lookupFunction(0x00115950u);
+            g_orig121d48 = runtime.lookupFunction(0x00121d48u);   // [clipguard]
+            if (g_orig121d48) runtime.replaceFunction(0x00121d48u, &bt3ClipXformGuard);
+            g_orig11f548 = runtime.lookupFunction(0x0011f548u);
+            if (g_orig11f548) runtime.replaceFunction(0x0011f548u, &bt3AngleWrapGuard);
+            std::fprintf(stderr, "[clipguard] armed (0x121d48 %s, 0x11f548 %s)\n", g_orig121d48 ? "ok" : "MISSING", g_orig11f548 ? "ok" : "MISSING");
             g_orig264d98 = runtime.lookupFunction(0x00264d98u);
             if (g_orig264d98) runtime.replaceFunction(0x00264d98u, &bt3WaitProbe);   // [vstepprobe]
             if (g_orig115950) runtime.replaceFunction(0x00115950u, &bt3LogicRate);

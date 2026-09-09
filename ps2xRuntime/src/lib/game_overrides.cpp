@@ -3932,17 +3932,24 @@ namespace
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
         if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
         ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
-        {   // [animprobe] PS2X_ANIMPROBE=<hex guest addr>: print the float at that address once per render frame for 600
-            // frames (e.g. P1's animation frame counter, block+0x138) -- to measure animation pace instead of guessing
-            static const uint32_t s_probe = [](){ const char *v = std::getenv("PS2X_ANIMPROBE"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
-            if (s_probe)
+        {   // [animprobe] PS2X_ANIMPROBE=<hex addr>[,<hex addr>...]: once the fight gate is open, print those floats every
+            // 10 render frames for 600 frames -- animation frame counters, position components -- to MEASURE the pace
+            static const std::vector<uint32_t> s_probes = [](){ std::vector<uint32_t> v; if (const char *e = std::getenv("PS2X_ANIMPROBE")) { std::string t(e); size_t p0 = 0; while (p0 < t.size()) { size_t p1 = t.find(',', p0); if (p1 == std::string::npos) p1 = t.size(); if (p1 > p0) v.push_back((uint32_t)std::strtoul(t.substr(p0, p1 - p0).c_str(), nullptr, 16)); p0 = p1 + 1; } } return v; }();
+            if (!s_probes.empty() && ps2HalfStepFightActive())
             {
-                static uint32_t s_n = 0; static float s_prev = 0.f;
+                static uint32_t s_n = 0; static std::vector<float> s_prev(s_probes.size(), 0.f);
                 if (s_n < 600u)
                 {
-                    float f = 0.f; if (const uint8_t *q = getMemPtr(rdram, s_probe & 0x1FFFFFFFu)) std::memcpy(&f, q, 4);
-                    if (s_n && (s_n % 10u) == 0u) std::fprintf(stderr, "[animprobe] frame %llu: %g (delta over 10 frames %g)\n", (unsigned long long)g_bt3FrameCount.load(), f, f - s_prev);
-                    if ((s_n % 10u) == 0u) s_prev = f;
+                    if ((s_n % 10u) == 0u)
+                    {
+                        std::string line;
+                        for (size_t k = 0; k < s_probes.size(); ++k)
+                        {
+                            float f = 0.f; if (const uint8_t *q = getMemPtr(rdram, s_probes[k] & 0x1FFFFFFFu)) std::memcpy(&f, q, 4);
+                            char b[96]; std::snprintf(b, sizeof b, " [0x%x]=%g (d10=%g)", s_probes[k], f, f - s_prev[k]); line += b; s_prev[k] = f;
+                        }
+                        std::fprintf(stderr, "[animprobe] frame %llu:%s\n", (unsigned long long)g_bt3FrameCount.load(), line.c_str());
+                    }
                     ++s_n;
                 }
             }

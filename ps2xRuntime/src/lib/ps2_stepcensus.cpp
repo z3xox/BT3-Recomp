@@ -255,7 +255,8 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     // of more than one frame is a one-shot event (a flag set, a state advance, a timer armed) and must land
     // unmodified: skipping it on an odd frame LOSES it (the half2 freeze: the fight intro polled a flag whose
     // one increment fell on an odd frame). The first tick after a gap therefore passes through at full rate.
-    static std::atomic<uint32_t> s_log{0}, s_logD{0};   // [halfstep] the first modifications after the gate opens, for the post-mortem
+    static uint16_t *s_siteLog = [](){ return new uint16_t[(kEnd - kBase) >> 2](); }();   // [halfstep] per-site log cap
+    auto logOk = [&](uint32_t p) { uint16_t &n = s_siteLog[(p - kBase) >> 2]; return n < 60u ? (++n, true) : false; };
     HsEntry &e = g_hsLast[((a * 2654435761u) ^ (pc * 40503u)) >> (32u - kHsBits)];
     uint32_t last = 0xFFFF0000u;
     if (e.addr == a && e.pc == pc) last = e.frame;
@@ -272,7 +273,7 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
         const uint32_t limit = size == 1 ? 0x7Fu : size == 2 ? 0x7FFFu : 0x7FFFFFFFu;
         if ((uint32_t)doubled > limit) return value;
         g_hsOneShot.fetch_add(1, std::memory_order_relaxed);
-        if (s_logD.fetch_add(1u, std::memory_order_relaxed) < 200u)
+        if (logOk(pc))
             std::fprintf(stderr, "[halfstep-mod] d pc=0x%06x addr=0x%x armed=%d first-tick %d -> stored %d frame=%u\n", pc, a, o, n, doubled, frame);
         return (uint32_t)doubled;
     }
@@ -286,13 +287,13 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
         const float h = fo + (fn - fo) * 0.5f;
         uint32_t bits; std::memcpy(&bits, &h, 4);
         g_hsFloat.fetch_add(1, std::memory_order_relaxed);
-        if (s_log.fetch_add(1u, std::memory_order_relaxed) < 400u)
+        if (logOk(pc))
             std::fprintf(stderr, "[halfstep-mod] f pc=0x%06x addr=0x%x old=%g new=%g stored=%g frame=%u\n", pc, a, fo, fn, h, frame);
         return bits;
     }
     // integer counter: keep the old value on odd render frames
     const bool skip = (frame & 1u) != 0u;
-    if (s_log.fetch_add(1u, std::memory_order_relaxed) < 400u)
+    if (logOk(pc))
         std::fprintf(stderr, "[halfstep-mod] i pc=0x%06x addr=0x%x old=%d new=%d %s frame=%u\n", pc, a, sext(old, size), sext(value, size), skip ? "SKIPPED" : "passed", frame);
     if (skip) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
     g_hsIntPass.fetch_add(1, std::memory_order_relaxed);

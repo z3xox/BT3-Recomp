@@ -71,7 +71,14 @@ namespace
 // fight is underway -- pc, ra, old and new value -- so the writer of one particular slot can be named.
 bool ps2HalfStepFightActive();   // defined below
 static uint32_t g_addrWatch = 0; static std::atomic<uint32_t> g_addrWatchN{0};
-void ps2AddrWatchEnable(const char *hex) { g_addrWatch = (uint32_t)std::strtoul(hex, nullptr, 16) & 0x1FFFFFFFu; g_ps2StepCensus.store(1, std::memory_order_relaxed); std::fprintf(stderr, "[addrwatch] ON 0x%x\n", g_addrWatch); }
+static uint32_t g_addrWatchList[6] = {0}; static int g_addrWatchCnt = 0;
+void ps2AddrWatchEnable(const char *list)
+{   // comma-separated hex addresses (up to 3 requested; helper sources fill the remaining slots)
+    std::string t(list); size_t p0 = 0;
+    while (p0 < t.size() && g_addrWatchCnt < 3) { size_t p1 = t.find(',', p0); if (p1 == std::string::npos) p1 = t.size(); if (p1 > p0) g_addrWatchList[g_addrWatchCnt++] = (uint32_t)std::strtoul(t.substr(p0, p1 - p0).c_str(), nullptr, 16) & 0x1FFFFFFFu; p0 = p1 + 1; }
+    g_addrWatch = g_addrWatchList[0]; g_ps2StepCensus.store(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[addrwatch] ON %d slot(s), first 0x%x; logging CHANGING stores only\n", g_addrWatchCnt, g_addrWatch);
+}
 void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx)
 {
     if (g_addrWatch && rdram && ctx)
@@ -80,7 +87,7 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
         // dst=$a0 src=$a1) that covers a watched slot adds src+off, up to 6 levels -- the chain from a displayed
         // position back to the site that integrates it. Each slot logs up to 200 stores.
         static uint32_t s_w[6] = {0}; static uint32_t s_n[6] = {0}; static int s_cnt = 0;
-        if (s_cnt == 0) { s_w[0] = g_addrWatch; s_cnt = 1; }
+        if (s_cnt == 0) { for (int k = 0; k < g_addrWatchCnt; ++k) s_w[k] = g_addrWatchList[k]; s_cnt = g_addrWatchCnt; }
         const uint32_t a = guestAddr & 0x1FFFFFFFu;
         const bool active = ps2HalfStepFightActive();
         for (int k = 0; k < s_cnt; ++k)
@@ -93,11 +100,12 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
             else nv = (uint32_t)(valueLo >> (8 * off));
             float fo, fn; std::memcpy(&fo, &oldv, 4); std::memcpy(&fn, &nv, 4);
             const uint32_t a0 = (uint32_t)ctx->r[4][0], a1 = (uint32_t)ctx->r[5][0], a2 = (uint32_t)ctx->r[6][0];
-            if (s_n[k]++ < 200u)
+            const bool changing = std::fabs(fn - fo) > 0.01f || (!std::isfinite(fn) != !std::isfinite(fo));
+            if (changing && s_n[k]++ < 300u)
                 std::fprintf(stderr, "[addrwatch%d] slot=0x%x pc=0x%06x ra=0x%06x size=%u old=%g new=%g a0=0x%x a1=0x%x a2=0x%x frame=%llu\n", k, w, ctx->pc, (uint32_t)ctx->r[31][0], size, fo, fn, a0, a1, a2, (unsigned long long)g_bt3FrameCount.load());
-            if (size == 16 && ctx->pc >= 0x120000u && ctx->pc < 0x122400u && (a0 & 0x1FFFFFFFu) == a && s_cnt < 6)
-            {
-                const uint32_t srcs[2] = { ((a1 & 0x1FFFFFFFu) + off) & 0x1FFFFFFFu, ((a2 & 0x1FFFFFFFu) + off) & 0x1FFFFFFFu };
+            if (size == 16 && ctx->pc >= 0x120000u && ctx->pc < 0x122400u && (a0 & 0x1FFFFFFFu) == a && s_cnt < 6 && k < g_addrWatchCnt)
+            {   // follow $a1 (the source) of a vector helper, one level below the requested slots only
+                const uint32_t srcs[1] = { ((a1 & 0x1FFFFFFFu) + off) & 0x1FFFFFFFu };
                 for (uint32_t src : srcs)
                 {
                     if (src < 0x100000u || src >= 32u * 1024u * 1024u) continue;

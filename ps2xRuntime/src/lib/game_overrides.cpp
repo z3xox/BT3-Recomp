@@ -3356,6 +3356,31 @@ namespace
     // half3/half5/half6. func_11F548 (wrap angle into [-r, r] by repeated +-2r) never terminates on a huge angle
     // (half4's hang). Both get a guard + a probe naming the caller and the data.
     PS2Runtime::RecompiledFunction g_orig121d48 = nullptr, g_orig11f548 = nullptr;
+    // func_121A10(poly, plane, count) -> new count: one clip pass. With NaN vertices every edge "crosses" and the
+    // count can double per pass (5 passes), overflowing the caller's stack polygon before the transform ever runs.
+    PS2Runtime::RecompiledFunction g_orig121a10 = nullptr;
+    void bt3ClipPassGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121A10
+    {
+        const uint32_t nin = getRegU32(ctx, 6); const uint32_t poly = getRegU32(ctx, 4);
+        if (nin > 9u)
+        {   // do not even run the pass on a runaway polygon
+            static std::atomic<uint32_t> s_n{0}; if (s_n.fetch_add(1u) < 40u)
+                std::fprintf(stderr, "[clipguard] func_121A10 input count=%u (>9) ra=0x%x poly=0x%x frame=%llu -> pass skipped, count 9\n", nin, getRegU32(ctx, 31), poly, (unsigned long long)g_bt3FrameCount.load());
+            ctx->r[2] = _mm_set_epi64x(0, 9);
+            return;
+        }
+        if (g_orig121a10) g_orig121a10(rdram, ctx, runtime);
+        const uint32_t nout = getRegU32(ctx, 2);
+        if (nout > 9u)
+        {
+            static std::atomic<uint32_t> s_m{0}; if (s_m.fetch_add(1u) < 40u)
+            {
+                float v[4] = {}; if (const uint8_t *q = getMemPtr(rdram, poly & 0x1FFFFFFFu)) std::memcpy(v, q, 16);
+                std::fprintf(stderr, "[clipguard] func_121A10 in=%u out=%u (>9) ra=0x%x poly=0x%x v0=(%g %g %g %g) frame=%llu -> clamped to 9\n", nin, nout, getRegU32(ctx, 31), poly, v[0], v[1], v[2], v[3], (unsigned long long)g_bt3FrameCount.load());
+            }
+            ctx->r[2] = _mm_set_epi64x(0, 9);
+        }
+    }
     void bt3ClipXformGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121D48
     {
         const uint32_t n = getRegU32(ctx, 7);
@@ -3380,8 +3405,12 @@ namespace
         if (!(std::fabs(a) < 1.0e6f) || !(r > 1.0e-6f))
         {
             static std::atomic<uint32_t> s_n{0}; const uint32_t k = s_n.fetch_add(1u);
-            if (k < 40u) std::fprintf(stderr, "[wrapguard] func_11F548 angle=%g range=%g ra=0x%x frame=%llu -> returning 0 (would spin)\n",
-                                       a, r, getRegU32(ctx, 31), (unsigned long long)g_bt3FrameCount.load());
+            if (k < 40u)
+            {   // the usual caller is the wrapper at 0x11f588, which saved the OUTER return address at 0($sp)
+                uint64_t outer = 0; if (const uint8_t *q = getMemPtr(rdram, getRegU32(ctx, 29) & 0x1FFFFFFFu)) std::memcpy(&outer, q, 8);
+                std::fprintf(stderr, "[wrapguard] func_11F548 angle=%g range=%g ra=0x%x outer_ra=0x%llx frame=%llu -> returning 0 (would spin)\n",
+                             a, r, getRegU32(ctx, 31), (unsigned long long)outer, (unsigned long long)g_bt3FrameCount.load());
+            }
             ctx->f[0] = 0.0f; ctx->f[12] = 0.0f;
             return;
         }
@@ -4531,6 +4560,8 @@ namespace
             g_orig121d48 = runtime.lookupFunction(0x00121d48u);   // [clipguard]
             if (g_orig121d48) runtime.replaceFunction(0x00121d48u, &bt3ClipXformGuard);
             g_orig11f548 = runtime.lookupFunction(0x0011f548u);
+            g_orig121a10 = runtime.lookupFunction(0x00121a10u);   // [clipguard] clip pass
+            if (g_orig121a10) runtime.replaceFunction(0x00121a10u, &bt3ClipPassGuard);
             if (g_orig11f548) runtime.replaceFunction(0x0011f548u, &bt3AngleWrapGuard);
             std::fprintf(stderr, "[clipguard] armed (0x121d48 %s, 0x11f548 %s)\n", g_orig121d48 ? "ok" : "MISSING", g_orig11f548 ? "ok" : "MISSING");
             g_orig264d98 = runtime.lookupFunction(0x00264d98u);

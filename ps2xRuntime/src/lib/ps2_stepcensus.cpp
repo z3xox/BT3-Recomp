@@ -209,6 +209,7 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     else { slot = rg.pos; rg.pos = (uint8_t)((rg.pos + 1u) & 7u); rg.addr[slot] = a; rg.frame[slot] = frame; }
     // an address this site did not touch on the previous frame (or never): a one-shot event, land it unmodified
     if (frame - last > 1u) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return value; }
+    static std::atomic<uint32_t> s_log{0};   // [halfstep] the first modifications after the gate opens, for the post-mortem
     if (k == 1)
     {
         if (size != 4u) return value;
@@ -217,10 +218,15 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
         const float h = fo + (fn - fo) * 0.5f;
         uint32_t bits; std::memcpy(&bits, &h, 4);
         g_hsFloat.fetch_add(1, std::memory_order_relaxed);
+        if (s_log.fetch_add(1u, std::memory_order_relaxed) < 400u)
+            std::fprintf(stderr, "[halfstep-mod] f pc=0x%06x addr=0x%x old=%g new=%g stored=%g frame=%u\n", pc, a, fo, fn, h, frame);
         return bits;
     }
     // integer counter: keep the old value on odd render frames
-    if (frame & 1u) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
+    const bool skip = (frame & 1u) != 0u;
+    if (s_log.fetch_add(1u, std::memory_order_relaxed) < 400u)
+        std::fprintf(stderr, "[halfstep-mod] i pc=0x%06x addr=0x%x old=%d new=%d %s frame=%u\n", pc, a, sext(old, size), sext(value, size), skip ? "SKIPPED" : "passed", frame);
+    if (skip) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
     g_hsIntPass.fetch_add(1, std::memory_order_relaxed);
     return value;
 }

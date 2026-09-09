@@ -71,20 +71,40 @@ namespace
 // fight is underway -- pc, ra, old and new value -- so the writer of one particular slot can be named.
 bool ps2HalfStepFightActive();   // defined below
 static uint32_t g_addrWatch = 0; static std::atomic<uint32_t> g_addrWatchN{0};
+// [addrwatch] follow-the-copy: when the watched slot is written by the vector COPY helper (0x121fa8, dst=$a0 src=$a1),
+// the value came from src + the same lane offset -- watch that source slot too, so the real integrator names itself
+static std::atomic<uint32_t> g_addrWatch2{0}; static std::atomic<uint32_t> g_addrWatch2N{0};
 void ps2AddrWatchEnable(const char *hex) { g_addrWatch = (uint32_t)std::strtoul(hex, nullptr, 16) & 0x1FFFFFFFu; g_ps2StepCensus.store(1, std::memory_order_relaxed); std::fprintf(stderr, "[addrwatch] ON 0x%x\n", g_addrWatch); }
 void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx)
 {
     if (g_addrWatch && rdram && ctx)
     {
         const uint32_t a = guestAddr & 0x1FFFFFFFu;
-        if (a <= g_addrWatch && g_addrWatch < a + size && ps2HalfStepFightActive() && g_addrWatchN.fetch_add(1u) < 400u)
+        const bool active = ps2HalfStepFightActive();
+        if (a <= g_addrWatch && g_addrWatch < a + size && active && g_addrWatchN.fetch_add(1u) < 400u)
         {
             const uint32_t off = g_addrWatch - a; uint32_t oldv, nv;
             std::memcpy(&oldv, rdram + g_addrWatch, 4);
             if (size == 16) nv = off < 8 ? (uint32_t)(valueLo >> (8 * off)) : (uint32_t)(valueHi >> (8 * (off - 8)));
             else nv = (uint32_t)(valueLo >> (8 * off));
             float fo, fn; std::memcpy(&fo, &oldv, 4); std::memcpy(&fn, &nv, 4);
-            std::fprintf(stderr, "[addrwatch] pc=0x%06x ra=0x%06x size=%u old=%g new=%g frame=%llu\n", ctx->pc, (uint32_t)ctx->r[31][0], size, fo, fn, (unsigned long long)g_bt3FrameCount.load());
+            const uint32_t a0 = (uint32_t)ctx->r[4][0], a1 = (uint32_t)ctx->r[5][0];
+            std::fprintf(stderr, "[addrwatch] pc=0x%06x ra=0x%06x size=%u old=%g new=%g a0=0x%x a1=0x%x frame=%llu\n", ctx->pc, (uint32_t)ctx->r[31][0], size, fo, fn, a0, a1, (unsigned long long)g_bt3FrameCount.load());
+            if (size == 16 && ctx->pc == 0x121facu && (a0 & 0x1FFFFFFFu) == a && !g_addrWatch2.load())
+            {   // the copy helper: the lane came from src ($a1) + off
+                g_addrWatch2.store(((a1 & 0x1FFFFFFFu) + off) & 0x1FFFFFFFu);
+                std::fprintf(stderr, "[addrwatch] copy source found: now also watching 0x%x\n", g_addrWatch2.load());
+            }
+        }
+        const uint32_t w2 = g_addrWatch2.load(std::memory_order_relaxed);
+        if (w2 && a <= w2 && w2 < a + size && active && g_addrWatch2N.fetch_add(1u) < 400u)
+        {
+            const uint32_t off = w2 - a; uint32_t oldv, nv;
+            std::memcpy(&oldv, rdram + w2, 4);
+            if (size == 16) nv = off < 8 ? (uint32_t)(valueLo >> (8 * off)) : (uint32_t)(valueHi >> (8 * (off - 8)));
+            else nv = (uint32_t)(valueLo >> (8 * off));
+            float fo, fn; std::memcpy(&fo, &oldv, 4); std::memcpy(&fn, &nv, 4);
+            std::fprintf(stderr, "[addrwatch2] pc=0x%06x ra=0x%06x size=%u old=%g new=%g a0=0x%x a1=0x%x frame=%llu\n", ctx->pc, (uint32_t)ctx->r[31][0], size, fo, fn, (uint32_t)ctx->r[4][0], (uint32_t)ctx->r[5][0], (unsigned long long)g_bt3FrameCount.load());
         }
     }
     if (!g_sites || !rdram || !ctx || ctx != g_ctx.load(std::memory_order_relaxed)) return;

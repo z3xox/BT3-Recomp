@@ -3932,6 +3932,41 @@ namespace
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
         if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
         ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
+        {   // [findclock] PS2X_FINDCLOCK=<start value>: when the fight gate opens, remember every 32-bit slot holding a value
+            // within 12 of the start value (int, or float), and 300 render frames (5 s at 60) later print the ones that
+            // moved by 2..14 -- a countdown in seconds shows up as the slot that lost ~5 (or ~10 if it runs at 2x).
+            static const int s_fc = [](){ const char *v = std::getenv("PS2X_FINDCLOCK"); return v && v[0] ? std::atoi(v) : 0; }();
+            if (s_fc && ps2HalfStepFightActive())
+            {
+                static uint64_t s_t0 = 0; static std::vector<std::pair<uint32_t, float>> s_cand; static bool s_done = false;
+                const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+                if (!s_t0)
+                {
+                    s_t0 = fr;
+                    for (uint32_t a = 0x100000u; a < 32u * 1024u * 1024u; a += 4u)
+                    {
+                        uint32_t bits; std::memcpy(&bits, rdram + a, 4);
+                        const int32_t iv = (int32_t)bits; float fv; std::memcpy(&fv, &bits, 4);
+                        if (iv >= s_fc - 12 && iv <= s_fc + 12 && iv != 0) s_cand.push_back({a, (float)iv});
+                        else if (std::isfinite(fv) && fv >= s_fc - 12.f && fv <= s_fc + 12.f) s_cand.push_back({a | 0x80000000u, fv});
+                    }
+                    std::fprintf(stderr, "[findclock] armed at frame %llu: %zu slots near %d\n", (unsigned long long)fr, s_cand.size(), s_fc);
+                }
+                else if (!s_done && fr - s_t0 >= 300u)
+                {
+                    s_done = true; unsigned n = 0;
+                    for (const auto &c : s_cand)
+                    {
+                        const uint32_t a = c.first & 0x1FFFFFFFu; uint32_t bits; std::memcpy(&bits, rdram + a, 4);
+                        float now; if (c.first & 0x80000000u) std::memcpy(&now, &bits, 4); else now = (float)(int32_t)bits;
+                        const float drop = c.second - now;
+                        if (drop >= 2.f && drop <= 14.f && n++ < 40)
+                            std::fprintf(stderr, "[findclock] %s0x%x: %g -> %g (dropped %g in 300 frames)\n", (c.first & 0x80000000u) ? "float " : "int ", a, c.second, now, drop);
+                    }
+                    std::fprintf(stderr, "[findclock] done: %u candidates dropped 2..14\n", n);
+                }
+            }
+        }
         {   // [animprobe] PS2X_ANIMPROBE=<hex addr>[,<hex addr>...]: once the fight gate is open, print those floats every
             // 10 render frames for 600 frames -- animation frame counters, position components -- to MEASURE the pace
             // an "i:" prefix prints the slot as a 32-bit integer (counters, the match clock); plain = float

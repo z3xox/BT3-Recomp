@@ -201,15 +201,31 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     // of more than one frame is a one-shot event (a flag set, a state advance, a timer armed) and must land
     // unmodified: skipping it on an odd frame LOSES it (the half2 freeze: the fight intro polled a flag whose
     // one increment fell on an odd frame). The first tick after a gap therefore passes through at full rate.
+    static std::atomic<uint32_t> s_log{0}, s_logD{0};   // [halfstep] the first modifications after the gate opens, for the post-mortem
     HsRing &rg = g_hsLast[(pc - kBase) >> 2];
     int slot = -1;
     for (int i = 0; i < 8; ++i) if (rg.addr[i] == a) { slot = i; break; }
     uint32_t last = 0xFFFF0000u;
     if (slot >= 0) { last = rg.frame[slot]; rg.frame[slot] = frame; }
     else { slot = rg.pos; rg.pos = (uint8_t)((rg.pos + 1u) & 7u); rg.addr[slot] = a; rg.frame[slot] = frame; }
+    const bool firstAfterGap = frame - last > 1u;
+    if (k == 3)
+    {   // countdown timer ('d'): exact half rate with NO register/memory mismatch. The first decrement after a gap
+        // is the first tick after the timer was armed with `old`; storing 2*old + delta makes the countdown take
+        // twice as many 60 Hz frames. Every later tick lands unmodified.
+        if (!firstAfterGap) return value;
+        const int32_t o = sext(old, size), n = sext(value, size), d = n - o;
+        if (d >= 0 || o <= 0 || o > 100000) return value;
+        const int32_t doubled = 2 * o + d;
+        const uint32_t limit = size == 1 ? 0x7Fu : size == 2 ? 0x7FFFu : 0x7FFFFFFFu;
+        if ((uint32_t)doubled > limit) return value;
+        g_hsOneShot.fetch_add(1, std::memory_order_relaxed);
+        if (s_logD.fetch_add(1u, std::memory_order_relaxed) < 200u)
+            std::fprintf(stderr, "[halfstep-mod] d pc=0x%06x addr=0x%x armed=%d first-tick %d -> stored %d frame=%u\n", pc, a, o, n, doubled, frame);
+        return (uint32_t)doubled;
+    }
     // an address this site did not touch on the previous frame (or never): a one-shot event, land it unmodified
-    if (frame - last > 1u) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return value; }
-    static std::atomic<uint32_t> s_log{0};   // [halfstep] the first modifications after the gate opens, for the post-mortem
+    if (firstAfterGap) { g_hsOneShot.fetch_add(1, std::memory_order_relaxed); return value; }
     if (k == 1)
     {
         if (size != 4u) return value;
@@ -237,17 +253,18 @@ void ps2HalfStepEnable(const char *sitesPath)
     g_hs = new uint8_t[(kEnd - kBase) >> 2]();
     g_hsLast = new HsRing[(kEnd - kBase) >> 2];
     for (uint32_t i = 0; i < ((kEnd - kBase) >> 2); ++i) { for (int j = 0; j < 8; ++j) { g_hsLast[i].addr[j] = 0xFFFFFFFFu; g_hsLast[i].frame[j] = 0xFFFF0000u; } g_hsLast[i].pos = 0; }
-    char line[128]; unsigned nf = 0, ni = 0;
+    char line[128]; unsigned nf = 0, ni = 0, nd = 0;
     while (std::fgets(line, sizeof line, f))
     {
         unsigned pc = 0; char kind = 0;
         if (std::sscanf(line, "%x %c", &pc, &kind) != 2 || pc < kBase || pc >= kEnd) continue;
         if (kind == 'f') { g_hs[(pc - kBase) >> 2] = 1; ++nf; }
-        else if (kind == 'i') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
+        else if (kind == 'i' || kind == 'u') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
+        else if (kind == 'd') { g_hs[(pc - kBase) >> 2] = 3; ++nd; }
     }
     std::fclose(f);
     g_hsEnabled.store(1, std::memory_order_relaxed);   // the macro switch itself is raised per fight frame (zero cost elsewhere)
-    std::fprintf(stderr, "[halfstep] ON: %u float sites halved, %u integer sites on even frames only (%s)\n", nf, ni, sitesPath);
+    std::fprintf(stderr, "[halfstep] ON: %u float sites halved, %u integer sites on even frames only, %u countdowns doubled on arm (%s)\n", nf, ni, nd, sitesPath);
 }
 void ps2HalfStepFrame(const R5900Context *ctx)
 {

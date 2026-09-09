@@ -639,10 +639,11 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
     if (renderer == 2)
     {
         setEnvDefault("PS2X_PGS", "1");
-        // [pgslive] pack mode whenever a pack is INDEXED (PS2X_TEXREPLACE or ./textures), so the Texture Replacement
-        // switch can flip live in either direction (pack mode keeps our state-only parse's VRAM mirror alive).
-        // PS2X_PGS_PACK=0 in the env forces the exclusive path.
-        setEnvDefault("PS2X_PGS_PACK", (texPack || ps2tex::replacementsEnabled()) ? "1" : "0");
+        // [pgslive] pack mode only when a pack is actually INDEXED (PS2X_TEXREPLACE or ./textures): the Texture
+        // Replacement switch is greyed out without one, and pack mode costs a second packet walk per frame (a laptop
+        // 4060 log showed 17-26 ms/swap of backend CPU at 4x with the switch on and NO pack). With a pack the switch
+        // still flips live in either direction. PS2X_PGS_PACK=0 in the env forces the exclusive path.
+        setEnvDefault("PS2X_PGS_PACK", ps2tex::replacementsEnabled() ? "1" : "0");
         { const char *pk = std::getenv("PS2X_PGS_PACK"); if (!(pk && pk[0] == '1')) setEnvDefault("PS2X_PGS_EXCLUSIVE", "1"); }
         if (forceBilinear) setEnvDefault("PS2X_PGS_FORCE_BILINEAR", "1");
     }

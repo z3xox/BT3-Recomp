@@ -147,3 +147,71 @@ void ps2StepCensusFrame(const R5900Context *ctx)
     const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
     if (fr - g_lastDumpFrame >= 600u) { g_lastDumpFrame = fr; ps2StepCensusDump(); }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// [halfstep] the experiment the census exists for. sites.txt lines: "<pc-hex> f|i" (f = float accumulator: store
+// old + (new-old)/2; i = integer counter: apply the store on even render frames only, keep the old value on odd
+// ones). Only the render-kick thread's stores are touched; everything else is untouched.
+std::atomic<int> g_ps2HalfStep{0};
+namespace
+{
+    uint8_t *g_hs = nullptr;                      // 0 none, 1 float-halve, 2 int-every-other-frame
+    std::atomic<const R5900Context *> g_hsCtx{nullptr};
+    std::atomic<uint64_t> g_hsFloat{0}, g_hsIntSkip{0}, g_hsIntPass{0};
+    uint64_t g_hsLastReport = 0;
+}
+uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint32_t value, const R5900Context *ctx)
+{
+    if (!g_hs || !ctx || ctx != g_hsCtx.load(std::memory_order_relaxed)) return value;
+    const uint32_t pc = ctx->pc;
+    if (pc < kBase || pc >= kEnd) return value;
+    const uint8_t k = g_hs[(pc - kBase) >> 2];
+    if (!k) return value;
+    const uint32_t a = guestAddr & 0x1FFFFFFFu;
+    if (a + size > 32u * 1024u * 1024u) return value;
+    const uint32_t old = readOld(rdram, a, size);
+    if (old == value) return value;
+    if (k == 1)
+    {
+        if (size != 4u) return value;
+        float fo, fn;
+        if (!plausibleFloat(old, fo) || !plausibleFloat(value, fn)) return value;
+        const float h = fo + (fn - fo) * 0.5f;
+        uint32_t bits; std::memcpy(&bits, &h, 4);
+        g_hsFloat.fetch_add(1, std::memory_order_relaxed);
+        return bits;
+    }
+    // integer counter: keep the old value on odd render frames
+    if (g_bt3FrameCount.load(std::memory_order_relaxed) & 1u) { g_hsIntSkip.fetch_add(1, std::memory_order_relaxed); return old; }
+    g_hsIntPass.fetch_add(1, std::memory_order_relaxed);
+    return value;
+}
+void ps2HalfStepEnable(const char *sitesPath)
+{
+    FILE *f = std::fopen(sitesPath, "r");
+    if (!f) { std::fprintf(stderr, "[halfstep] cannot read %s\n", sitesPath); return; }
+    g_hs = new uint8_t[(kEnd - kBase) >> 2]();
+    char line[128]; unsigned nf = 0, ni = 0;
+    while (std::fgets(line, sizeof line, f))
+    {
+        unsigned pc = 0; char kind = 0;
+        if (std::sscanf(line, "%x %c", &pc, &kind) != 2 || pc < kBase || pc >= kEnd) continue;
+        if (kind == 'f') { g_hs[(pc - kBase) >> 2] = 1; ++nf; }
+        else if (kind == 'i') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
+    }
+    std::fclose(f);
+    g_ps2HalfStep.store(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[halfstep] ON: %u float sites halved, %u integer sites on even frames only (%s)\n", nf, ni, sitesPath);
+}
+void ps2HalfStepFrame(const R5900Context *ctx)
+{
+    if (!g_hs) return;
+    if (!g_hsCtx.load(std::memory_order_relaxed)) g_hsCtx.store(ctx);
+    const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);
+    if (fr - g_hsLastReport >= 600u)
+    {
+        g_hsLastReport = fr;
+        std::fprintf(stderr, "[halfstep] frame %llu: float halved %llu, int skipped %llu / passed %llu\n", (unsigned long long)fr,
+                     (unsigned long long)g_hsFloat.exchange(0), (unsigned long long)g_hsIntSkip.exchange(0), (unsigned long long)g_hsIntPass.exchange(0));
+    }
+}

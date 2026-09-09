@@ -3863,6 +3863,7 @@ namespace
         seServiceVoices(runtime);
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
         if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
+        if (g_ps2HalfStep.load(std::memory_order_relaxed)) ps2HalfStepFrame(ctx);        // [halfstep]
         {   // [framegate] PS2X_FRAMEGATE (default ON when async is on, =0 disables): require two
             // vsync ticks between render kicks.
             //
@@ -4476,6 +4477,7 @@ namespace
         // Demo scene-tree recursion-depth guard: default ON (prevents the cyclic-tree stack
         // overflow crash). Disable with PS2X_NO_DEMO_GUARD. The PS2X_DEMOPROBE dump rides on it.
         if (const char *sc = std::getenv("PS2X_STEPCENSUS"); sc && sc[0]) ps2StepCensusEnable(sc);   // [stepcensus]
+        if (const char *hs = std::getenv("PS2X_HALFSTEP"); hs && hs[0]) ps2HalfStepEnable(hs);        // [halfstep]
         if (std::getenv("PS2X_VSTEP"))
         {   // [vstep] [logicrate]
             g_orig102060 = runtime.lookupFunction(0x00102060u);

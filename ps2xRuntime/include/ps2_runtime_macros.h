@@ -381,7 +381,10 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         else                                                                         \
         {                                                                            \
             ps2TraceGuestWrite(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
-            FAST_WRITE8(_addr, (val));                                               \
+            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0)                          \
+                FAST_WRITE8(_addr, (uint8_t)ps2HalfStepWrite(rdram, _addr, 1u, (uint32_t)(uint8_t)(val), ctx)); \
+            else                                                                           \
+                FAST_WRITE8(_addr, (val));                                               \
         }                                                                            \
     } while (0)
 
@@ -394,7 +397,10 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         else                                                                           \
         {                                                                              \
             ps2TraceGuestWrite(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
-            FAST_WRITE16(_addr, (val));                                                \
+            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0)                          \
+                FAST_WRITE16(_addr, (uint16_t)ps2HalfStepWrite(rdram, _addr, 2u, (uint32_t)(uint16_t)(val), ctx)); \
+            else                                                                           \
+                FAST_WRITE16(_addr, (val));                                               \
         }                                                                              \
     } while (0)
 
@@ -407,7 +413,10 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         else                                                                           \
         {                                                                              \
             ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
-            FAST_WRITE32(_addr, (val));                                                \
+            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0)                          \
+                FAST_WRITE32(_addr, (uint32_t)ps2HalfStepWrite(rdram, _addr, 4u, (uint32_t)(uint32_t)(val), ctx)); \
+            else                                                                           \
+                FAST_WRITE32(_addr, (val));                                               \
         }                                                                              \
     } while (0)
 

@@ -72,12 +72,21 @@ namespace
 bool ps2HalfStepFightActive();   // defined below
 static uint32_t g_addrWatch = 0; static std::atomic<uint32_t> g_addrWatchN{0};
 static uint32_t g_addrWatchList[6] = {0}; static int g_addrWatchCnt = 0;
+// PS2X_ADDRWATCH_TRIG=<hex addr>:<delta>: hold the log until the float at addr has moved more than delta from its
+// value when the fight gate opened -- so the 500-line budget per slot lands on the move under study (a takeoff,
+// a dash) instead of the idle frames before it
+static uint32_t g_awTrigAddr = 0; static float g_awTrigDelta = 0.f;
 void ps2AddrWatchEnable(const char *list)
 {   // comma-separated hex addresses (up to 3 requested; helper sources fill the remaining slots)
     std::string t(list); size_t p0 = 0;
     while (p0 < t.size() && g_addrWatchCnt < 3) { size_t p1 = t.find(',', p0); if (p1 == std::string::npos) p1 = t.size(); if (p1 > p0) g_addrWatchList[g_addrWatchCnt++] = (uint32_t)std::strtoul(t.substr(p0, p1 - p0).c_str(), nullptr, 16) & 0x1FFFFFFFu; p0 = p1 + 1; }
     g_addrWatch = g_addrWatchList[0]; g_ps2StepCensus.store(1, std::memory_order_relaxed);
-    std::fprintf(stderr, "[addrwatch] ON %d slot(s), first 0x%x; logging CHANGING stores only\n", g_addrWatchCnt, g_addrWatch);
+    if (const char *tr = std::getenv("PS2X_ADDRWATCH_TRIG"); tr && tr[0])
+    {
+        char *end = nullptr; g_awTrigAddr = (uint32_t)std::strtoul(tr, &end, 16) & 0x1FFFFFFFu;
+        g_awTrigDelta = (end && *end == ':') ? std::strtof(end + 1, nullptr) : 1.f;
+    }
+    std::fprintf(stderr, "[addrwatch] ON %d slot(s), first 0x%x; logging CHANGING stores only%s\n", g_addrWatchCnt, g_addrWatch, g_awTrigAddr ? " (held until the trigger slot moves)" : "");
 }
 void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx)
 {
@@ -85,12 +94,20 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
     {
         // watch list: slot 0 = the requested address; a store by a vector-library helper (0x120000..0x122400,
         // dst=$a0 src=$a1) that covers a watched slot adds src+off, up to 6 levels -- the chain from a displayed
-        // position back to the site that integrates it. Each slot logs up to 200 stores.
+        // position back to the site that integrates it. Each slot logs up to 500 stores.
         static uint32_t s_w[6] = {0}; static uint32_t s_n[6] = {0}; static int s_cnt = 0;
         if (s_cnt == 0) { for (int k = 0; k < g_addrWatchCnt; ++k) s_w[k] = g_addrWatchList[k]; s_cnt = g_addrWatchCnt; }
         const uint32_t a = guestAddr & 0x1FFFFFFFu;
         const bool active = ps2HalfStepFightActive();
-        for (int k = 0; k < s_cnt; ++k)
+        static bool s_trig = (g_awTrigAddr == 0); static bool s_haveBase = false; static float s_base = 0.f;
+        if (!s_trig && active)
+        {
+            float cur; std::memcpy(&cur, rdram + g_awTrigAddr, 4);
+            if (!s_haveBase) { s_base = cur; s_haveBase = true; }
+            else if (std::isfinite(cur) && std::fabs(cur - s_base) > g_awTrigDelta)
+            { s_trig = true; std::fprintf(stderr, "[addrwatch] TRIGGERED: slot 0x%x moved %g -> %g at frame %llu\n", g_awTrigAddr, s_base, cur, (unsigned long long)g_bt3FrameCount.load()); }
+        }
+        for (int k = 0; s_trig && k < s_cnt; ++k)
         {
             const uint32_t w = s_w[k];
             if (!(a <= w && w < a + size) || !active) continue;
@@ -101,7 +118,7 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
             float fo, fn; std::memcpy(&fo, &oldv, 4); std::memcpy(&fn, &nv, 4);
             const uint32_t a0 = (uint32_t)ctx->r[4][0], a1 = (uint32_t)ctx->r[5][0], a2 = (uint32_t)ctx->r[6][0];
             const bool changing = std::fabs(fn - fo) > 0.01f || (!std::isfinite(fn) != !std::isfinite(fo));
-            if (changing && s_n[k]++ < 300u)
+            if (changing && s_n[k]++ < 500u)
                 std::fprintf(stderr, "[addrwatch%d] slot=0x%x pc=0x%06x ra=0x%06x size=%u old=%g new=%g a0=0x%x a1=0x%x a2=0x%x frame=%llu\n", k, w, ctx->pc, (uint32_t)ctx->r[31][0], size, fo, fn, a0, a1, a2, (unsigned long long)g_bt3FrameCount.load());
             if (size == 16 && ctx->pc >= 0x120000u && ctx->pc < 0x122400u && (a0 & 0x1FFFFFFFu) == a && s_cnt < 6 && k < g_addrWatchCnt)
             {   // follow $a1 (the source) of a vector helper, one level below the requested slots only

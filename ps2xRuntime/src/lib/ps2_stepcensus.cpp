@@ -14,6 +14,8 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 std::atomic<int> g_ps2StepCensus{0};
 extern std::atomic<uint64_t> g_bt3FrameCount;
@@ -35,6 +37,8 @@ namespace
     };
     constexpr uint32_t kBase = 0x100000u, kEnd = 0x340000u;
     Site *g_sites = nullptr;
+    // vector (sqc2) stores keyed by (pc, ra): the store sites are shared math helpers, the caller tells them apart
+    std::unordered_map<uint64_t, Site> g_vecSites;
     std::atomic<const R5900Context *> g_ctx{nullptr};
     std::string g_out;
     std::mutex g_dumpMtx;
@@ -74,7 +78,8 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
         if (pc < kBase || pc >= kEnd) return;
         const uint32_t a = guestAddr & 0x1FFFFFFFu;
         if (a + 16u > 32u * 1024u * 1024u) return;
-        Site &s = g_sites[(pc - kBase) >> 2];
+        const uint32_t ra = (uint32_t)ctx->r[31][0];
+        Site &s = g_vecSites[((uint64_t)pc << 32) | ra];
         uint32_t oldv[4]; std::memcpy(oldv, rdram + a, 16);
         const uint32_t nw[4] = { (uint32_t)valueLo, (uint32_t)(valueLo >> 32), (uint32_t)valueHi, (uint32_t)(valueHi >> 32) };
         const uint32_t frame = (uint32_t)g_bt3FrameCount.load(std::memory_order_relaxed);
@@ -142,7 +147,7 @@ void ps2StepCensusDump()
     std::lock_guard<std::mutex> lk(g_dumpMtx);
     FILE *f = std::fopen(g_out.c_str(), "w");
     if (!f) { std::fprintf(stderr, "[stepcensus] cannot write %s\n", g_out.c_str()); return; }
-    std::fprintf(f, "pc,count,frames,per_frame,size,addr_lo,addr_hi,chain_pct,same_pct,fplaus_pct,fdelta,fdelta_pct,idelta,idelta_pct\n");
+    std::fprintf(f, "pc,count,frames,per_frame,size,addr_lo,addr_hi,chain_pct,same_pct,fplaus_pct,fdelta,fdelta_pct,idelta,idelta_pct,ra\n");
     uint32_t n = 0;
     const uint32_t total = (kEnd - kBase) >> 2;
     for (uint32_t i = 0; i < total; ++i)
@@ -151,11 +156,23 @@ void ps2StepCensusDump()
         if (s.count < 20u || s.framesSeen < 5u) continue;
         const double c = s.count;
         const double nz = c - s.zeroDelta;
-        std::fprintf(f, "0x%06x,%u,%u,%.2f,%u,0x%x,0x%x,%.0f,%.0f,%.0f,%.6g,%.0f,%d,%.0f\n",
+        std::fprintf(f, "0x%06x,%u,%u,%.2f,%u,0x%x,0x%x,%.0f,%.0f,%.0f,%.6g,%.0f,%d,%.0f,0\n",
                      kBase + i * 4u, s.count, s.framesSeen, c / (double)s.framesSeen, s.sizeMask, s.addrLo, s.addrHi,
                      100.0 * s.chain / c, 100.0 * s.zeroDelta / c, nz > 0 ? 100.0 * s.fplaus / nz : 0.0,
                      (double)s.dMode, s.fplaus ? 100.0 * s.dModeN / (double)s.fplaus : 0.0,
                      s.iMode, nz > 0 ? 100.0 * s.iModeN / nz : 0.0);
+        ++n;
+    }
+    for (const auto &kv : g_vecSites)
+    {
+        const Site &s = kv.second;
+        if (s.count < 20u || s.framesSeen < 5u) continue;
+        const double c = s.count; const double nz = c - s.zeroDelta;
+        std::fprintf(f, "0x%06x,%u,%u,%.2f,%u,0x%x,0x%x,%.0f,%.0f,%.0f,%.6g,%.0f,%d,%.0f,0x%x\n",
+                     (uint32_t)(kv.first >> 32), s.count, s.framesSeen, c / (double)s.framesSeen, s.sizeMask, s.addrLo, s.addrHi,
+                     100.0 * s.chain / c, 100.0 * s.zeroDelta / c, nz > 0 ? 100.0 * s.fplaus / nz : 0.0,
+                     (double)s.dMode, s.fplaus ? 100.0 * s.dModeN / (double)s.fplaus : 0.0,
+                     s.iMode, nz > 0 ? 100.0 * s.iModeN / nz : 0.0, (uint32_t)kv.first);
         ++n;
     }
     std::fclose(f);
@@ -208,6 +225,7 @@ bool ps2HalfStepFightActive()
 namespace
 {
     uint8_t *g_hs = nullptr;                      // 0 none, 1 float-halve, 2 int-every-other-frame
+    std::unordered_set<uint64_t> g_hsVec;         // vector sites: (pc << 32) | ra
     // one-shot guard keyed per (site, address): a hash table over all addresses (fd11: a smoke-particle lifetime
     // site touches 29 slots, >10 per frame -- an 8-entry per-site ring thrashed and re-doubled live particles)
     struct HsEntry { uint32_t addr, frame, pc; };
@@ -285,7 +303,7 @@ void ps2HalfStepWrite128(uint8_t *rdram, uint32_t guestAddr, uint64_t &lo, uint6
     if (!g_hs || !ctx || ctx != g_hsCtx.load(std::memory_order_relaxed)) return;
     const uint32_t pc = ctx->pc;
     if (pc < kBase || pc >= kEnd) return;
-    if (g_hs[(pc - kBase) >> 2] != 1) return;     // vector sites are float accumulators ('f')
+    if (g_hsVec.find(((uint64_t)pc << 32) | (uint32_t)ctx->r[31][0]) == g_hsVec.end()) return;   // keyed by (site, caller)
     const uint32_t a = guestAddr & 0x1FFFFFFFu;
     if (a + 16u > 32u * 1024u * 1024u) return;
     const uint32_t frame = (uint32_t)g_bt3FrameCount.load(std::memory_order_relaxed);
@@ -317,10 +335,11 @@ void ps2HalfStepEnable(const char *sitesPath)
     g_hs = new uint8_t[(kEnd - kBase) >> 2]();
     g_hsLast = new HsEntry[kHsSize];
     for (uint32_t i = 0; i < kHsSize; ++i) { g_hsLast[i].addr = 0xFFFFFFFFu; g_hsLast[i].frame = 0xFFFF0000u; g_hsLast[i].pc = 0; }
-    char line[128]; unsigned nf = 0, ni = 0, nd = 0;
+    char line[128]; unsigned nf = 0, ni = 0, nd = 0, nv = 0;
     while (std::fgets(line, sizeof line, f))
     {
-        unsigned pc = 0; char kind = 0;
+        unsigned pc = 0, ra = 0; char kind = 0;
+        if (std::sscanf(line, "%x:%x %c", &pc, &ra, &kind) == 3) { if (pc >= kBase && pc < kEnd && kind == 'f') { g_hsVec.insert(((uint64_t)pc << 32) | ra); ++nv; } continue; }
         if (std::sscanf(line, "%x %c", &pc, &kind) != 2 || pc < kBase || pc >= kEnd) continue;
         if (kind == 'f') { g_hs[(pc - kBase) >> 2] = 1; ++nf; }
         else if (kind == 'i' || kind == 'u') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
@@ -328,7 +347,7 @@ void ps2HalfStepEnable(const char *sitesPath)
     }
     std::fclose(f);
     g_hsEnabled.store(1, std::memory_order_relaxed);   // the macro switch itself is raised per fight frame (zero cost elsewhere)
-    std::fprintf(stderr, "[halfstep] ON: %u float sites halved, %u integer sites on even frames only, %u countdowns doubled on arm (%s)\n", nf, ni, nd, sitesPath);
+    std::fprintf(stderr, "[halfstep] ON: %u float sites halved, %u integer sites on even frames only, %u countdowns doubled on arm, %u vector sites by caller (%s)\n", nf, ni, nd, nv, sitesPath);
 }
 void ps2HalfStepFrame(const R5900Context *ctx)
 {

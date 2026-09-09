@@ -3932,6 +3932,21 @@ namespace
         g_bt3FrameCount.fetch_add(1, std::memory_order_relaxed);
         if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
         ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
+        {   // [animprobe] PS2X_ANIMPROBE=<hex guest addr>: print the float at that address once per render frame for 600
+            // frames (e.g. P1's animation frame counter, block+0x138) -- to measure animation pace instead of guessing
+            static const uint32_t s_probe = [](){ const char *v = std::getenv("PS2X_ANIMPROBE"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
+            if (s_probe)
+            {
+                static uint32_t s_n = 0; static float s_prev = 0.f;
+                if (s_n < 600u)
+                {
+                    float f = 0.f; if (const uint8_t *q = getMemPtr(rdram, s_probe & 0x1FFFFFFFu)) std::memcpy(&f, q, 4);
+                    if (s_n && (s_n % 10u) == 0u) std::fprintf(stderr, "[animprobe] frame %llu: %g (delta over 10 frames %g)\n", (unsigned long long)g_bt3FrameCount.load(), f, f - s_prev);
+                    if ((s_n % 10u) == 0u) s_prev = f;
+                    ++s_n;
+                }
+            }
+        }
         {   // [framegate] PS2X_FRAMEGATE (default ON when async is on, =0 disables): require two
             // vsync ticks between render kicks.
             //

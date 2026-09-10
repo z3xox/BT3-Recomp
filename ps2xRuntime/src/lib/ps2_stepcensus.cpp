@@ -87,6 +87,9 @@ static void parseTrig()
 // store whose pc lies in one of the ranges for the next N frames (default 40, cap 40000 lines) -- a module's whole
 // per-frame update (e.g. the camera) in one run, so its persistent slots and their writers can be read off
 static uint32_t g_stRange[8][2]; static int g_stRanges = 0; static uint32_t g_stFrames = 40; static std::atomic<uint32_t> g_stLines{0};
+// PS2X_STORETRACE_ADDR=<hex lo>:<hex hi>: additionally log every store (from ANY pc) into that address range after the
+// trigger -- the writers of one struct when its module is unknown
+static uint32_t g_stAddrLo = 0, g_stAddrHi = 0;
 void ps2StoreTraceEnable(const char *spec)
 {
     std::string t(spec); size_t semi = t.find(';');
@@ -98,6 +101,12 @@ void ps2StoreTraceEnable(const char *spec)
         std::string r = t.substr(p0, p1 - p0); size_t c = r.find(':');
         if (c != std::string::npos) { g_stRange[g_stRanges][0] = (uint32_t)std::strtoul(r.c_str(), nullptr, 16); g_stRange[g_stRanges][1] = (uint32_t)std::strtoul(r.c_str() + c + 1, nullptr, 16); ++g_stRanges; }
         p0 = p1 + 1;
+    }
+    if (const char *ar = std::getenv("PS2X_STORETRACE_ADDR"); ar && ar[0])
+    {
+        char *end = nullptr; g_stAddrLo = (uint32_t)std::strtoul(ar, &end, 16) & 0x1FFFFFFFu;
+        if (end && *end == ':') g_stAddrHi = (uint32_t)std::strtoul(end + 1, nullptr, 16) & 0x1FFFFFFFu;
+        std::fprintf(stderr, "[storetrace] address range 0x%x..0x%x (any pc)\n", g_stAddrLo, g_stAddrHi);
     }
     parseTrig(); g_ps2StepCensus.store(1, std::memory_order_relaxed);
     std::fprintf(stderr, "[storetrace] ON: %d pc range(s), %u frames after the trigger\n", g_stRanges, g_stFrames);
@@ -147,7 +156,8 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
             if (fr != s_capFrame) { s_capFrame = fr; s_perPc.clear(); }
             if (fr - s_trigFrame < g_stFrames)
                 for (int r = 0; r < g_stRanges; ++r)
-                    if ((ctx->pc >= g_stRange[r][0] && ctx->pc < g_stRange[r][1]) || (ra >= g_stRange[r][0] && ra < g_stRange[r][1]))
+                    if ((ctx->pc >= g_stRange[r][0] && ctx->pc < g_stRange[r][1]) || (ra >= g_stRange[r][0] && ra < g_stRange[r][1])
+                        || (g_stAddrHi && a + size > g_stAddrLo && a < g_stAddrHi))
                     {
                         if (s_perPc[ctx->pc ^ (ra << 8)]++ < 8u && g_stLines.fetch_add(1, std::memory_order_relaxed) < 60000u)
                         {

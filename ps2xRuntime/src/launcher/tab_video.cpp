@@ -9,6 +9,7 @@
 #include <QScrollArea>
 #include <QSlider>
 #include <QVBoxLayout>
+#include <algorithm>
 
 namespace
 {
@@ -112,8 +113,13 @@ VideoTab::VideoTab(QWidget *parent)
 
     // RENDERER
     root->addWidget(sectionLabel(QStringLiteral("RENDERER")));
-    root->addWidget(toggleRow(QStringLiteral("GPU Renderer (OpenGL)"), &m_gpu, s.gpuRenderer(),
-                              QStringLiteral("Takes full effect after restart.")));
+    QStringList renderers = {
+        QStringLiteral("OpenGL"),
+        QStringLiteral("Software (CPU)"),
+        QStringLiteral("paraLLEl-GS (Vulkan)")};
+    const int curRenderer = std::min(std::max(s.renderer(), 0), 2);
+    root->addWidget(comboRow(QStringLiteral("Renderer"), &m_renderer, renderers, curRenderer));
+    root->addWidget(hintRow(QStringLiteral("paraLLEl-GS is the default backend. Falls back to OpenGL if Vulkan is unavailable.")));
     root->addWidget(toggleRow(QStringLiteral("Cel Outline"), &m_outline, s.outline()));
     m_inkRow = sliderPair(QStringLiteral("Ink Strength"), &m_ink, &m_inkVal, 100, 260,
                           s.inkStrength(), "%d %%");
@@ -208,7 +214,9 @@ VideoTab::VideoTab(QWidget *parent)
     outer->addWidget(scroll);
 
     // Live write-through into SettingsManager (Save persists to INI).
-    connect(m_gpu, &QCheckBox::toggled, this, [](bool v) { SettingsManager::instance().setGpuRenderer(v); });
+    connect(m_renderer, &QComboBox::currentIndexChanged, this, [](int v) {
+        SettingsManager::instance().setRenderer(v);
+    });
     connect(m_outline, &QCheckBox::toggled, this, &VideoTab::onOutline);
     connect(m_ink, &QSlider::valueChanged, this, [this](int v) {
         m_inkVal->setText(QString::number(v) + QStringLiteral("%%"));

@@ -1,3 +1,4 @@
+#include "app_paths.h"
 #include "launcher_window.h"
 
 #include "dbz_theme.h"
@@ -14,6 +15,7 @@
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
+#include <QMessageBox>
 #include <QPainter>
 #include <QProcess>
 #include <QPushButton>
@@ -50,8 +52,8 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     setMinimumSize(700, 420);
 
     // The launcher lives in the deploy root; savedata/ is the shared settings dir.
-    m_savedataDir = QDir(QApplication::applicationDirPath()).filePath(QStringLiteral("savedata"));
-    m_dataDir = QDir(QApplication::applicationDirPath()).filePath(QStringLiteral("data"));
+    m_savedataDir = QDir(apppaths::userRoot()).filePath(QStringLiteral("savedata"));
+    m_dataDir = QDir(apppaths::userRoot()).filePath(QStringLiteral("data"));
 
     // Resolve the game ELF next to the launcher binary.
     const QDir appDir(QApplication::applicationDirPath());
@@ -70,23 +72,13 @@ LauncherWindow::LauncherWindow(QWidget *parent)
         }
     }
 
-    // Release deploy: no SELFX next to us, but a plain ps2EntryRunner from the
-    // same stage tree. Boot it directly with data/SLUS_216.78 instead of
-    // embedding a duplicate self-extracting runner (saves ~130 MiB payload).
-    if (m_gameElf.isEmpty())
-    {
-        const QString runner = appDir.filePath(QStringLiteral("bt3-runner"));
-        if (QFile::exists(runner) && QFileInfo(runner).isExecutable())
-            m_plainRunner = true;
-    }
-
     // Background: deploy assets/background.png if present, else a DBZ gradient.
-    const QString bg = appDir.filePath(QStringLiteral("assets/background.png"));
+    const QString bg = QDir(apppaths::assets()).filePath(QStringLiteral("background.png"));
     if (QFile::exists(bg))
         m_bgPath = bg;
 
     // Window/taskbar icon from the same asset tree.
-    const QIcon appIcon(appDir.filePath(QStringLiteral("assets/icon.png")));
+    const QIcon appIcon(QDir(apppaths::assets()).filePath(QStringLiteral("icon.png")));
     if (!appIcon.isNull())
         setWindowIcon(appIcon);
 
@@ -145,6 +137,29 @@ LauncherWindow::LauncherWindow(QWidget *parent)
     SettingsManager::instance().load();
 }
 
+// Release deploy: no SELFX next to us, but a plain ps2EntryRunner from the
+// same stage tree. Boot it directly with data/SLUS_216.78 instead of
+// embedding a duplicate self-extracting runner (saves ~130 MiB payload).
+// Re-run after the install wizard so a freshly created runner (direct-runner
+// deploy) flips the hint straight to "Ready to Play" without a restart.
+void LauncherWindow::resolveLaunchTarget()
+{
+    if (m_gameElf.isEmpty())
+    {
+#ifdef _WIN32
+        const QString runner = QDir::cleanPath(
+            QApplication::applicationDirPath() + QStringLiteral("/bt3-runner.exe"));
+#else
+        const QString runner = QDir::cleanPath(
+            QApplication::applicationDirPath() + QStringLiteral("/bt3-runner"));
+#endif
+        if (QFile::exists(runner) && QFileInfo(runner).isExecutable())
+            m_plainRunner = true;
+        else
+            m_plainRunner = false;
+    }
+}
+
 QString LauncherWindow::findGameElf()
 {
     const QDir appDir(QApplication::applicationDirPath());
@@ -185,20 +200,38 @@ void LauncherWindow::onPlayClicked()
     const QDir appDir(QApplication::applicationDirPath());
 
     QProcess *proc = new QProcess(nullptr);
-    proc->setWorkingDirectory(appDir.absolutePath());
+    proc->setWorkingDirectory(apppaths::userRoot());
+#if defined(Q_OS_MACOS)
+    // Detached GUI applications do not inherit a useful terminal on macOS.
+    // Keep the most recent runner diagnostics where users can attach them to a report.
+    const QString logsDir = QDir(apppaths::userRoot()).filePath(QStringLiteral("logs"));
+    QDir().mkpath(logsDir);
+    proc->setStandardOutputFile(QDir(logsDir).filePath(QStringLiteral("game-latest.out")));
+    proc->setStandardErrorFile(QDir(logsDir).filePath(QStringLiteral("game-latest.log")));
+#endif
 
     if (m_plainRunner)
     {
         // Direct runner mode: point it at the extracted boot ELF and the
         // bundled library tree; it is already the real ps2EntryRunner.
+#ifdef _WIN32
+        proc->setProgram(appDir.filePath(QStringLiteral("bt3-runner.exe")));
+#else
         proc->setProgram(appDir.filePath(QStringLiteral("bt3-runner")));
-        const QString dataDir = appDir.filePath(QStringLiteral("data"));
+#endif
+        const QString dataDir = m_dataDir;
         proc->setArguments({QDir(dataDir).filePath(QStringLiteral("SLUS_216.78"))});
         auto env = QProcessEnvironment::systemEnvironment();
         // [deploy] Anchor the runner's savedata/assets/fonts (and bt3_settings.ini)
         // at the deploy root -- where the launcher wrote them -- not data/.
-        env.insert(QStringLiteral("PS2X_EXEDIR"), appDir.absolutePath());
+        env.insert(QStringLiteral("PS2X_EXEDIR"), apppaths::userRoot());
+        env.insert(QStringLiteral("PS2X_ASSETDIR"), apppaths::assets());
+#if !defined(_WIN32) && !defined(Q_OS_MACOS)
+        // position-independent loader search is a POSIX concept; Windows
+        // resolves the bundled dlls from the executable's own directory, and
+        // the macOS bundle resolves its dylibs through @rpath.
         env.insert(QStringLiteral("LD_LIBRARY_PATH"), appDir.filePath(QStringLiteral("lib")));
+#endif
         proc->setProcessEnvironment(env);
     }
     else
@@ -206,7 +239,12 @@ void LauncherWindow::onPlayClicked()
         // Launch detached: the game extracts + execs its own inner runner.
         proc->setProgram(m_gameElf);
     }
-    proc->startDetached();
+    if (!proc->startDetached())
+    {
+        QMessageBox::critical(this, QStringLiteral("Could not start the game"), proc->errorString());
+        proc->deleteLater();
+        return;
+    }
 
     // The launcher's job is done: close this window (the game runs on its own).
     close();
@@ -214,6 +252,7 @@ void LauncherWindow::onPlayClicked()
 
 void LauncherWindow::checkGameData()
 {
+    resolveLaunchTarget();
     m_gameDataValid = (DiscVerify::verifyInstalledData(m_dataDir) == DiscVerify::State::Valid);
 
     if (m_play)
@@ -224,25 +263,30 @@ void LauncherWindow::checkGameData()
 
 void LauncherWindow::updateHint()
 {
+    const QString kRed = QStringLiteral("#ef4444");
+    const QString kGreen = QStringLiteral("#22c55e");
+    const QString kDim = QStringLiteral("#9999b3");
+
+    QString color;
     QString text;
     if (!m_gameDataValid)
     {
-        text = QStringLiteral("  game data missing or corrupted - reinstall required");
+        color = kRed;
+        text = QStringLiteral("Missing or Corrupted Data");
     }
-    else if (!m_gameElf.isEmpty())
+    else if (!m_gameElf.isEmpty() || m_plainRunner)
     {
-        text = QStringLiteral("  ready to play: %1").arg(QFileInfo(m_gameElf).fileName());
-    }
-    else if (m_plainRunner)
-    {
-        text = QStringLiteral("  ready to play (direct runner)");
+        color = kGreen;
+        text = QStringLiteral("Ready to Play");
     }
     else
     {
-        text = QStringLiteral("  no self-extracting game ELF found in this folder");
+        color = kDim;
+        text = QStringLiteral("No self-extracting game ELF found in this folder");
     }
     if (m_hint)
-        m_hint->setText(text);
+        m_hint->setText(QStringLiteral("<span style=\"color:%1; font-size:15px;\">●</span> %2")
+                            .arg(color, text));
 }
 
 bool LauncherWindow::openInstallWizard()

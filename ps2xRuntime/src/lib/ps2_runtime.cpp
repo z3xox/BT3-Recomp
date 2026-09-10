@@ -33,6 +33,7 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_settings_overlay.h"
+#include "raylib.h" // window icon (deploy assets/icon.png)
 // [wstrig] rig lever: PS2X_WSTRIG=<path> forces widescreen ON while <path> exists, so a
 // drive can boot with the calibrated 4:3 screen-matching and flip to true widescreen at
 // fight time (touch the file + resize the window). Checked once a second.
@@ -1215,6 +1216,45 @@ bool PS2Runtime::initialize(const char *title)
         }
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // [icon] Carry the launcher's icon onto the runner window. Same asset
+        // convention as the overlay font (<exeDir>/assets/icon.png); exeDir is
+        // PS2X_EXEDIR (deploy root) else the executable's own directory.
+        // raylib's SetWindowIcon must be called on a live (hidden) window.
+        {
+            std::error_code ec;
+            std::filesystem::path exeDir;
+            if (const char *exeDirEnv = std::getenv("PS2X_EXEDIR"))
+                if (exeDirEnv[0] != '\0')
+                    exeDir = exeDirEnv;
+#if !defined(_WIN32)
+            if (exeDir.empty())
+            {
+                std::filesystem::path self = std::filesystem::canonical("/proc/self/exe", ec);
+                if (!ec && !self.empty())
+                    exeDir = self.parent_path();
+            }
+#endif
+            if (!exeDir.empty())
+            {
+                const std::filesystem::path iconPath = exeDir / "assets" / "icon.png";
+                if (std::filesystem::is_regular_file(iconPath, ec) && !ec)
+                {
+                    Image icon = LoadImage(iconPath.string().c_str());
+                    if (icon.data != nullptr)
+                    {
+                        // The deploy art is huge (7k x 5k); X11's _NET_WM_ICON
+                        // sends every pixel as one property and would exceed a
+                        // single request (BadLength). Downscale before setting.
+                        const int target = 128;
+                        if (icon.width > target || icon.height > target)
+                            ImageResize(&icon, target,
+                                        target * icon.height / icon.width);
+                        SetWindowIcon(icon);
+                        UnloadImage(icon);
+                    }
+                }
+            }
+        }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -5289,7 +5329,7 @@ void PS2Runtime::run()
                 if (gprof::g_on)
                 {   // [guestprof] exclusive phase time on the guest thread(s), ms per second; tsc calibrated over this interval
                     static uint64_t s_lastTsc = 0, s_lastAcc[gprof::NPHASE] = {0};
-                    const uint64_t tsc = __rdtsc();
+                    const uint64_t tsc = gprof::ticks();
                     if (s_lastTsc)
                     {
                         const double nsPerTick = (dt * 1.0e9) / (double)(tsc - s_lastTsc);

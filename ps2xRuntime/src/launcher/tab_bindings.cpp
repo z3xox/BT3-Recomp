@@ -1,13 +1,13 @@
 #include "tab_bindings.h"
 
-#include "evdev_reader.h"
-
-#include <linux/input.h>
+#include "app_paths.h"
+#include "input_reader.h"
 
 #include <QApplication>
 #include <QComboBox>
 #include <QDir>
 #include <QFileInfo>
+#include <QKeyEvent>
 #include <QFont>
 #include <QHeaderView>
 #include <QHBoxLayout>
@@ -68,29 +68,27 @@ namespace
         return false;
     }
 
-    // evdev EV_KEY code -> raylib KEY_* code. The runtime stores raylib codes
-    // in pad.conf and polls with IsKeyDown(value), so capture must translate.
-    int evKeyToRaylib(int code)
+    // Qt key code -> raylib KEY_* code. The runtime stores raylib codes in
+    // pad.conf and polls with IsKeyDown(value), so capture must translate.
+    int qtKeyToRaylib(int key)
     {
-        static const struct { int ev; int rl; } map[] = {
-            {KEY_ESC, 256}, {KEY_ENTER, 257}, {KEY_TAB, 258}, {KEY_BACKSPACE, 259},
-            {KEY_SPACE, 32},
-            {KEY_UP, 265}, {KEY_DOWN, 264}, {KEY_LEFT, 263}, {KEY_RIGHT, 262},
-            {KEY_LEFTCTRL, 341}, {KEY_RIGHTCTRL, 345},
-            {KEY_LEFTSHIFT, 340}, {KEY_RIGHTSHIFT, 344},
-            {KEY_LEFTALT, 342}, {KEY_RIGHTALT, 346},
-            {KEY_LEFTMETA, 343}, {KEY_RIGHTMETA, 347},
-            {KEY_1, 49}, {KEY_2, 50}, {KEY_3, 51}, {KEY_4, 52}, {KEY_5, 53},
-            {KEY_6, 54}, {KEY_7, 55}, {KEY_8, 56}, {KEY_9, 57}, {KEY_0, 48},
-            {KEY_Q, 81}, {KEY_W, 87}, {KEY_E, 69}, {KEY_R, 82}, {KEY_T, 84},
-            {KEY_Y, 89}, {KEY_U, 85}, {KEY_I, 73}, {KEY_O, 79}, {KEY_P, 80},
-            {KEY_A, 65}, {KEY_S, 83}, {KEY_D, 68}, {KEY_F, 70}, {KEY_G, 71},
-            {KEY_H, 72}, {KEY_J, 74}, {KEY_K, 75}, {KEY_L, 76},
-            {KEY_Z, 90}, {KEY_X, 88}, {KEY_C, 67}, {KEY_V, 86}, {KEY_B, 66},
-            {KEY_N, 78}, {KEY_M, 77},
+        static const struct { int qt; int rl; } map[] = {
+            {Qt::Key_Escape, 256}, {Qt::Key_Return, 257}, {Qt::Key_Enter, 257},
+            {Qt::Key_Tab, 258}, {Qt::Key_Backspace, 259},
+            {Qt::Key_Space, 32},
+            {Qt::Key_Up, 265}, {Qt::Key_Down, 264}, {Qt::Key_Left, 263}, {Qt::Key_Right, 262},
+            {Qt::Key_Control, 341}, {Qt::Key_Shift, 340}, {Qt::Key_Alt, 342}, {Qt::Key_Meta, 343},
+            {Qt::Key_1, 49}, {Qt::Key_2, 50}, {Qt::Key_3, 51}, {Qt::Key_4, 52}, {Qt::Key_5, 53},
+            {Qt::Key_6, 54}, {Qt::Key_7, 55}, {Qt::Key_8, 56}, {Qt::Key_9, 57}, {Qt::Key_0, 48},
+            {Qt::Key_Q, 81}, {Qt::Key_W, 87}, {Qt::Key_E, 69}, {Qt::Key_R, 82}, {Qt::Key_T, 84},
+            {Qt::Key_Y, 89}, {Qt::Key_U, 85}, {Qt::Key_I, 73}, {Qt::Key_O, 79}, {Qt::Key_P, 80},
+            {Qt::Key_A, 65}, {Qt::Key_S, 83}, {Qt::Key_D, 68}, {Qt::Key_F, 70}, {Qt::Key_G, 71},
+            {Qt::Key_H, 72}, {Qt::Key_J, 74}, {Qt::Key_K, 75}, {Qt::Key_L, 76},
+            {Qt::Key_Z, 90}, {Qt::Key_X, 88}, {Qt::Key_C, 67}, {Qt::Key_V, 86}, {Qt::Key_B, 66},
+            {Qt::Key_N, 78}, {Qt::Key_M, 77},
         };
         for (auto &m : map)
-            if (m.ev == code)
+            if (m.qt == key)
                 return m.rl;
         return 0;
     }
@@ -195,9 +193,32 @@ BindingsTab::BindingsTab(QWidget *parent)
     m_timer = new QTimer(this);
     m_timer->setInterval(16);
     connect(m_timer, &QTimer::timeout, this, &BindingsTab::pollCapture);
+
+    // The keyboard is Qt-managed: a window-level filter feeds captured keys to
+    // the reader (instead of a /dev/input node).
+    qApp->installEventFilter(this);
 }
 
-BindingsTab::~BindingsTab() = default;
+BindingsTab::~BindingsTab()
+{
+    qApp->removeEventFilter(this);
+}
+
+bool BindingsTab::eventFilter(QObject *watched, QEvent *event)
+{
+    // Only feed keys while an active keyboard capture is waiting.
+    if (event->type() == QEvent::KeyPress && m_captureRow >= 0 &&
+        m_reader.isKeyboardDevice())
+    {
+        const int rl = qtKeyToRaylib(static_cast<QKeyEvent *>(event)->key());
+        if (rl != 0)
+        {
+            m_reader.captureKey(rl);
+            return true; // consume the press so it doesn't double-bind
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
 
 bool BindingsTab::load()
 {
@@ -232,7 +253,7 @@ bool BindingsTab::save()
 std::string BindingsTab::padconfPath() const
 {
     // Legacy single pad.conf (deploy root), kept for migration.
-    const QDir dir(QApplication::applicationDirPath());
+    const QDir dir(apppaths::userRoot());
     return dir.filePath(QStringLiteral("pad.conf")).toStdString();
 }
 
@@ -240,7 +261,7 @@ std::string BindingsTab::padconfLegacyPath() const { return padconfPath(); }
 
 std::string BindingsTab::playerConfigPath(int p) const
 {
-    const QDir dir(QApplication::applicationDirPath());
+    const QDir dir(apppaths::userRoot());
     return dir.filePath(QStringLiteral("savedata/pad_p%1.conf").arg(p + 1)).toStdString();
 }
 
@@ -490,22 +511,19 @@ void BindingsTab::pollCapture()
     }
     m_reader.update();
 
-    // Keyboard device: capture a raw key press (edge-triggered via
-    // takeLastKey, so no latch problem like gamepad buttons).
+    // Keyboard capture: keys are injected directly by the window event filter
+    // (as raylib codes) via captureKey(); takeLastKey is edge-triggered, so no
+    // latch problem like gamepad buttons.
     if (m_reader.isKeyboardDevice())
     {
-        const int key = m_reader.takeLastKey();
-        if (key > 0)
+        const int rl = m_reader.takeLastKey();
+        if (rl > 0)
         {
-            const int rl = evKeyToRaylib(key);
-            if (rl != 0)
-            {
-                padconf::Bind b;
-                b.kind = padconf::BindKind::Key;
-                b.value = rl;
-                m_players[m_player->currentIndex()].binds[m_captureRow] = b;
-                finishCapture();
-            }
+            padconf::Bind b;
+            b.kind = padconf::BindKind::Key;
+            b.value = rl;
+            m_players[m_player->currentIndex()].binds[m_captureRow] = b;
+            finishCapture();
         }
         return;
     }

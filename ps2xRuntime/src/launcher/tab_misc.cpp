@@ -1,3 +1,4 @@
+#include "app_paths.h"
 #include "tab_misc.h"
 
 #include "install_wizard_dialog.h"
@@ -134,7 +135,7 @@ MiscTab::MiscTab(QWidget *parent)
 
 void MiscTab::refresh()
 {
-    const QString dataDir = QApplication::applicationDirPath() + QStringLiteral("/data");
+    const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
     const DiscVerify::State st = DiscVerify::verifyInstalledData(dataDir);
 
     m_size->setText(fmtSize(DiscVerify::dataSize(dataDir)));
@@ -177,8 +178,8 @@ void MiscTab::onInstallWizard()
 
 void MiscTab::onOpenFolder()
 {
-    const QString dataDir = QApplication::applicationDirPath() + QStringLiteral("/data");
-    const QString target = QDir(dataDir).exists() ? dataDir : QApplication::applicationDirPath();
+    const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
+    const QString target = QDir(dataDir).exists() ? dataDir : apppaths::userRoot();
     if (!QDir().mkpath(target))
         return;
     QDesktopServices::openUrl(QUrl::fromLocalFile(target));

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "evdev_reader.h"
+#include "input_reader.h"
 #include "pad_config_reader.h"
 
 #include <QElapsedTimer>
@@ -10,6 +10,7 @@
 #include <vector>
 
 class QComboBox;
+class QEvent;
 class QLabel;
 class QTableWidget;
 class QTimer;
@@ -47,7 +48,7 @@ private:
     std::array<padconf::Player, 2> m_players{};
     std::vector<evin::DeviceInfo> m_filteredDevices;
 
-    // Persisted evdev reader for bind capture (opened once per device change).
+    // Reader for bind capture (opened once per device change).
     evin::Reader m_reader;
     std::string m_openedNode;
 
@@ -70,4 +71,6 @@ private:
     void pollCapture();
     void finishCapture();
     void setStatus(const QString &text);
+
+    bool eventFilter(QObject *watched, QEvent *event) override;
 };

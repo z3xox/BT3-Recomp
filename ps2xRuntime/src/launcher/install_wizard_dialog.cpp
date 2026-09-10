@@ -1,3 +1,4 @@
+#include "app_paths.h"
 #include "install_wizard_dialog.h"
 
 #include "afs_extract_worker.h"
@@ -297,8 +298,11 @@ void InstallWizardDialog::onBrowse()
 {
     static const QString kFilter =
         QStringLiteral("Game disc dump (*.iso *.img *.rar *.7z *.zip *.tar *.tar.gz);;All files (*)");
+    // Qt's own dialog (not the native GTK/portal one) so the app's DBZ theme
+    // applies: lighter slate background + white text, readable over dark desks.
     const QString path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("Select your own game disc dump"), QDir::homePath(), kFilter);
+        this, QStringLiteral("Select your own game disc dump"), QDir::homePath(), kFilter,
+        nullptr, QFileDialog::DontUseNativeDialog);
     if (path.isEmpty())
         return;
     m_selected->setText(QDir::toNativeSeparators(path));
@@ -427,7 +431,7 @@ void InstallWizardDialog::startExtraction()
     connect(m_worker, &ExtractWorker::done, m_thread, &QThread::quit);
     m_thread->start();
 
-    const QString dataDir = QApplication::applicationDirPath() + QStringLiteral("/data");
+    const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
     QMetaObject::invokeMethod(m_worker, "doWork", Qt::QueuedConnection, Q_ARG(QString, m_isoPath),
                               Q_ARG(QString, dataDir));
 }
@@ -445,7 +449,7 @@ void InstallWizardDialog::onExtractDone(bool ok, const QString &msg)
 {
     if (ok)
     {
-        const QString dataDir = QApplication::applicationDirPath() + QStringLiteral("/data");
+        const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
         if (!findAfsContainers(dataDir).isEmpty())
         {
             startAfsConversion();
@@ -459,7 +463,7 @@ void InstallWizardDialog::onExtractDone(bool ok, const QString &msg)
 
 void InstallWizardDialog::startAfsConversion()
 {
-    const QString dataDir = QApplication::applicationDirPath() + QStringLiteral("/data");
+    const QString dataDir = apppaths::userRoot() + QStringLiteral("/data");
     const QStringList afs = findAfsContainers(dataDir);
     if (afs.isEmpty())
     {

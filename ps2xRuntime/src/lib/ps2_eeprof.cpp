@@ -25,7 +25,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#else
+#elif defined(__linux__) && defined(__x86_64__)
 #include <dlfcn.h>
 #include <signal.h>
 #include <sys/syscall.h>
@@ -37,8 +37,13 @@
 #include "ps2_waitprof.h"
 std::atomic<uint64_t> g_ps2xWaitNs[WP_COUNT];
 std::atomic<uint64_t> g_ps2xWaitN[WP_COUNT];
+#if (defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))) || (defined(__linux__) && defined(__x86_64__))
 bool g_ps2xWaitProfOn = [](){ const char *e = std::getenv("PS2X_EEPROF"); return e && e[0] && e[0] != '0'; }();
+#else
+bool g_ps2xWaitProfOn = false;
+#endif
 
+#if (defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))) || (defined(__linux__) && defined(__x86_64__))
 extern "C" void ps2xEeProfCollectTable(void (*cb)(uintptr_t fnptr, uint32_t guestAddr, int which, void *user), void *user);
 
 namespace
@@ -263,3 +268,16 @@ extern "C" void ps2xEeProfAddCurrentThread(const char *name)
     { std::lock_guard<std::mutex> lk(g_mx); g_targets.push_back(t); }
     ensureStarted();
 }
+#else
+// The sampler requires Windows x64 thread contexts or Linux x64 CPU timers.
+// Keep the exported entry point on other hosts without starting a reporter.
+extern "C" void ps2xEeProfAddCurrentThread(const char *)
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char *e = std::getenv("PS2X_EEPROF");
+        if (e && e[0] && e[0] != '0')
+            std::fprintf(stderr, "[eeprof] sampling unavailable on this platform; use PS2X_GUESTPROF=1\n");
+    });
+}
+#endif

@@ -28,6 +28,7 @@ protected:
 
 private:
     void loadBackground();
+    void resolveLaunchTarget();
     void updateHint();
     void checkGameData();
     bool openInstallWizard();

@@ -26,6 +26,9 @@ extern "C" void ps2xWinHostInfo();             // ps2_win_timer.cpp: [host] cpu 
 #include <algorithm>
 #include <cstdlib>
 #include <csignal>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 namespace
 {
@@ -91,10 +94,22 @@ namespace
             if (exeDir[0] != '\0')
                 return std::filesystem::path(exeDir);
         std::error_code ec;
+#if defined(__APPLE__)
+        uint32_t size = 0;
+        _NSGetExecutablePath(nullptr, &size);
+        std::vector<char> path(size);
+        if (_NSGetExecutablePath(path.data(), &size) == 0)
+        {
+            const auto self = std::filesystem::canonical(path.data(), ec);
+            if (!ec) return self.parent_path();
+        }
+        return std::filesystem::current_path();
+#else
         std::filesystem::path self = std::filesystem::canonical("/proc/self/exe", ec);
         if (ec || self.empty())
             self = std::filesystem::current_path();
         return self.parent_path();
+#endif
     }
 
     std::filesystem::path getExecutablePath(int argc, char *argv[])

@@ -3,7 +3,7 @@
 
     python3 games/bt3/setup.py <iso|elf> [--jobs N] [--deploy OUT] [--skip-setup]
 
-Cross-platform (Linux primary; Windows experimental). The game's code is generated
+Cross-platform (Linux primary; Windows and macOS experimental). The game's code is generated
 locally from YOUR copy of the game — this repository ships no game code or assets.
 Steps: extract/verify the game files, build the recompiler, generate the runner
 sources, generate the overlay module, apply patches, build the runner.
@@ -34,6 +34,7 @@ BUILD = Path(os.environ.get("PS2X_BUILD_DIR") or str(ROOT / "build"))
 WORK = HERE / "work"
 ELF_SHA256 = "811188ba9b416500d921cd4d9514df0cbf42f3a41a99cf5aac5a3da37171bf99"
 IS_WINDOWS = os.name == "nt"
+IS_MACOS = sys.platform == "darwin"
 # Generated TUs are huge; high job counts can exhaust RAM (16 GB: keep <= 3).
 DEFAULT_JOBS = "3"
 
@@ -115,6 +116,12 @@ def cmake_configure_extra() -> list:
     # aborted a user's whole game build (imgui_colortextedit populate failed, 2026-09-08). The game does
     # not need it: off unless PS2X_SETUP_STUDIO=1.
     extra.append("-DPS2X_BUILD_STUDIO=" + ("ON" if os.environ.get("PS2X_SETUP_STUDIO") == "1" else "OFF"))
+    if IS_MACOS:
+        extra += ["-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"]
+        if os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
+            extra.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=" + os.environ["MACOSX_DEPLOYMENT_TARGET"])
+        if not (BUILD / "CMakeCache.txt").exists() and shutil.which("ninja"):
+            extra += ["-G", "Ninja"]
     if not IS_WINDOWS:
         return extra
     cache = BUILD / "CMakeCache.txt"
@@ -131,7 +138,6 @@ def cmake_configure_extra() -> list:
     # Visual Studio generator hands the runner project's ~1000 unity units to MSBuild, which without
     # multi-processor compilation builds them one at a time (a 45-minute scratch build, 2026-09-08).
     # PS2X_SETUP_GENERATOR=vs forces the Visual Studio generator.
-    import shutil
     dev_prompt = bool(os.environ.get("VCToolsInstallDir") or os.environ.get("INCLUDE"))
     if (os.environ.get("PS2X_SETUP_GENERATOR", "ninja").lower() != "vs" and dev_prompt
             and shutil.which("ninja") and shutil.which("clang-cl")):
@@ -145,6 +151,12 @@ def configured() -> bool:
     project files, and `cmake --build` then dies with "MSB1009: Project file does not exist"."""
     if not (BUILD / "CMakeCache.txt").exists():
         return False
+    if IS_MACOS and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
+        cache = (BUILD / "CMakeCache.txt").read_text(errors="replace")
+        desired = os.environ["MACOSX_DEPLOYMENT_TARGET"]
+        if not any(line.startswith("CMAKE_OSX_DEPLOYMENT_TARGET:") and line.endswith("=" + desired)
+                   for line in cache.splitlines()):
+            return False
     if any((BUILD / f).exists() for f in ("build.ninja", "Makefile", "ALL_BUILD.vcxproj")):
         return True
     return any(BUILD.glob("*.sln"))

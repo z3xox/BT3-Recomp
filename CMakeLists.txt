@@ -42,10 +42,20 @@ option(PS2X_BUILD_STUDIO "Build ps2xStudio" ON)
 
 set(PS2X_IS_ARM_TARGET OFF)
 set(PS2X_IS_AARCH64_TARGET OFF)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+# CMAKE_SYSTEM_PROCESSOR describes the host when selecting a macOS cross-build.
+# SIMD compile flags must instead follow the requested output architecture.
+set(PS2X_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    list(LENGTH CMAKE_OSX_ARCHITECTURES _ps2x_arch_count)
+    if(NOT _ps2x_arch_count EQUAL 1)
+        message(FATAL_ERROR "Build macOS arm64 and x86_64 separately; mixed SIMD universal builds are not supported")
+    endif()
+    set(PS2X_TARGET_PROCESSOR "${CMAKE_OSX_ARCHITECTURES}")
+endif()
+if(PS2X_TARGET_PROCESSOR MATCHES "arm64|aarch64|ARM64")
     set(PS2X_IS_ARM_TARGET ON)
     set(PS2X_IS_AARCH64_TARGET ON)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm|^ARM")
+elseif(PS2X_TARGET_PROCESSOR MATCHES "^arm|^ARM")
     set(PS2X_IS_ARM_TARGET ON)
 endif()
 

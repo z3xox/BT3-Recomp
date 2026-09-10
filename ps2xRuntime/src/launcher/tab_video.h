@@ -23,7 +23,7 @@ private slots:
     void onHudLayout(int);
 
 private:
-    QCheckBox *m_gpu = nullptr;
+    QComboBox *m_renderer = nullptr;
     QCheckBox *m_outline = nullptr;
     QWidget *m_inkRow = nullptr;
     QSlider *m_ink = nullptr;

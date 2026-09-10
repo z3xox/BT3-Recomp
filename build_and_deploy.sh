@@ -5,25 +5,15 @@
 #   ./build_and_deploy.sh --iso PATH --output DIR  # non-interactive
 #   ./build_and_deploy.sh --skip-setup --output DIR  # reuse work/, just rebuild + deploy
 #
-# The Linux deploy is a self-extracting launcher: [static stub][zstd payload][footer].
-# Deploys into DIR/ as:
-#   Dragon Ball - Budokai Tenkaichi 3   (the self-extracting executable)
-#   data/   savedata/   assets/   logs/
+# Deploys a runnable portable tree into DIR/, ready to play. No self-extracting
+# installer: run `install game.sh` inside the folder to install the game on the
+# host (copies it to ~/.local/share/bt3-recomp and registers a launcher entry).
+#   DIR/  Launcher   bt3-runner   data/   savedata/   assets/   logs/   install game.sh
 set -euo pipefail
 
 # ---- config ---------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISO_DEFAULT="/home/rexx/Descargas/Roms/PS2/DragonBall Z - Budokai Tenkaichi 3.iso"
-DEPLOY_SRC="${BT3_DEPLOY_SRC:-/tmp/opencode/bt3-deploy}"   # scratch dir for zstd source + staged payload
-STUB_BIN="$DEPLOY_SRC/stub"
-ZSTD_VERSION="1.5.7"
-ZSTD_DIR="$DEPLOY_SRC/zstd-$ZSTD_VERSION"
-ZSTD_LIB="$ZSTD_DIR/lib/libzstd.a"
-# The stub source is kept in-repo (tools/selfx/stub.c) so the deploy survives
-# /tmp cleanup; an older BT3_DEPLOY_SRC copy still works as a fallback.
-STUB_SRC="${BT3_STUB_SRC:-$ROOT/tools/selfx/stub.c}"
-[ ! -f "$STUB_SRC" ] && STUB_SRC="$DEPLOY_SRC/stub.c"
-STAGE="$DEPLOY_SRC/stage"
 JOBS="${BT3_JOBS:-$(nproc)}"
 GAME="Dragon Ball - Budokai Tenkaichi 3"
 
@@ -67,34 +57,16 @@ if [[ ! -f "$RUNNER" ]]; then
     echo "ERROR: build/deploy did not produce $RUNNER" >&2; exit 2
 fi
 
-# ---- static stub (compile once) --------------------------------------------------
-if [[ ! -x "$STUB_BIN" ]]; then
-    echo "== building static stub launcher"
-    if [[ ! -f "$ZSTD_LIB" ]]; then
-        if [[ ! -f "$ZSTD_DIR/Makefile" ]]; then
-            echo "== fetching zstd $ZSTD_VERSION source"
-            mkdir -p "$DEPLOY_SRC"
-            if ! curl -fsSL --retry 2 \
-                "https://github.com/facebook/zstd/releases/download/v$ZSTD_VERSION/zstd-$ZSTD_VERSION.tar.gz" \
-                -o "$DEPLOY_SRC/zstd.tar.gz"; then
-                echo "ERROR: could not fetch zstd $ZSTD_VERSION (BT3_DEPLOY_SRC=$DEPLOY_SRC)"
-                exit 2
-            fi
-            tar -xzf "$DEPLOY_SRC/zstd.tar.gz" -C "$DEPLOY_SRC"
-            rm -f "$DEPLOY_SRC/zstd.tar.gz"
-        fi
-        make -C "$ZSTD_DIR" -j"$JOBS" lib-release > /dev/null
-    fi
-    gcc -static -O2 -o "$STUB_BIN" "$STUB_SRC" \
-        -I"$ZSTD_DIR/lib" -L"$ZSTD_DIR/lib" -lzstd -lpthread -lm
-fi
+# ---- rename runner to what the launcher expects ----------------------------------
+# The launcher boots "$appDir/bt3-runner" directly (plain-runner mode); the
+# tarball built by tools/release/package.sh uses the same name.
+cp -v "$RUNNER" "$OUT/bt3-runner" | sed 's/^/  /'
+rm -f "$OUT/ps2EntryRunner"
 
-# ---- stage: runner + shared libs -------------------------------------------------
-echo "== staging payload"
-rm -rf "$STAGE"; mkdir -p "$STAGE/lib"
-
-cp -v "$RUNNER" "$STAGE/ps2EntryRunner" | sed 's/^/  /'
-mapfile -t LIBS < <(ldd "$STAGE/ps2EntryRunner" 2>/dev/null |
+# ---- bundle the runner's shared libraries into OUT/lib ----------------------------
+echo "== bundling shared libs"
+mkdir -p "$OUT/lib"
+mapfile -t LIBS < <(ldd "$RUNNER" 2>/dev/null |
     awk '/=> \//{print $3} /^\//{print $1}' | sort -u)
 count=0
 for lib in "${LIBS[@]}"; do
@@ -102,52 +74,28 @@ for lib in "${LIBS[@]}"; do
     if [[ "$base" == ld-linux* ]]; then
         continue  # the kernel maps the interpreter itself; not needed in lib/
     fi
-    # NEVER bundle the C/C++ runtime core. Forcing the build-host glibc onto an
-    # arbitrary target via stub's LD_LIBRARY_PATH=lib causes GLIBC_PRIVATE symbol
-    # clashes at load (e.g. "undefined symbol: __pointer_chk_guard, version
-    # GLIBC_PRIVATE"). The target system provides these; the runner's minimum
-    # glibc floor still applies (build against an older-baseline chroot/container
-    # to widen it).
+    # NEVER bundle the C/C++ runtime core (glibc/libstdc++): forcing the
+    # build-host glibc onto an arbitrary target causes GLIBC_PRIVATE symbol
+    # clashes at load. The target system provides these; the runner's minimum
+    # glibc floor still applies (build on an older baseline to widen it).
     case "$base" in
         libc.so.*|libm.so.*|libmvec.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libutil.so.*|libresolv.so.*|libnss*.so.*|libanl.so.*|libthread_db.so.*|libBrokenLocale.so.*|libcrypt.so.*|libnsl.so.*|libstdc++.so.*|libgcc_s.so.*)
             continue ;;
     esac
-    if [[ -f "$lib" && ! -f "$STAGE/lib/$base" ]]; then
-        cp "$lib" "$STAGE/lib/$base"
+    if [[ -f "$lib" && ! -f "$OUT/lib/$base" ]]; then
+        cp "$lib" "$OUT/lib/$base"
         count=$((count + 1))
     fi
 done
 echo "  collected $count shared libs"
-
-# ---- payload + footer ------------------------------------------------------------
-echo "== compressing payload (zstd -19)"
-tar --format=ustar -C "$STAGE" -cf - ps2EntryRunner lib | zstd -19 -T0 -q -o "$STAGE/payload.tar.zst"
-HASH="$(sha256sum "$STAGE/payload.tar.zst" | cut -d' ' -f1)"
-SEED="${HASH:0:16}"
-
-python3 - "$STUB_BIN" "$STAGE/payload.tar.zst" "$STAGE/BT3-Recomp-Dragonball" "$SEED" <<'EOF'
-import struct, sys
-stub, payload = open(sys.argv[1], "rb").read(), open(sys.argv[2], "rb").read()
-seed = int(sys.argv[4], 16)
-footer = b"BT3SELFX" + struct.pack("<QQQ", len(stub), len(payload), seed)
-open(sys.argv[3], "wb").write(stub + payload + footer)
-print(f"  payload={len(payload)} stub={len(stub)} ELF={len(stub)+len(payload)+len(footer)} seed={sys.argv[4]}")
-EOF
-
-# ---- deploy ----------------------------------------------------------------------
-DEST_ELF="$OUT/$GAME"
-cp -v "$STAGE/BT3-Recomp-Dragonball" "$DEST_ELF" | sed 's/^/  /'
-chmod +x "$DEST_ELF"
-# the runner deployed by setup.py is superseded by the self-extracting ELF
-rm -f "$OUT/ps2EntryRunner"
 
 # ---- Qt launcher (bt3-launcher) ---------------------------------------------------
 echo "== building Qt launcher"
 LAUNCH_DIR="$ROOT/ps2xRuntime/src/launcher"
 LAUNCH_BUILD="$LAUNCH_DIR/build"
 if [[ -f /usr/lib/cmake/Qt6/Qt6Config.cmake ]]; then
-    cmake -S "$LAUNCH_DIR" -B "$LAUNCH_BUILD" -DCMAKE_BUILD_TYPE=Release > "$STAGE/launcher_cmake.log" 2>&1
-    cmake --build "$LAUNCH_BUILD" -j"$JOBS" >> "$STAGE/launcher_cmake.log" 2>&1
+    cmake -S "$LAUNCH_DIR" -B "$LAUNCH_BUILD" -DCMAKE_BUILD_TYPE=Release > "$OUT/launcher_cmake.log" 2>&1
+    cmake --build "$LAUNCH_BUILD" -j"$JOBS" >> "$OUT/launcher_cmake.log" 2>&1
     cp -v "$LAUNCH_BUILD/Launcher" "$OUT/Launcher" | sed 's/^/  /'
     chmod +x "$OUT/Launcher"
     cp -rv "$LAUNCH_BUILD/assets" "$OUT/" 2>/dev/null | sed 's/^/  /'
@@ -163,11 +111,12 @@ if [[ ! -d "$OUT/savedata/BASLUS-21678DBZT3" ]]; then
     mkdir -p "$OUT/savedata/BASLUS-21678DBZT3"
 fi
 
+# ---- portable installer script ---------------------------------------------------
+cp "$ROOT/tools/release/install-game.sh.in" "$OUT/install game.sh"
+chmod +x "$OUT/install game.sh"
+
 echo
 echo "Deploy ready:"
-echo "  $DEST_ELF"
+echo "  $OUT/Launcher"
 echo "  $OUT/data   $OUT/savedata   $OUT/assets   $OUT/logs"
-echo "Run:  cd \"$OUT\" && \"./$GAME\""
-if [[ -x "$OUT/Launcher" ]]; then
-    echo "Launcher:  \"$OUT/Launcher\""
-fi
+echo "Portable:  \"$OUT/Launcher\"  (or ./install game.sh to install on the host)"

@@ -30,3 +30,30 @@
 - PZS3US0.AFS (14336B) recuperado del ISO: 1 entrada `boot_texture_PS2_.d` (12888B).
 - Los AFL nuevos quedan embebidos en `src/launcher/assets/` para que el usuario final
   los tenga (no accede a internet/repo).
+---
+
+# Port launcher → Windows/macOS (input multiplataforma) — 2026-09-09
+
+## Tarea
+Reemplazar el backend de input Linux del launcher (evdev, linux/input.h) por uno
+multiplataforma, y portabilizar los puntos POSIX del launcher. GitHub Actions
+quedó abandonado por decisión del usuario; la validación Windows es dual-boot.
+
+## Elementos verificables
+- [x] `input_reader.{h,cpp}` GLFW 3.4 (FetchContent) joystick + QKeyEvent teclado; API `evin::` estable.
+- [x] Borrar `evdev_reader.{h,cpp}`; tabs usan `input_reader.h`; sin `linux/input.h`.
+- [x] `tab_bindings`: `evKeyToRaylib` → `qtKeyToRaylib` + eventFilter Qt (captura teclado).
+- [x] Launcher CMake: GLFW FetchContent 3.4, `if(NOT MSVC)` en `-Wall -Wextra`, POST_BUILD copia `background.png`/`icon.png`.
+- [x] `_WIN32`: `bt3-runner.exe`, LD_LIBRARY_PATH solo POSIX, `MoveFileEx` para rename atómico en `pad_config_reader.cpp`, setPermissions no-op en Windows (`extract_worker.cpp`).
+- [x] Build launcher local (Arch): CONFIG/BUILD OK, smoke offscreen rc=124 (sin crash).
+- [x] Fix GLFW Wayland en el contenedor: `GLFW_BUILD_WAYLAND OFF` (falta wayland-scanner en ubuntu:22.04).
+- [x] Fix `entrypoint.sh` SIGPIPE (`find | head -40` + pipefail) — el clone local aún no tenía el fix de PR #6.
+- [x] `entrypoint.sh` + `package.sh` ahora incluyen `data/` en stage/tarball (faltaba; el tarball salía sin el juego).
+- [x] Flujo docker de 0: runner+launcher compilan (glibc floor 2.35), tarball 1.9G con `data/` + `install game.sh` + `.sha256`.
+- [x] descomprimir → `install game.sh` (HOME temporal) → .desktop válido → Launcher corre → savedata preservado en re-install.
+- [x] Docs: `docs/DEPLOY.md` y `README.md` reescritos (sin SELFX/stub; portable tripla).
+
+## Notas
+- Tarball release nuevo en `~/Escritorio/` (BT3-Recomp-x86_64.tar.gz 1.9G + .sha256), regenerado del flujo docker.
+- Portal del Escritorio ahora con launcher contenedor (glibc 2.35) reemplazado.
+- Queda como tarea futura: build Windows real via dual-boot del usuario, y PR con todo esto.

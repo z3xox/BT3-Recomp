@@ -327,8 +327,11 @@ void PS2SettingsOverlay::initialize()
     // the path must be resolved and the callback installed BEFORE rlImGuiSetup runs.
     if (!s_configDir.empty())
     {
-        const std::filesystem::path fontPath =
-            std::filesystem::path(s_configDir).parent_path() / "assets" / "fonts" / "RussoOne-Regular.ttf";
+        const char *assetDir = std::getenv("PS2X_ASSETDIR");
+        const std::filesystem::path assets = assetDir && *assetDir
+            ? std::filesystem::path(assetDir)
+            : std::filesystem::path(s_configDir).parent_path() / "assets";
+        const std::filesystem::path fontPath = assets / "fonts" / "RussoOne-Regular.ttf";
         std::error_code ec;
         if (std::filesystem::is_regular_file(fontPath, ec) && !ec)
             s_hudFontPath = fontPath.string();

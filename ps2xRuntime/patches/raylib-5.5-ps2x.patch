@@ -25,7 +25,7 @@ index e3749c5..5ba03dc 100644
  
  #define RL_MAX_MATRIX_STACK_SIZE              32      // Maximum size of internal Matrix stack
 diff --git a/src/rlgl.h b/src/rlgl.h
-index 756656e..8a8ffa8 100644
+index 756656e..99e5ccc 100644
 --- a/src/rlgl.h
 +++ b/src/rlgl.h
 @@ -213,7 +213,7 @@
@@ -58,7 +58,7 @@ index 756656e..8a8ffa8 100644
      TRACELOG(RL_LOG_INFO, "RLGL: Render batch vertex buffers loaded successfully in VRAM (GPU)");
  
      // Unbind the current VAO
-@@ -2901,14 +2908,213 @@ void rlUnloadRenderBatch(rlRenderBatch batch)
+@@ -2901,36 +2908,279 @@ void rlUnloadRenderBatch(rlRenderBatch batch)
  
  // Draw render batch
  // NOTE: We require a pointer to reset batch and increase current buffer (multi-buffer)
@@ -80,7 +80,7 @@ index 756656e..8a8ffa8 100644
 +#endif
 +#define RL_VBRING_SEGS  4
 +typedef struct rlVbRing {
-+    int on, tried;
++    int on, tried, persistent;
 +    unsigned int vao, vbo[4], ibo;
 +    unsigned char *map[4];
 +    int ringVerts, segVerts, cursor, curSeg, lastFencedSeg;
@@ -101,7 +101,11 @@ index 756656e..8a8ffa8 100644
 +    g_vbr.tried = 1;
 +    const char *env = getenv("PS2X_VBRING");
 +    if (env && env[0] == '0') { TRACELOG(RL_LOG_INFO, "RLGL: [vbring] disabled by PS2X_VBRING=0"); return; }
-+    if (!RLGL.ExtSupported.vao || !glBufferStorage || !glMapBufferRange || !glFenceSync || !glClientWaitSync || !glDeleteSync)
++    if (!RLGL.ExtSupported.vao || !glMapBufferRange || !glFenceSync || !glClientWaitSync || !glDeleteSync
++#if !defined(__APPLE__)
++        || !glBufferStorage
++#endif
++       )
 +    {
 +        TRACELOG(RL_LOG_INFO, "RLGL: [vbring] not available (vao=%d bufferStorage=%d) - SubData path", RLGL.ExtSupported.vao, glBufferStorage != NULL);
 +        return;
@@ -115,6 +119,7 @@ index 756656e..8a8ffa8 100644
 +    g_vbr.segVerts = ringVerts;
 +    g_vbr.ringVerts = ringVerts*RL_VBRING_SEGS;
 +
++    g_vbr.persistent = (glBufferStorage != NULL);
 +    const unsigned int flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
 +    const size_t bytes[4] = { (size_t)g_vbr.ringVerts*3*sizeof(float), (size_t)g_vbr.ringVerts*2*sizeof(float),
 +                              (size_t)g_vbr.ringVerts*3*sizeof(float), (size_t)g_vbr.ringVerts*4 };
@@ -128,9 +133,17 @@ index 756656e..8a8ffa8 100644
 +    {
 +        glGenBuffers(1, &g_vbr.vbo[k]);
 +        glBindBuffer(GL_ARRAY_BUFFER, g_vbr.vbo[k]);
-+        glBufferStorage(GL_ARRAY_BUFFER, (GLsizeiptr)bytes[k], NULL, flags);
-+        g_vbr.map[k] = (unsigned char *)glMapBufferRange(GL_ARRAY_BUFFER, 0, (GLsizeiptr)bytes[k], flags);
-+        if (!g_vbr.map[k] || glGetError() != GL_NO_ERROR) { ok = 0; break; }
++        if (g_vbr.persistent)
++        {
++            glBufferStorage(GL_ARRAY_BUFFER, (GLsizeiptr)bytes[k], NULL, flags);
++            g_vbr.map[k] = (unsigned char *)glMapBufferRange(GL_ARRAY_BUFFER, 0, (GLsizeiptr)bytes[k], flags);
++            if (!g_vbr.map[k] || glGetError() != GL_NO_ERROR) { ok = 0; break; }
++        }
++        else
++        {
++            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)bytes[k], NULL, GL_STREAM_DRAW);
++            if (glGetError() != GL_NO_ERROR) { ok = 0; break; }
++        }
 +        glEnableVertexAttribArray(locs[k]);
 +        if (k == 3) glVertexAttribPointer(locs[k], 4, GL_UNSIGNED_BYTE, GL_TRUE, 0, 0);
 +        else glVertexAttribPointer(locs[k], (k == 1)? 2 : 3, GL_FLOAT, 0, 0, 0);
@@ -161,8 +174,9 @@ index 756656e..8a8ffa8 100644
 +    }
 +    g_vbr.cursor = 0; g_vbr.curSeg = 0; g_vbr.lastFencedSeg = -1;
 +    g_vbr.on = 1; g_rlglVbRingOn = 1;
-+    TRACELOG(RL_LOG_INFO, "RLGL: [vbring] persistent vertex ring on: %d vertices (%d segments of %d), %.1f MB mapped",
-+             g_vbr.ringVerts, RL_VBRING_SEGS, g_vbr.segVerts, (bytes[0] + bytes[1] + bytes[2] + bytes[3])/1048576.0);
++    TRACELOG(RL_LOG_INFO, "RLGL: [vbring] %s vertex ring on: %d vertices (%d segments of %d), %.1f MB",
++             g_vbr.persistent ? "persistent" : "mapped", g_vbr.ringVerts, RL_VBRING_SEGS, g_vbr.segVerts,
++             (bytes[0] + bytes[1] + bytes[2] + bytes[3])/1048576.0);
 +}
 +
 +/* fence every segment written since the last fence, then wait for the fence of each segment we are about to reuse */
@@ -201,10 +215,24 @@ index 756656e..8a8ffa8 100644
 +    const int base = g_vbr.cursor;
 +    rlVbRingFenceAndWait(base/g_vbr.segVerts, (base + nAligned - 1)/g_vbr.segVerts);
 +    const rlVertexBuffer *vb = &batch->vertexBuffer[batch->currentBuffer];
-+    memcpy(g_vbr.map[0] + (size_t)base*3*sizeof(float), vb->vertices, (size_t)n*3*sizeof(float));
-+    memcpy(g_vbr.map[1] + (size_t)base*2*sizeof(float), vb->texcoords, (size_t)n*2*sizeof(float));
-+    memcpy(g_vbr.map[2] + (size_t)base*3*sizeof(float), vb->normals, (size_t)n*3*sizeof(float));
-+    memcpy(g_vbr.map[3] + (size_t)base*4, vb->colors, (size_t)n*4);
++    const size_t offsets[4] = { (size_t)base*3*sizeof(float), (size_t)base*2*sizeof(float),
++                                (size_t)base*3*sizeof(float), (size_t)base*4 };
++    const size_t lengths[4] = { (size_t)n*3*sizeof(float), (size_t)n*2*sizeof(float),
++                                (size_t)n*3*sizeof(float), (size_t)n*4 };
++    const void *sources[4] = { vb->vertices, vb->texcoords, vb->normals, vb->colors };
++    for (int k = 0; k < 4; k++)
++    {
++        if (g_vbr.persistent) memcpy(g_vbr.map[k] + offsets[k], sources[k], lengths[k]);
++        else
++        {
++            glBindBuffer(GL_ARRAY_BUFFER, g_vbr.vbo[k]);
++            void *dst = glMapBufferRange(GL_ARRAY_BUFFER, (GLintptr)offsets[k], (GLsizeiptr)lengths[k],
++                                         GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
++            if (!dst) return -1;
++            memcpy(dst, sources[k], lengths[k]);
++            glUnmapBuffer(GL_ARRAY_BUFFER);
++        }
++    }
 +    g_rlglVbRingBytes += (unsigned long long)n*36;
 +    g_vbr.cursor = base + nAligned;
 +    return base;
@@ -273,7 +301,45 @@ index 756656e..8a8ffa8 100644
      {
          // Activate elements VAO
          if (RLGL.ExtSupported.vao) glBindVertexArray(batch->vertexBuffer[batch->currentBuffer].vaoId);
-@@ -2982,6 +3188,10 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
+ 
+         // Vertex positions buffer
+         glBindBuffer(GL_ARRAY_BUFFER, batch->vertexBuffer[batch->currentBuffer].vboId[0]);
++#if defined(__APPLE__)
++        glBufferData(GL_ARRAY_BUFFER, RLGL.State.vertexCounter*3*sizeof(float), batch->vertexBuffer[batch->currentBuffer].vertices, GL_STREAM_DRAW);
++#else
+         glBufferSubData(GL_ARRAY_BUFFER, 0, RLGL.State.vertexCounter*3*sizeof(float), batch->vertexBuffer[batch->currentBuffer].vertices);
++#endif
+         //glBufferData(GL_ARRAY_BUFFER, sizeof(float)*3*4*batch->vertexBuffer[batch->currentBuffer].elementCount, batch->vertexBuffer[batch->currentBuffer].vertices, GL_DYNAMIC_DRAW);  // Update all buffer
+ 
+         // Texture coordinates buffer
+         glBindBuffer(GL_ARRAY_BUFFER, batch->vertexBuffer[batch->currentBuffer].vboId[1]);
++#if defined(__APPLE__)
++        glBufferData(GL_ARRAY_BUFFER, RLGL.State.vertexCounter*2*sizeof(float), batch->vertexBuffer[batch->currentBuffer].texcoords, GL_STREAM_DRAW);
++#else
+         glBufferSubData(GL_ARRAY_BUFFER, 0, RLGL.State.vertexCounter*2*sizeof(float), batch->vertexBuffer[batch->currentBuffer].texcoords);
++#endif
+         //glBufferData(GL_ARRAY_BUFFER, sizeof(float)*2*4*batch->vertexBuffer[batch->currentBuffer].elementCount, batch->vertexBuffer[batch->currentBuffer].texcoords, GL_DYNAMIC_DRAW); // Update all buffer
+ 
+         // Normals buffer
+         glBindBuffer(GL_ARRAY_BUFFER, batch->vertexBuffer[batch->currentBuffer].vboId[2]);
++#if defined(__APPLE__)
++        glBufferData(GL_ARRAY_BUFFER, RLGL.State.vertexCounter*3*sizeof(float), batch->vertexBuffer[batch->currentBuffer].normals, GL_STREAM_DRAW);
++#else
+         glBufferSubData(GL_ARRAY_BUFFER, 0, RLGL.State.vertexCounter*3*sizeof(float), batch->vertexBuffer[batch->currentBuffer].normals);
++#endif
+         //glBufferData(GL_ARRAY_BUFFER, sizeof(float)*3*4*batch->vertexBuffer[batch->currentBuffer].elementCount, batch->vertexBuffer[batch->currentBuffer].normals, GL_DYNAMIC_DRAW); // Update all buffer
+ 
+         // Colors buffer
+         glBindBuffer(GL_ARRAY_BUFFER, batch->vertexBuffer[batch->currentBuffer].vboId[3]);
++#if defined(__APPLE__)
++        glBufferData(GL_ARRAY_BUFFER, RLGL.State.vertexCounter*4*sizeof(unsigned char), batch->vertexBuffer[batch->currentBuffer].colors, GL_STREAM_DRAW);
++#else
+         glBufferSubData(GL_ARRAY_BUFFER, 0, RLGL.State.vertexCounter*4*sizeof(unsigned char), batch->vertexBuffer[batch->currentBuffer].colors);
++#endif
+         //glBufferData(GL_ARRAY_BUFFER, sizeof(float)*4*4*batch->vertexBuffer[batch->currentBuffer].elementCount, batch->vertexBuffer[batch->currentBuffer].colors, GL_DYNAMIC_DRAW);    // Update all buffer
+ 
+         // NOTE: glMapBuffer() causes sync issue
+@@ -2982,6 +3232,10 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
  
              // Create modelview-projection matrix and upload to shader
              Matrix matMVP = rlMatrixMultiply(RLGL.State.modelview, RLGL.State.projection);
@@ -284,7 +350,7 @@ index 756656e..8a8ffa8 100644
              glUniformMatrix4fv(RLGL.State.currentShaderLocs[RL_SHADER_LOC_MATRIX_MVP], 1, false, rlMatrixToFloat(matMVP));
  
              if (RLGL.State.currentShaderLocs[RL_SHADER_LOC_MATRIX_PROJECTION] != -1)
-@@ -3007,7 +3217,8 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
+@@ -3007,7 +3261,8 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
                  glUniformMatrix4fv(RLGL.State.currentShaderLocs[RL_SHADER_LOC_MATRIX_NORMAL], 1, false, rlMatrixToFloat(rlMatrixTranspose(rlMatrixInvert(RLGL.State.transform))));
              }
  
@@ -294,7 +360,7 @@ index 756656e..8a8ffa8 100644
              else
              {
                  // Bind vertex attrib: position (shader-location = 0)
-@@ -3034,8 +3245,13 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
+@@ -3034,8 +3289,13 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
              }
  
              // Setup some default shader values
@@ -308,7 +374,7 @@ index 756656e..8a8ffa8 100644
  
              // Activate additional sampler textures
              // Those additional textures will be common for all draw calls of the batch
-@@ -3052,11 +3268,12 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
+@@ -3052,11 +3312,12 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
              // NOTE: Batch system accumulates calls by texture0 changes, additional textures are enabled for all the draw calls
              glActiveTexture(GL_TEXTURE0);
  
@@ -322,7 +388,7 @@ index 756656e..8a8ffa8 100644
                  if ((batch->draws[i].mode == RL_LINES) || (batch->draws[i].mode == RL_TRIANGLES)) glDrawArrays(batch->draws[i].mode, vertexOffset, batch->draws[i].vertexCount);
                  else
                  {
-@@ -3080,12 +3297,20 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
+@@ -3080,12 +3341,20 @@ void rlDrawRenderBatch(rlRenderBatch *batch)
                  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
              }
  
@@ -346,7 +412,7 @@ index 756656e..8a8ffa8 100644
      }
  
      // Restore viewport to default measures
-@@ -4259,6 +4484,9 @@ unsigned int rlLoadShaderProgram(unsigned int vShaderId, unsigned int fShaderId)
+@@ -4259,6 +4528,9 @@ unsigned int rlLoadShaderProgram(unsigned int vShaderId, unsigned int fShaderId)
  
          TRACELOG(RL_LOG_INFO, "SHADER: [ID %i] Program shader loaded successfully", program);
      }
@@ -356,7 +422,7 @@ index 756656e..8a8ffa8 100644
  #endif
      return program;
  }
-@@ -4268,6 +4496,9 @@ void rlUnloadShaderProgram(unsigned int id)
+@@ -4268,6 +4540,9 @@ void rlUnloadShaderProgram(unsigned int id)
  {
  #if defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES2)
      glDeleteProgram(id);

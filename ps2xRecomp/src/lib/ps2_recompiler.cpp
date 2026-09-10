@@ -1308,7 +1308,7 @@ namespace ps2recomp
                         {
                             std::lock_guard<std::mutex> lock(outputMutex);
                             while (nextFunction < outputFunctions.size() &&
-                                   outstandingWork + completedCode.size() < maxBufferedOutput &&
+                                   outstandingWork + readyCode.size() + completedCode.size() < maxBufferedOutput &&
                                    !stopWorkers)
                             {
                                 pendingWork.push(nextFunction++);
@@ -1378,7 +1378,10 @@ namespace ps2recomp
                             }
 
                             std::lock_guard<std::mutex> finalLock(outputMutex);
-                            if (outstandingWork == 0 && nextFunction >= outputFunctions.size() && completedCode.empty())
+                            // A worker can finish after the drain above and before this
+                            // lock. Its result is still in readyCode, not completedCode.
+                            if (outstandingWork == 0 && nextFunction >= outputFunctions.size() &&
+                                readyCode.empty() && completedCode.empty())
                             {
                                 throw std::runtime_error("Internal error: combined output completion queue is missing index " + std::to_string(nextOutputIndex));
                             }

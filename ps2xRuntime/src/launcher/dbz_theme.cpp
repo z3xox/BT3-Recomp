@@ -1,3 +1,4 @@
+#include "app_paths.h"
 #include "dbz_theme.h"
 
 #include <QApplication>
@@ -170,6 +171,50 @@ namespace dbz
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
         QToolTip { background-color: %1; color: %4; border: 1px solid %3; }
+
+        /* File picker (Browse… for the disc dump): the default dark window-bg
+           made it near-illegible. Use a lighter slate + white text. */
+        QFileDialog {
+            background-color: #1d2530;
+            color: #ffffff;
+        }
+        QFileDialog QDialogButtonBox { background: transparent; }
+        QFileDialog QLabel { background: transparent; color: #ffffff; }
+        QFileDialog QListWidget,
+        QFileDialog QTreeView,
+        QFileDialog QListView,
+        QFileDialog QAbstractItemView {
+            background-color: #232c38;
+            alternate-background-color: #1e2733;
+            border: 1px solid %3;
+            color: #ffffff;
+            outline: none;
+        }
+        QFileDialog QListWidget::item,
+        QFileDialog QTreeView::item,
+        QFileDialog QListView::item,
+        QFileDialog QAbstractItemView::item {
+            color: #ffffff;
+            padding: 3px 4px;
+        }
+        QFileDialog QListWidget::item:selected,
+        QFileDialog QTreeView::item:selected,
+        QFileDialog QListView::item:selected,
+        QFileDialog QAbstractItemView::item:selected {
+            background-color: rgba(255,158,26,0.20);
+            color: %7;
+        }
+        QFileDialog QLineEdit {
+            background-color: #1b232e;
+            border: 1px solid %3;
+            color: #ffffff;
+            selection-background-color: rgba(255,158,26,0.30);
+        }
+        QFileDialog QComboBox {
+            background-color: #1b232e;
+            border: 1px solid %3;
+            color: #ffffff;
+        }
         )QSS")
             .arg(QString(kWindowBg), QString(kFrameBg), QString(kBorder), QString(kText),
                  QString(kAccent),  QString(kTextDisabled), QString(kGold),
@@ -178,8 +223,8 @@ namespace dbz
 
     QString loadHudFont()
     {
-        QDir appDir(QApplication::applicationDirPath());
-        const QString fontPath = appDir.filePath("assets/fonts/RussoOne-Regular.ttf");
+        QDir appDir(apppaths::assets());
+        const QString fontPath = appDir.filePath("fonts/RussoOne-Regular.ttf");
         if (QFile::exists(fontPath))
         {
             const int id = QFontDatabase::addApplicationFont(fontPath);

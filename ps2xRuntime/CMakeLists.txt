@@ -5,6 +5,10 @@ project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(NOT DEFINED PS2X_TARGET_PROCESSOR)
+    set(PS2X_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 8 CACHE STRING "Unity build batch size for ps2EntryRunner")
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
@@ -516,9 +520,15 @@ endif()
 # The runtime and the generated runner sources use SSE4.1 intrinsics
 # (_mm_blendv_ps, _mm_extract_epi32, ...). Guarantee the ISA is enabled even
 # when the user configures without -march=native.
-if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+if(NOT MSVC AND PS2X_TARGET_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     target_compile_options(ps2_runtime PRIVATE -msse4.1)
     target_compile_options(ps2EntryRunner PRIVATE -msse4.1)
+endif()
+
+# ARM can fuse multiply/add by default; guest VU math requires two roundings.
+if(APPLE)
+    target_compile_options(ps2_runtime PRIVATE -ffp-contract=off)
+    target_compile_options(ps2EntryRunner PRIVATE -ffp-contract=off -fno-strict-aliasing -fwrapv)
 endif()
 
 # Mirror the Linux build on MSVC: the generated runner sources compile WITHOUT

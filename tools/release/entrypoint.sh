@@ -145,9 +145,22 @@ if [[ -d "$SRC/ps2xRuntime/src/launcher/assets" ]]; then
     mkdir -p "$OUT/stage/assets"
     cp -rv "$SRC/ps2xRuntime/src/launcher/assets/." "$OUT/stage/assets/" | sed 's/^/  /'
 fi
+
+# Game data from the ISO extraction (--gen-only left it in games/bt3/work/).
+# Keyed the same way as setup.py's deploy_tree() so the stage is playable.
+WORK="$SRC/games/bt3/work"
+if [[ -d "$WORK" ]]; then
+    log "copying game data (work/ -> stage/data)"
+    mkdir -p "$OUT/stage/data"
+    for name in BIN DATA IRX SYSTEM.CNF; do
+        [[ -e "$WORK/$name" ]] && cp -rv "$WORK/$name" "$OUT/stage/data/" | sed 's/^/  /'
+    done
+    [[ -f "$WORK/SLUS_216.78" ]] && cp -v "$WORK/SLUS_216.78" "$OUT/stage/data/" | sed 's/^/  /'
+fi
+
 chmod +x "$OUT/stage/bt3-runner" "$OUT/stage/Launcher"
 
 log "stage assembled:"
 du -sh "$OUT/stage"
-find "$OUT/stage" -maxdepth 2 -type f | sed 's/^/  /' | head -40
-echo "  libs: $(find "$OUT/stage/lib" -maxdepth 1 -type f | wc -l)"
+find "$OUT/stage" -maxdepth 2 -type f | sed 's/^/  /' | head -40 || true
+echo "  libs: $(find "$OUT/stage" -path "*/lib/*" -maxdepth 3 -type f | wc -l)"

@@ -6,13 +6,16 @@ The game's MIPS code is translated to C++ **at build time, from your own disc
 image** — this repository contains no game code, assets, or media.
 
 > This is not an emulator: the game's executable and its gameplay overlay are
-> recompiled into a native Linux binary with an OpenGL renderer.
+> recompiled into a native, portable game tree with an OpenGL renderer. Ships
+> with a Qt 6 launcher (GLFW gamepad support) for Linux, Windows and macOS.
 
 ## Requirements
 
 - **Your own legally obtained BT3 USA ISO** (SLUS-21678). Other regions are not
   supported — the committed function maps are for the USA executable.
-- Linux or Windows (experimental), x86-64 CPU with SSE4.1.
+- Linux, Windows or macOS (Windows/macOS experimental), x86-64 CPU with SSE4.1.
+  On macOS the build is native arm64 (Apple Silicon) or x86-64, one at a time;
+  see [the port notes](docs/MACOS-PORT.md).
 - ~16 GB RAM and ~10 GB free disk for the build.
 - Packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`,
   `bsdtar` (libarchive) or `7z`, pkg-config, the FFmpeg development libraries,
@@ -31,7 +34,7 @@ image** — this repository contains no game code, assets, or media.
 
 ## Build + deploy — one command
 
-**Linux** (build + assemble the self-extracting launcher):
+**Linux** (build + assemble the portable game tree):
 
 ```sh
 git clone https://github.com/z3xox/BT3-Recomp.git
@@ -40,10 +43,12 @@ cd BT3-Recomp
 ```
 
 The script asks for the ISO and output directory if they are not given, runs the
-full `setup.py` pipeline, then assembles a single self-extracting ELF (runner +
-shared libraries + game data, unpacked to `~/.cache` on first run) into the
-output directory. Pass `--skip-setup` to reuse an existing `games/bt3/work/`
-tree and only rebuild the runner. See `docs/DEPLOY.md` for the full picture.
+full `setup.py` pipeline, bundles the runner + its shared libraries into the
+deploy tree, builds a Qt 6 launcher (GLFW gamepad support), and drops
+`install game.sh` for the desktop-integration step. Pass `--skip-setup` to
+reuse an existing `games/bt3/work/` tree and only rebuild the runner.
+`tools/release/package.sh` then wraps everything into the single release
+artifact. See `docs/DEPLOY.md` for the full picture.
 
 **Windows (experimental):** install [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
 (the "Desktop development with C++" workload, which includes CMake, plus its optional
@@ -58,7 +63,8 @@ python games\bt3\setup.py C:\path\to\bt3-usa.iso --deploy C:\path\where\deploy
 ```
 
 12 GB+ RAM recommended on Windows; the Windows build is young — expect rough
-edges and please report issues.
+edges and please report issues. The output is the same portable tree
+(`Launcher.exe`, `bt3-runner.exe`, `data/`, …), zipped for distribution.
 
 The pipeline extracts and sha256-verifies the game files from your ISO, builds the
 recompiler, generates ~7,800 C++ sources from the game's executable and overlay,
@@ -66,28 +72,50 @@ applies the committed patches, and builds the final binary. The compile is quick
 on a modern machine (a few minutes at `-j16`); the conservative default is `-j3` —
 pass your core count with `--jobs N` if you have 8 GB+ of free RAM.
 
+**macOS (experimental):** install the Xcode Command Line Tools and Homebrew dependencies:
+
+```sh
+brew install cmake ninja pkg-config ffmpeg qt
+./build_and_deploy_macos.sh --iso /path/to/bt3-usa.iso --jobs 3
+open build/macos-dist/BT3-Recomp.app
+```
+
+The app's installation wizard reads your USA ISO. Game files, settings and saves
+live in `~/Library/Application Support/BT3-Recomp/`, outside the signed bundle.
+The script defaults to the build Mac's OS version as its minimum and checks the
+bundled libraries against it. Homebrew bottles can require a recent macOS release.
+The signature is local/ad-hoc; Developer ID signing and notarization are not included.
+For development without a bundle, use `python3 games/bt3/setup.py /path/to/bt3-usa.iso --jobs 3`.
+See [deployment details](docs/DEPLOY.md#macos-app-experimental) for rebuilds and limitations.
+
 ## Run
 
 The setup script prints the exact command when it finishes.
 
-**Linux:**
+**Linux portable (release):** unpack the archive and launch from the folder:
 
 ```sh
-cd build/ps2xRuntime
-env PS2X_CD_IMAGE="/path/to/your/bt3-usa.iso" \
-    ./ps2EntryRunner ../../games/bt3/work/SLUS_216.78
+cd "Dragon Ball Budokai Tenkaichi 3 Recompiled"
+./Launcher
 ```
 
-**Windows** (`cmd.exe`):
+or run `install game.sh` for a desktop menu entry + icon. The launcher boots
+`bt3-runner` with the extracted `data/SLUS_216.78` and the bundled `lib/`
+automatically.
+
+**Windows** (`cmd.exe`, release): open the extracted folder and run
+`Launcher.exe`; it starts `bt3-runner.exe` with the game data.
+
+For raw runner runs (no launcher):
 
 ```
 cd build\ps2xRuntime\Release
 set PS2X_CD_IMAGE=C:\path\to\your\bt3-usa.iso
-ps2EntryRunner.exe ..\..\..\games\bt3\work\SLUS_216.78
+bt3-runner.exe ..\..\..\games\bt3\work\SLUS_216.78
 ```
 
-Gamepads are supported (GLFW mappings; tested with an 8BitDo pad — close Steam
-the software rasterizer instead of the OpenGL renderer.
+Gamepads are supported (GLFW mappings; tested with an 8BitDo pad — the launcher
+and the runner read the same mapping database).
 
 ## Status
 
@@ -104,9 +132,10 @@ Known issues:
 
 | Path | What it is |
 | --- | --- |
-| `build_and_deploy.sh` | Linux one-command build + deploy (ISO prompt, self-extracting ELF) |
+| `build_and_deploy.sh` | Linux one-command build + deploy (ISO prompt, portable game tree) |
+| `tools/release/package.sh` | wraps the deploy tree into the release tarball (`BT3-Recomp-x86_64.tar.gz` + `.sha256`) |
 | `games/bt3/setup.py` | cross-platform build pipeline (`--deploy`, `--skip-setup`, `--jobs`) |
-| `docs/DEPLOY.md` | the deploy structure and self-extracting launcher documentation |
+| `docs/DEPLOY.md` | the deploy structure and cross-platform packaging documentation |
 | `games/bt3/functions.csv`, `dbzp_*.csv` | function address maps (symbols only) |
 | `games/bt3/vu1_programs.json` | ELF offsets + hashes of the VU1 microprograms (the translation is generated from your ELF at setup) |
 | `games/bt3/gen_overlay.py`, `apply_patches.py` | generators for the game-specific pieces |

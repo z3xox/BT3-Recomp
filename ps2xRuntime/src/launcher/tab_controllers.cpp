@@ -1,6 +1,6 @@
 #include "tab_controllers.h"
 
-#include "evdev_reader.h"
+#include "input_reader.h"
 #include "settings_manager.h"
 
 #include <QCheckBox>
@@ -329,9 +329,9 @@ void ControllersTab::onDeviceChanged()
 
 void ControllersTab::openDevice()
 {
-    // Resolve the semantic combo to a physical /dev/input node for the live
-    // test, like BindingsTab::openCaptureDevice(): Auto -> first gamepad,
-    // Keyboard -> first keyboard, Gamepad N -> the N-th gamepad.
+    // Resolve the semantic combo to a joystick node for the live test, like
+    // BindingsTab::openCaptureDevice(): Auto -> first gamepad, Keyboard -> the
+    // Qt pseudo-keyboard, Gamepad N -> the N-th gamepad.
     constexpr int kDevKeyboard = 1;
     constexpr int kDevGamepadBase = 2;
     const int idx = m_device->currentIndex();
@@ -397,8 +397,8 @@ void ControllersTab::pollGamepad()
             ? QStringLiteral("QLabel { background-color: rgba(255,158,26,0.85); border: 1px solid #ff9e1a; border-radius: 2px; color: #1a1208; font-weight: bold; }")
             : QStringLiteral("QLabel { background-color: #212128; border: 1px solid #3a3a4a; border-radius: 2px; color: #8c8c9e; }"));
     }
-    // evdev Y is -1 up, +1 down; QPainter's y axis grows downward, so the raw
-    // axis maps straight onto the widget without extra negation.
+    // Joystick Y is -1 up, +1 down; QPainter's y axis grows downward, so the
+    // raw axis maps straight onto the widget without extra negation.
     m_stickL->setDot(m_reader.axis(evin::AxisLX), m_reader.axis(evin::AxisLY));
     m_stickR->setDot(m_reader.axis(evin::AxisRX), m_reader.axis(evin::AxisRY));
     m_lt->setValue(m_reader.axis(evin::AxisLT));

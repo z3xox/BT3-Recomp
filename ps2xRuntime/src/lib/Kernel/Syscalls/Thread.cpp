@@ -1,5 +1,5 @@
 #include "ps2_waitprof.h"   // [waitprof]
-#include <xmmintrin.h>
+#include "ps2_runtime_macros.h"
 #include "Common.h"
 #include "Thread.h"
 

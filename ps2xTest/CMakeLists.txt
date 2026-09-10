@@ -8,13 +8,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Static library with test logic (no main), used by ps2xStudio
 add_library(ps2_test_function_table OBJECT
     src/test_function_table.cpp
+    src/test_thread_state.cpp
 )
 
 target_include_directories(ps2_test_function_table PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib/Kernel
 )
 
 add_library(ps2_test_lib STATIC
+    src/simd_portability_tests.cpp
     src/code_generator_tests.cpp
     src/r5900_decoder_tests.cpp
     src/elf_analyzer_tests.cpp
@@ -42,6 +45,10 @@ target_link_libraries(ps2_test_lib PRIVATE
     ps2_analyzer_lib
     ps2_runtime
 )
+
+if(NOT MSVC AND PS2X_TARGET_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    target_compile_options(ps2_test_lib PRIVATE -msse4.1)
+endif()
 
 add_executable(ps2x_tests
     src/main.cpp

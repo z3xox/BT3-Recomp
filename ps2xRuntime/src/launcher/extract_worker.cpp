@@ -64,12 +64,15 @@ void ExtractWorker::doWork(const QString &isoPath, const QString &dataDir)
 
     // BIN/DBZP.BIN is opened read-write by the game; ISO extraction yields
     // read-only files, so lift the write bits (mirrors setup.py make_writable).
+    // On Windows the writable attribute is default and the POSIX mask is moot.
     const QString dbzp = QDir(dataDir).filePath(QStringLiteral("BIN/DBZP.BIN"));
     if (QFile::exists(dbzp))
     {
+#ifndef _WIN32
         QFile::setPermissions(dbzp, QFileDevice::ReadOwner | QFileDevice::WriteOwner
                                          | QFileDevice::ReadGroup | QFileDevice::WriteGroup
                                          | QFileDevice::ReadOther | QFileDevice::WriteOther);
+#endif
     }
 
     emit done(true, QString());

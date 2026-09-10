@@ -60,6 +60,7 @@ bool SettingsManager::load()
         return false;
 
     sections.clear();
+    m_sawRenderer = false;
     QString curSection;
     QString openSection; // key of "first value encountered" per section (for order)
     QStringList order;
@@ -115,7 +116,8 @@ bool SettingsManager::load()
         else if (curSection == "video")
         {
             const bool b = (val == "1" || val == "true");
-            if (key == "gpu_renderer") m_gpu = b;
+            if (key == "renderer") { setRenderer(stoi(val, m_renderer)); m_sawRenderer = true; }
+            else if (key == "gpu_renderer" && !m_sawRenderer) setGpuRenderer(b);
             else if (key == "glow") m_glow = b;
             else if (key == "glowfix") m_glowFix = b;
             else if (key == "postfx") m_postfx = b;
@@ -183,7 +185,8 @@ bool SettingsManager::save()
     upsert(QStringLiteral("audio"), QStringLiteral("sfx_volume"),
            QString::number(m_sfx));
 
-    upsert("video", "gpu_renderer", m_gpu ? "1" : "0");
+    upsert("video", "renderer", QString::number(m_renderer));
+    upsert("video", "gpu_renderer", gpuRenderer() ? "1" : "0");
     upsert("video", "glow", m_glow ? "1" : "0");
     upsert("video", "glowfix", m_glowFix ? "1" : "0");
     upsert("video", "ink_strength", QString::number(m_inkStrength));

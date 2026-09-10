@@ -1,5 +1,12 @@
 #include "pad_config_reader.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#undef ERROR
+#undef interface
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -289,6 +296,15 @@ namespace padconf
             }
             if (std::rename(tmp.c_str(), path.c_str()) != 0)
                 ok = false;
+#ifdef _WIN32
+            // Windows std::rename refuses to replace an existing file. Retry
+            // with the Win32 atomic-replace API (same semantics as POSIX).
+            if (!ok && ::MoveFileExA(tmp.c_str(), path.c_str(),
+                                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+            {
+                ok = true;
+            }
+#endif
         }
         return ok;
     }

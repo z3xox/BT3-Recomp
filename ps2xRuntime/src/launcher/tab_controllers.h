@@ -1,6 +1,6 @@
 #pragma once
 
-#include "evdev_reader.h"
+#include "input_reader.h"
 #include "pad_config_reader.h"
 
 #include <QLabel>
@@ -39,8 +39,8 @@ private:
 };
 
 // Gamepad live test widget: button grid + sticks + triggers, polling the
-// selected evdev /dev/input node on a 16ms timer. Reuses the same numbering
-// convention as the in-game overlay's test area.
+// selected joystick on a 16ms timer. Reuses the same numbering convention as
+// the in-game overlay's test area.
 class ControllersTab : public QWidget
 {
     Q_OBJECT
@@ -66,15 +66,15 @@ private:
     Gauge *m_lt = nullptr, *m_rt = nullptr;
     QLabel *m_axisReadout = nullptr;
 
-    // Persisted evdev reader (opened once per device selection). Polling an
-    // already-open fd is cheap; recreating Reader + listDevices() every 16 ms
-    // is what turned the Controllers tab (and the whole dialog) sluggish.
+    // Persisted input reader (opened once per device selection). Polling an
+    // already-open reader is cheap; recreating Reader + listDevices() every
+    // 16 ms is what turned the Controllers tab (and the whole dialog) sluggish.
     evin::Reader m_reader;
     std::string m_openedNode;
     bool m_devWasOpen = false;
 
-    // Physical devices (filtered to gamepads / keyboards / mice), used only to
-    // resolve a semantic combo choice to a /dev/input node for the live test.
+    // Physical devices (filtered to gamepads), used only to resolve a semantic
+    // combo choice to a joystick node for the live test.
     std::vector<evin::DeviceInfo> m_filteredDevices;
 
     // Shared per-player state from BindingsTab; device combo loads/saves the

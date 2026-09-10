@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Install Dragon Ball Budokai Tenkaichi 3 (Recompiled) into this user's home:
+# copies the portable tree to ~/.local/share/bt3-recomp and registers a
+# launcher entry (with the game icon) in the application menu.
+set -euo pipefail
+
+SRC="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
+DEST="$BASE/bt3-recomp"
+
+echo "== installing to $DEST"
+mkdir -p "$DEST"
+
+cp -a "$SRC"/Launcher "$SRC"/bt3-runner "$SRC"/lib "$SRC"/assets "$DEST"/
+
+# already-extracted game data (when present in the portable)
+for extra in data textures; do
+    if [[ -d "$SRC/$extra" ]]; then
+        cp -a "$SRC/$extra" "$DEST/"
+    fi
+done
+
+# savedata: keep an existing install's saves/settings
+if [[ -d "$SRC/savedata" ]]; then
+    if [[ ! -d "$DEST/savedata" ]]; then
+        cp -a "$SRC/savedata" "$DEST/"
+    else
+        echo "  keeping existing $DEST/savedata"
+    fi
+fi
+
+# launcher wrapper
+WRAP="$BASE/bt3-launcher.sh"
+cat > "$WRAP" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$DEST"
+export LD_LIBRARY_PATH="\$PWD/lib"
+export QT_PLUGIN_PATH="\$PWD/lib/qt6/plugins"
+export PS2X_EXEDIR="\$PWD"
+exec ./Launcher "\$@"
+EOF
+chmod +x "$WRAP"
+
+# icon + desktop entry
+mkdir -p "$BASE/icons" "$BASE/applications"
+cp -f "$DEST/assets/icon.png" "$BASE/icons/bt3.png"
+cat > "$BASE/applications/Dragon-Ball-Budokai-Tenkaichi-3.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Dragon Ball Budokai Tenkaichi 3
+Comment=Play Dragon Ball Budokai Tenkaichi 3 (recompiled)
+Exec=$WRAP
+Icon=$BASE/icons/bt3.png
+Terminal=false
+Categories=Game;
+EOF
+
+echo
+echo "Installed:"
+echo "  game:      $DEST"
+echo "  launcher:  $WRAP"
+echo "  menu:      $BASE/applications/Dragon-Ball-Budokai-Tenkaichi-3.desktop"
+echo "Run it from the application menu, or:  \"$WRAP\""
+echo "You can now delete the portable folder:  \"$SRC\""

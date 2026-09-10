@@ -12,20 +12,9 @@
 #include <thread>
 #include <vector>
 
-// g_currentThreadId is an `inline thread_local int` defined in the kernel's
-// internal State.h (ps2xRuntime/.../Kernel/Syscalls/Helpers/State.h, default 1).
-// Only sub-case H of the semaphore-return-value test reaches into it: the worker
-// thread sets its own guest tid so ReleaseWaitThread(tid) can target the exact
-// ThreadInfo that the worker's WaitSema put into THS_WAIT.
-//
-// ODR-safety: this declaration MUST stay byte-for-byte type-compatible with that
-// definition (`thread_local int`, same name, no namespace). It is an `extern`
-// declaration of an existing inline thread_local, NOT a second definition, so the
-// linker binds to the runtime's instance. If the runtime ever changes the type or
-// moves it into a namespace, update this line in lockstep or the build will break.
-extern thread_local int g_currentThreadId;
-
 using namespace ps2_syscalls;
+
+extern "C" void ps2xTestSetCurrentThreadId(int tid);
 
 namespace
 {
@@ -634,7 +623,7 @@ void register_ps2_runtime_kernel_tests()
                 int32_t workerRet = 0;
 
                 std::thread worker([&]() {
-                    g_currentThreadId = kWorkerTid;
+                    ps2xTestSetCurrentThreadId(kWorkerTid);
                     R5900Context wctx{};
                     setRegU32(wctx, 4, static_cast<uint32_t>(sid));
                     writeGuestU32(env.rdram.data(), K_SEMA_WAIT_READY_ADDR, 1u);

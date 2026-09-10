@@ -557,6 +557,16 @@ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
 # ps2xRuntime/third_party/parallel-gs is a git-ignored symlink/checkout of https://github.com/Arntzen-Software/parallel-gs
 set(PS2X_PGS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parallel-gs" CACHE PATH "paraLLEl-GS checkout (with its Granite submodule)")
 option(PS2X_DISABLE_PGS "Do not build the paraLLEl-GS backend even if the checkout is present" OFF)
+# paraLLEl-GS does not compile on macOS: Granite's sleep_until_nsecs() uses
+# clock_nanosleep/TIMER_ABSTIME for everything that is not _WIN32, and macOS has
+# neither. Gate it on the platform rather than on a cache variable alone, so a
+# regenerated cache cannot silently turn it back on. PS2X_FORCE_PGS=ON opts in
+# (needs MoltenVK and a patched Granite).
+option(PS2X_FORCE_PGS "Build paraLLEl-GS even on platforms it is not known to support" OFF)
+if (APPLE AND NOT PS2X_FORCE_PGS)
+    set(PS2X_DISABLE_PGS ON)
+    set(PS2X_PGS_SKIP_REASON "not supported on macOS (Granite needs clock_nanosleep)")
+endif()
 if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
     add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
@@ -565,7 +575,16 @@ if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
     target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_PGS=1)
     message(STATUS "[pgs] paraLLEl-GS backend enabled from ${PS2X_PGS_DIR}")
 else()
-    message(STATUS "[pgs] paraLLEl-GS backend not built (no checkout at ${PS2X_PGS_DIR})")
+    # Say WHICH of the three reasons applies: the old message always blamed a
+    # missing checkout, including when the backend was deliberately disabled.
+    if (PS2X_PGS_SKIP_REASON)
+        set(_pgs_why "${PS2X_PGS_SKIP_REASON}")
+    elseif (PS2X_DISABLE_PGS)
+        set(_pgs_why "PS2X_DISABLE_PGS=ON")
+    else()
+        set(_pgs_why "no checkout at ${PS2X_PGS_DIR}")
+    endif()
+    message(STATUS "[pgs] paraLLEl-GS backend not built (${_pgs_why})")
 endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE

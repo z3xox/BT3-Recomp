@@ -3699,7 +3699,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     recordRegisterDebugEventUnlocked(regAddr, value);
 }
 
+#if defined(PS2X_HAVE_PGS)
 namespace ps2x_pgs { extern std::atomic<int> g_pgsProbeReq; extern std::atomic<unsigned> g_pgsProbeFbp, g_pgsProbeZbp; }   // [vramprobe]
+#endif
 // [rtstale] page footprint of a VRAM region: bp in blocks, bw in 64-pixel units, an inclusive pixel box in `psm`
 // pixels. Pages per row follow the format's page width; a base that is not page aligned makes every block-table
 // index >= 32 land in the NEXT LINEAR page (page + 1), which is how addrPSMT4/8/CT32 resolve it -- not the next
@@ -4087,8 +4089,12 @@ void GS::vertexKick(bool drawing)
             }
             {   // [vramprobe] the 32-sprite depth-mask pass just finished -> ask the pgs module to dump the frame alpha
                 static unsigned s_c16run = 0;
+#if defined(PS2X_HAVE_PGS)
                 if (activeContext().frame.psm == GS_PSM_CT16) { if (++s_c16run == 32u) { ps2x_pgs::g_pgsProbeFbp.store(activeContext().frame.fbp); ps2x_pgs::g_pgsProbeZbp.store(activeContext().zbuf.zbp); ps2x_pgs::g_pgsProbeReq.store(1); } }
                 else s_c16run = 0;
+#else
+                (void)s_c16run;
+#endif
             }
             if (s_censusMode == 3 && s_c16N < 48 && m_vtxCount > 0 && activeContext().frame.psm == GS_PSM_CT16)
             {   // [pgscensus] every kick into a 16-bit FRAME view: BT3's depth-mask columns (must sit on x = 8..15 mod 16 of

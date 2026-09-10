@@ -1223,6 +1223,10 @@ bool PS2Runtime::initialize(const char *title)
         {
             std::error_code ec;
             std::filesystem::path exeDir;
+            std::filesystem::path iconPath;
+            if (const char *assetDir = std::getenv("PS2X_ASSETDIR"))
+                if (assetDir[0] != '\0')
+                    iconPath = std::filesystem::path(assetDir) / "icon.png";
             if (const char *exeDirEnv = std::getenv("PS2X_EXEDIR"))
                 if (exeDirEnv[0] != '\0')
                     exeDir = exeDirEnv;
@@ -1234,24 +1238,24 @@ bool PS2Runtime::initialize(const char *title)
                     exeDir = self.parent_path();
             }
 #endif
-            if (!exeDir.empty())
+            if (iconPath.empty() && !exeDir.empty())
             {
-                const std::filesystem::path iconPath = exeDir / "assets" / "icon.png";
-                if (std::filesystem::is_regular_file(iconPath, ec) && !ec)
+                iconPath = exeDir / "assets" / "icon.png";
+            }
+            if (std::filesystem::is_regular_file(iconPath, ec) && !ec)
+            {
+                Image icon = LoadImage(iconPath.string().c_str());
+                if (icon.data != nullptr)
                 {
-                    Image icon = LoadImage(iconPath.string().c_str());
-                    if (icon.data != nullptr)
-                    {
-                        // The deploy art is huge (7k x 5k); X11's _NET_WM_ICON
-                        // sends every pixel as one property and would exceed a
-                        // single request (BadLength). Downscale before setting.
-                        const int target = 128;
-                        if (icon.width > target || icon.height > target)
-                            ImageResize(&icon, target,
-                                        target * icon.height / icon.width);
-                        SetWindowIcon(icon);
-                        UnloadImage(icon);
-                    }
+                    // The deploy art is huge (7k x 5k); X11's _NET_WM_ICON
+                    // sends every pixel as one property and would exceed a
+                    // single request (BadLength). Downscale before setting.
+                    const int target = 128;
+                    if (icon.width > target || icon.height > target)
+                        ImageResize(&icon, target,
+                                    target * icon.height / icon.width);
+                    SetWindowIcon(icon);
+                    UnloadImage(icon);
                 }
             }
         }

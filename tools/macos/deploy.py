@@ -25,6 +25,22 @@ def version(value):
     return tuple((list(map(int, value.split("."))) + [0, 0])[:3])
 
 
+def make_icns(source, destination, workdir):
+    """Convert the launcher artwork to the native Finder/Dock icon format."""
+    iconset = workdir / "BT3-Recomp.iconset"
+    iconset.mkdir()
+    # iconutil requires square source images. Crop the artwork around its center
+    # before generating the standard 1x/2x icon sizes.
+    square = workdir / "icon-square.png"
+    run("sips", "-c", "5178", "5178", source, "--out", square)
+    for size in (16, 32, 128, 256, 512):
+        run("sips", "-z", str(size), str(size), square,
+            "--out", iconset / f"icon_{size}x{size}.png")
+        run("sips", "-z", str(size * 2), str(size * 2), square,
+            "--out", iconset / f"icon_{size}x{size}@2x.png")
+    run("iconutil", "-c", "icns", iconset, "-o", destination)
+
+
 def audit(app, minimum):
     """Reject unresolved external libraries and a falsely advertised OS floor."""
     required_arches = set(output("lipo", "-archs", app / "Contents/MacOS/bt3-runner").split())
@@ -69,7 +85,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iso", type=Path, help="BT3 USA ISO (SLUS-21678)")
     parser.add_argument("--output", type=Path, default=ROOT / "build/macos-dist/BT3-Recomp.app",
-                        help="destination .app; must not already exist")
+                        help="destination .app; replaced only after packaging and verification succeed")
     parser.add_argument("--jobs", type=int, default=3)
     parser.add_argument("--skip-setup", action="store_true", help="reuse generated sources and rebuild")
     parser.add_argument("--skip-build", action="store_true", help="package existing build products only")
@@ -83,8 +99,8 @@ def main():
     if not args.skip_setup and not args.skip_build and not args.iso:
         parser.error("provide --iso, --skip-setup or --skip-build")
     dest = args.output.expanduser().absolute()
-    if dest.suffix != ".app" or dest.exists():
-        parser.error("--output must name a new .app path")
+    if dest.suffix != ".app":
+        parser.error("--output must name a .app path")
     build = Path(os.environ.get("PS2X_BUILD_DIR") or ROOT / "build").resolve()
     qt = Path(output("brew", "--prefix", "qt"))
     deployqt = qt / "bin/macdeployqt"
@@ -120,6 +136,7 @@ def main():
         info = plistlib.loads(plist.read_bytes())
         info["LSMinimumSystemVersion"] = args.deployment_target
         plist.write_bytes(plistlib.dumps(info))
+        make_icns(resources / "assets/icon.png", resources / "BT3-Recomp.icns", Path(tmp))
         # Homebrew's Qt plugins use @rpath for non-Qt dependencies. macdeployqt
         # only searches Qt's own prefix by default, so provide every installed
         # formula lib directory and let it close the complete dependency graph.
@@ -149,7 +166,21 @@ def main():
             run("codesign", "--force", "--sign", "-", framework)
         run("codesign", "--force", "--sign", "-", app)
         run("codesign", "--verify", "--deep", "--strict", app)
-        app.rename(dest)
+        # Keep one predictable app path for local use.  Retain the previous bundle until the
+        # newly staged bundle has passed deployment and signature verification, so a failed
+        # publish never leaves the user without a runnable app.
+        previous = Path(tmp) / "previous.app"
+        had_previous = dest.exists()
+        if had_previous:
+            dest.rename(previous)
+        try:
+            app.rename(dest)
+        except Exception:
+            if had_previous:
+                previous.rename(dest)
+            raise
+        if had_previous:
+            shutil.rmtree(previous)
     print(f"Ready: {dest}\nGame data and saves: ~/Library/Application Support/BT3-Recomp")
     print("Local ad-hoc signature; Developer ID and notarization are not performed.")
 

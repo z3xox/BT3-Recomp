@@ -88,6 +88,12 @@ static constexpr size_t kStreamChunkFrames = 1024;
 
 struct PS2AudioBackend::Impl
 {
+    struct DeviceProgress
+    {
+        uint64_t played = 0;
+        size_t queued = 0;
+        uint32_t primingSlots = 2;
+    };
     struct TrackedSound
     {
         Sound snd;
@@ -96,6 +102,8 @@ struct PS2AudioBackend::Impl
     std::vector<TrackedSound> activeSounds;
     // Open raylib AudioStreams for the streaming-PCM path, keyed by streamId.
     std::unordered_map<uint32_t, AudioStream> streams;
+    // PCM that is still inside raylib/Core Audio rather than in StreamState::ring.
+    std::unordered_map<uint32_t, DeviceProgress> deviceProgress;
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
@@ -376,7 +384,12 @@ PS2AudioBackend::StreamProgress PS2AudioBackend::streamProgress(uint32_t streamI
         return p;
     p.known = true;
     p.started = it->second.started;
-    p.consumedSamples = it->second.fed;
+    // `fed` only means that PCM was copied into raylib's double buffer.  Treating it as
+    // played returns the IOP ring immediately, so BT3 sends STOP while the first character
+    // call-out is still sitting in Core Audio.  `played` moves only when raylib reports a
+    // previously-filled sub-buffer free again.
+    auto dev = m_impl->deviceProgress.find(streamId);
+    p.consumedSamples = (dev != m_impl->deviceProgress.end()) ? dev->second.played : 0u;
     p.gapSamples = it->second.gap;
     p.pending = it->second.ring.size();
     return p;
@@ -515,6 +528,8 @@ void PS2AudioBackend::serviceStreams()
             SetAudioStreamBufferSizeDefault(static_cast<int>(kStreamChunkFrames));
             m_impl->streams[kPairKey] = LoadAudioStream(L.sampleRate, 16, 2);
             L.opened = R.opened = true;
+            m_impl->deviceProgress[kLeftId] = {};
+            m_impl->deviceProgress[kRightId] = {};
             s_pairOpenRate = L.sampleRate;
             std::fprintf(stderr, "[sndplay] opened STEREO PAIR (streams 0+1) rate=%u\n", L.sampleRate);
         }
@@ -571,6 +586,24 @@ void PS2AudioBackend::serviceStreams()
             while (IsAudioStreamProcessed(s) &&
                    std::min(L.ring.size(), R.ring.size()) >= kStreamChunkFrames)
             {
+                // A new AudioStream starts with two empty sub-buffers.  The first two
+                // processed notifications merely let us prime them; every later one means a
+                // complete stereo chunk was actually heard.
+                auto &lDev = m_impl->deviceProgress[kLeftId];
+                auto &rDev = m_impl->deviceProgress[kRightId];
+                if (lDev.primingSlots != 0u)
+                {
+                    --lDev.primingSlots;
+                    --rDev.primingSlots;
+                }
+                else if (lDev.queued >= kStreamChunkFrames &&
+                         rDev.queued >= kStreamChunkFrames)
+                {
+                    lDev.queued -= kStreamChunkFrames;
+                    rDev.queued -= kStreamChunkFrames;
+                    lDev.played += kStreamChunkFrames;
+                    rDev.played += kStreamChunkFrames;
+                }
                 for (size_t i = 0; i < kStreamChunkFrames; ++i)
                 {
                     inter[i * 2u]     = static_cast<int16_t>(L.ring[i] * musicVol);
@@ -581,6 +614,8 @@ void PS2AudioBackend::serviceStreams()
                 R.ring.erase(R.ring.begin(), R.ring.begin() + static_cast<long>(kStreamChunkFrames));
                 L.fed += kStreamChunkFrames;
                 R.fed += kStreamChunkFrames;
+                lDev.queued += kStreamChunkFrames;
+                rDev.queued += kStreamChunkFrames;
                 static std::atomic<uint32_t> pf{0};
                 const uint32_t k = pf.fetch_add(1);
                 if (k < 4u || (k % 300u) == 0u)
@@ -646,6 +681,7 @@ void PS2AudioBackend::serviceStreams()
             AudioStream s = LoadAudioStream(st.sampleRate, 16, s_channels);
             m_impl->streams[id] = s;
             st.opened = true;
+            m_impl->deviceProgress[id] = {};
             std::fprintf(stderr, "[sndplay] opened stream=%u rate=%u channels=%u\n",
                          id, st.sampleRate, s_channels);
         }
@@ -689,11 +725,8 @@ void PS2AudioBackend::serviceStreams()
         if (!st.started)
         {
             // Build several whole sub-buffers before starting, so the first refills never run
-            // dry. Reported symptom: the first word or two of every VOICE line is glitched and
-            // the rest is clean -- a textbook startup underrun. A voice line arrives as a burst,
-            // so 4 sub-buffers (~170ms) was not enough of a head start; raylib drains both
-            // sub-buffers immediately on play and then runs dry while the pump catches up.
-            // 6 sub-buffers (~256ms at 24kHz) gives that head start.
+            // dry. A voice line arrives as a burst, so the IOP needs this head start before
+            // the real device clock begins returning ring capacity.
             // The cushion MUST stay BELOW the pump's backlog target (PS2X_SNDBACKLOG, default
             // 8192) or the two deadlock: the pump stops handing buffers back once it reaches
             // the target, a larger start threshold is then never reached, and the stream never
@@ -730,6 +763,19 @@ void PS2AudioBackend::serviceStreams()
             const size_t chunk = kStreamChunkFrames * s_channels;
             if (st.ring.size() < chunk)
                 break;
+            auto &dev = m_impl->deviceProgress[id];
+            // See the paired-stream path above: do not credit the IOP until a buffer that
+            // contained audio has become free.  This holds the guest's STOP/cleanup path off
+            // for the real device latency without changing the game's stream state machine.
+            if (dev.primingSlots != 0u)
+            {
+                --dev.primingSlots;
+            }
+            else if (dev.queued >= chunk)
+            {
+                dev.queued -= chunk;
+                dev.played += chunk;
+            }
             // Apply SFX volume (master * sfx) to this chunk. Mono streams carry voices and
             // effects; scaling here is cheaper than a second ring pass.
             const float sfxVol = s_masterVolume * s_sfxVolume;
@@ -747,6 +793,7 @@ void PS2AudioBackend::serviceStreams()
             }
             st.ring.erase(st.ring.begin(), st.ring.begin() + static_cast<long>(chunk));
             st.fed += chunk;
+            dev.queued += chunk;
             static std::atomic<uint32_t> f{0};
             const uint32_t k = f.fetch_add(1);
             if (k < 6u || (k % 200u) == 0u)

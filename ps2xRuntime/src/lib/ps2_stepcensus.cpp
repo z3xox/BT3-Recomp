@@ -179,7 +179,7 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
             else nv = (uint32_t)(valueLo >> (8 * off));
             float fo, fn; std::memcpy(&fo, &oldv, 4); std::memcpy(&fn, &nv, 4);
             const uint32_t a0 = (uint32_t)ctx->r[4][0], a1 = (uint32_t)ctx->r[5][0], a2 = (uint32_t)ctx->r[6][0];
-            const bool changing = std::fabs(fn - fo) > 0.01f || (!std::isfinite(fn) != !std::isfinite(fo));
+            const bool changing = oldv != nv;   // (a float tolerance here hid integer slots whose bits are float denormals: the ki 98400 -> 96800)
             if (changing && s_n[k]++ < 500u)
                 std::fprintf(stderr, "[addrwatch%d] slot=0x%x pc=0x%06x ra=0x%06x size=%u old=%g new=%g a0=0x%x a1=0x%x a2=0x%x frame=%llu\n", k, w, ctx->pc, (uint32_t)ctx->r[31][0], size, fo, fn, a0, a1, a2, (unsigned long long)g_bt3FrameCount.load());
             if (size == 16 && ctx->pc >= 0x120000u && ctx->pc < 0x122400u && (a0 & 0x1FFFFFFFu) == a && s_cnt < 6 && k < g_addrWatchCnt)

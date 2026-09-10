@@ -863,8 +863,16 @@ namespace ps2_stubs
                 }
                 else if (tok == "bind")
                 {
-                    std::string actionName, kindName;
-                    if (!(ss >> actionName >> kindName))
+                    // The action name may contain spaces ("D-Pad Up", "L Stick X -"): read tokens until
+                    // the bind kind. The old single-token read silently dropped every such line, so a saved
+                    // D-pad or stick binding never came back after a restart.
+                    std::string actionName, kindName, tok2;
+                    while (ss >> tok2)
+                    {
+                        if (tok2 == "Key" || tok2 == "Button" || tok2 == "Axis") { kindName = tok2; break; }
+                        actionName += (actionName.empty() ? "" : " ") + tok2;
+                    }
+                    if (kindName.empty())
                     {
                         continue;
                     }
@@ -897,7 +905,7 @@ namespace ps2_stubs
                     PadBind bind;
                     bind.kind = kind;
                     bind.value = value;
-                    bind.sign = (std::fabs(sign) < 0.5f) ? -1.0f : 1.0f;
+                    bind.sign = (sign < 0.0f) ? -1.0f : 1.0f;   // the file stores the sign as -1/1
                     dst.binds[static_cast<size_t>(action)] = bind;
                     any = true;
                 }
@@ -982,8 +990,13 @@ namespace ps2_stubs
                         }
                         else if (tok == "bind")
                         {
-                            std::string actionName, kindName;
-                            if (!(ss >> actionName >> kindName))
+                            std::string actionName, kindName, tok2;   // multi-word action names (see above)
+                            while (ss >> tok2)
+                            {
+                                if (tok2 == "Key" || tok2 == "Button" || tok2 == "Axis") { kindName = tok2; break; }
+                                actionName += (actionName.empty() ? "" : " ") + tok2;
+                            }
+                            if (kindName.empty())
                             {
                                 continue;
                             }
@@ -1016,7 +1029,7 @@ namespace ps2_stubs
                             PadBind bind;
                             bind.kind = kind;
                             bind.value = value;
-                            bind.sign = (std::fabs(sign) < 0.5f) ? -1.0f : 1.0f;
+                            bind.sign = (sign < 0.0f) ? -1.0f : 1.0f;   // the file stores the sign as -1/1
                             players[idx].binds[static_cast<size_t>(action)] = bind;
                             any = true;
                         }

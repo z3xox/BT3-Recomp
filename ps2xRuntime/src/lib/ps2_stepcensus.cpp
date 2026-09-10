@@ -363,6 +363,15 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     // counters on the same thread, and halving those crashed the loader (half3: wild jump to 0x10000000).
     const uint32_t frame = (uint32_t)g_bt3FrameCount.load(std::memory_order_relaxed);
     if (frame - (uint32_t)g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) > 2u) return value;
+    if (k == 4)
+    {   // 'h': a per-frame RATE assignment (the animation speed 2.0 set every frame by its setter): halve the value
+        // itself, so every consumer -- the frame advance, the finish look-ahead, anything stepping by it -- runs at
+        // the 30 fps pace. No gap logic: it is an assignment, applied on every store.
+        if (size != 4) return value;
+        float f; std::memcpy(&f, &value, 4);
+        if (!std::isfinite(f) || std::fabs(f) > 1e6f) return value;
+        f *= 0.5f; uint32_t bits; std::memcpy(&bits, &f, 4); g_hsFloat.fetch_add(1, std::memory_order_relaxed); return bits;
+    }
     const uint32_t old = readOld(rdram, a, size);
     if (old == value) return value;
     // One-shot guard: a per-frame quantity is advanced on consecutive frames. A store at a listed site after a gap

@@ -2,9 +2,13 @@
 #include "Pad.h"
 #include "runtime/pad_config.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+
+extern std::atomic<uint64_t> g_bt3FrameCount;   // [input] defined in game_overrides.cpp
+static inline unsigned long long ps2xInputLogFrame() { return (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed); }
 
 namespace ps2_stubs
 {
@@ -140,6 +144,30 @@ namespace ps2_stubs
             data[1] = portState.analogMode ? kPadModeDualShock : kPadModeDigital;
             data[2] = static_cast<uint8_t>(state.buttons & 0xFFu);
             data[3] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
+            // [input] PS2X_INPUTLOG=1: log every button transition the GAME sees, with the frame number, so a
+            // hand-played move can be MEASURED (press and release) instead of guessed at. Comparing a move's
+            // timing between 30 and 60 fps is meaningless without this, since its length depends on how long the
+            // button was held; that cost several inconclusive run pairs. Active-low: a clear bit means pressed.
+            {
+                static const bool s_on = [](){ const char *v = std::getenv("PS2X_INPUTLOG"); return v && v[0] && v[0] != '0'; }();
+                if (s_on)
+                {
+                    static const char *const kBtnNames[16] = { "SELECT", "L3", "R3", "START", "UP", "RIGHT", "DOWN", "LEFT",
+                                                               "L2", "R2", "L1", "R1", "TRIANGLE", "CIRCLE", "CROSS", "SQUARE" };
+                    static uint16_t s_prevBtn = 0xFFFFu;
+                    const uint16_t cur = state.buttons;
+                    if (cur != s_prevBtn)
+                    {
+                        const uint16_t changed = static_cast<uint16_t>(cur ^ s_prevBtn);
+                        for (int b = 0; b < 16; ++b)
+                            if (changed & (1u << b))
+                                std::fprintf(stderr, "[input] frame %llu %-8s %s\n",
+                                             static_cast<unsigned long long>(ps2xInputLogFrame()),
+                                             kBtnNames[b], (cur & (1u << b)) ? "release" : "press");
+                        s_prevBtn = cur;
+                    }
+                }
+            }
             data[4] = state.rx;
             data[5] = state.ry;
             data[6] = state.lx;

@@ -80,7 +80,11 @@ else()
         # NOTE: keep "--check" WITHOUT "--quiet": Ubuntu 22.04 ships git 2.34, where the
         # combination exits 129 (usage error), so a patched source would fall through to the
         # forward apply and fail. Verify with `git apply --reverse --check`.
-        PATCH_COMMAND git apply --reverse --check "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch" || git apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/patches/raylib-5.5-ps2x.patch"
+        # [ps2x raylib patch] NO PATCH_COMMAND here on purpose: it needed a shell (`git apply ... || git apply ...`),
+        # and the populate sub-build runs it WITHOUT one on Windows (MSBuild), where it exited -1 and failed the
+        # configure (2026-09-11). The self-heal block after FetchContent_MakeAvailable does the same work through
+        # CMake -- reverse-check, restore if an older patch is applied, forward-apply, fail loudly -- on every
+        # configure and on every platform, so the patch step here is redundant as well as broken.
     )
     FetchContent_MakeAvailable(raylib)
 

@@ -11,6 +11,15 @@ endif()
 
 project(PS2RetroX)
 
+
+# [windows] Pin the C runtime for the WHOLE tree. third_party/parallel-gs sets the STATIC CRT when nobody else has
+# ("if (NOT CMAKE_MSVC_RUNTIME_LIBRARY)"), so without this the backend builds /MT while the runtime builds /MD and
+# lld-link refuses the mix: "mismatch detected for 'RuntimeLibrary': granite-vulkan.lib has value MT_StaticRelease".
+# Setting it here makes that guard stand down. No effect on Linux or macOS.
+if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    cmake_policy(SET CMP0091 NEW)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>" CACHE STRING "C runtime for every target")
+endif()
 # Visual Studio generator: compile a project's files in parallel (MSBuild MultiProcessorCompilation). The
 # generator turns /MP into the project property; it is not passed to clang-cl. Without it the runner's
 # ~1000 unity units build one at a time (45-minute scratch builds, 2026-09-08).

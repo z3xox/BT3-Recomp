@@ -18,7 +18,7 @@ project(PS2RetroX)
 # Setting it here makes that guard stand down. No effect on Linux or macOS.
 if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     cmake_policy(SET CMP0091 NEW)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL$<$<CONFIG:Debug>:Debug>" CACHE STRING "C runtime for every target")
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING "C runtime for every target")
 endif()
 # Visual Studio generator: compile a project's files in parallel (MSBuild MultiProcessorCompilation). The
 # generator turns /MP into the project property; it is not passed to clang-cl. Without it the runner's

@@ -268,7 +268,7 @@ def main():
     progs = []
     seen = {}
     for spec in sys.argv[2:]:
-        path, ext = spec.split(':')
+        path, ext = spec.rsplit(':', 1)   # rsplit: a Windows path carries its own colon (C:/...)
         image = open(path, 'rb').read()
         extent = int(ext, 16)
         body = image[:extent]

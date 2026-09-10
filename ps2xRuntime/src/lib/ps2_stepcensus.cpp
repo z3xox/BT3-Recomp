@@ -75,6 +75,10 @@ static uint32_t g_addrWatchList[6] = {0}; static int g_addrWatchCnt = 0;
 // PS2X_ADDRWATCH_TRIG=<hex addr>:<delta>: hold the log until the float at addr has moved more than delta from its
 // value when the fight gate opened -- so the 500-line budget per slot lands on the move under study (a takeoff,
 // a dash) instead of the idle frames before it
+// [halfstep] ADDRESS rules ("@<hexaddr> D"): the recompiler only assigns ctx->pc at branches, so a plain store is
+// attributed to the pc of the last branch -- several distinct stores share one site id and cannot be told apart by
+// pc. An address rule targets one guest slot exactly.
+static uint32_t g_hsAddr[16] = {0}; static char g_hsAddrKind[16] = {0}; static int g_hsAddrN = 0; static int g_hsAddrLog = 0;
 static uint32_t g_awTrigAddr = 0; static float g_awTrigDelta = 0.f; static uint32_t g_awTrigAddr2 = 0;
 static void parseTrig()
 {
@@ -364,6 +368,27 @@ namespace
 uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint32_t value, const R5900Context *ctx)
 {
     if (!g_hs || !ctx || ctx != g_hsCtx.load(std::memory_order_relaxed)) return value;
+    if (g_hsAddrN)
+    {
+        const uint32_t aa = guestAddr & 0x1FFFFFFFu;
+        for (int i = 0; i < g_hsAddrN; ++i)
+        {
+            if (g_hsAddr[i] != aa) continue;
+            const uint32_t fr = (uint32_t)g_bt3FrameCount.load(std::memory_order_relaxed);
+            if (fr - (uint32_t)g_ps2HalfStepLogicFrame.load(std::memory_order_relaxed) > 2u) return value;
+            if (g_hsAddrKind[i] == 'D' && size == 4)
+            {
+                const int32_t v = (int32_t)value;
+                if (v > 0 && v <= 100000)
+                {
+                    if (g_hsAddrLog < 6) { ++g_hsAddrLog; std::fprintf(stderr, "[halfstep] duration 0x%x doubled %d -> %d (frame %u)\n", aa, v, v * 2, fr); }
+                    g_hsFloat.fetch_add(1, std::memory_order_relaxed);
+                    return (uint32_t)(v * 2);
+                }
+            }
+            return value;
+        }
+    }
     const uint32_t pc = ctx->pc;
     if (pc < kBase || pc >= kEnd) return value;
     const uint8_t k = g_hs[(pc - kBase) >> 2];
@@ -501,6 +526,15 @@ void ps2HalfStepEnable(const char *sitesPath)
     while (std::fgets(line, sizeof line, f))
     {
         unsigned pc = 0, ra = 0; char kind = 0;
+        {   // "@<hexaddr> <kind>": applies to every store covering that guest address, whatever the pc
+            unsigned aa = 0; const char *q = line; while (*q == ' ' || *q == '\t') ++q;
+            if (*q == '@' && std::sscanf(q + 1, "%x %c", &aa, &kind) == 2)
+            {
+                if (g_hsAddrN < 16) { g_hsAddr[g_hsAddrN] = aa & 0x1FFFFFFFu; g_hsAddrKind[g_hsAddrN] = kind; ++g_hsAddrN; ++ni; }
+                continue;
+            }
+            kind = 0;
+        }
         if (std::sscanf(line, "%x:%x %c", &pc, &ra, &kind) == 3) { if (pc >= kBase && pc < kEnd && kind == 'f') { g_hsVec.insert(((uint64_t)pc << 32) | ra); ++nv; } continue; }
         if (std::sscanf(line, "%x %c", &pc, &kind) != 2 || pc < kBase || pc >= kEnd) continue;
         if (kind == 'f') { g_hs[(pc - kBase) >> 2] = 1; ++nf; }

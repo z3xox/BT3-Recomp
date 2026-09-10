@@ -473,6 +473,7 @@ void ps2HalfStepEnable(const char *sitesPath)
         if (kind == 'f') { g_hs[(pc - kBase) >> 2] = 1; ++nf; }
         else if (kind == 'i' || kind == 'u') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
         else if (kind == 'd') { g_hs[(pc - kBase) >> 2] = 3; ++nd; }
+        else if (kind == 'h') { g_hs[(pc - kBase) >> 2] = 4; ++nf; }   // rate assignment: value * 0.5 on every store
     }
     std::fclose(f);
     g_hsEnabled.store(1, std::memory_order_relaxed);   // the macro switch itself is raised per fight frame (zero cost elsewhere)

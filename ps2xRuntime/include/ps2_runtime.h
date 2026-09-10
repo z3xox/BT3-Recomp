@@ -259,6 +259,10 @@ void ps2StepCensusDump();
 // [halfstep] PS2X_HALFSTEP=<sites.txt>: run the fight at step 1 (60 Hz) with the census-classified per-frame
 // accumulators advancing by half (floats) or every other frame (integer counters). Zero cost when off.
 extern std::atomic<int> g_ps2HalfStep;
+// [fps60] overlay switch: 60 fps = fight step 1 + the pacing table. Applied between fights, never mid-fight.
+extern std::atomic<int> g_ps2VStepMode;
+void ps2Set60Fps(bool on, const char *sitesPath);
+inline bool ps2VStepActive() { return g_ps2VStepMode.load(std::memory_order_relaxed) != 0; }
 extern std::atomic<uint64_t> g_ps2HalfStepLogicFrame;   // render frame of the last fight update: the gate
 uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint32_t value, const R5900Context *ctx);
 void ps2HalfStepWrite128(uint8_t *rdram, uint32_t guestAddr, uint64_t &lo, uint64_t &hi, const R5900Context *ctx);   // sqc2: 4 float lanes

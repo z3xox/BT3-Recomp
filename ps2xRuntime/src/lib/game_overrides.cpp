@@ -3363,6 +3363,8 @@ namespace
     PS2Runtime::RecompiledFunction g_orig121a10 = nullptr;
     void bt3ClipPassGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121A10
     {
+        // [fps60] inert at 30 fps: these guards exist for step-1 pathologies, so stock play stays byte-identical.
+        if (!ps2VStepActive() && std::getenv("PS2X_VSTEP") == nullptr) { if (g_orig121a10) g_orig121a10(rdram, ctx, runtime); return; }
         const uint32_t nin = getRegU32(ctx, 6); const uint32_t poly = getRegU32(ctx, 4);
         // LOG ONLY: guard3 showed the recompiled clipper re-entering itself through the function table (ra inside
         // 0x121a10..0x121d48) with registers that are not this function's arguments -- clamping there would corrupt it.
@@ -3379,6 +3381,8 @@ namespace
     }
     void bt3ClipXformGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121D48
     {
+        // [fps60] inert at 30 fps: these guards exist for step-1 pathologies, so stock play stays byte-identical.
+        if (!ps2VStepActive() && std::getenv("PS2X_VSTEP") == nullptr) { if (g_orig121d48) g_orig121d48(rdram, ctx, runtime); return; }
         const uint32_t n = getRegU32(ctx, 7);
         if (n > 9u)
         {
@@ -3397,6 +3401,8 @@ namespace
     }
     void bt3AngleWrapGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_11F548(f12 angle, f13 half-range) -> f0
     {
+        // [fps60] inert at 30 fps: these guards exist for step-1 pathologies, so stock play stays byte-identical.
+        if (!ps2VStepActive() && std::getenv("PS2X_VSTEP") == nullptr) { if (g_orig11f548) g_orig11f548(rdram, ctx, runtime); return; }
         const float a = ctx->f[12], r = ctx->f[13];
         if (!(std::fabs(a) < 1.0e6f) || !(r > 1.0e-6f))
         {
@@ -3416,7 +3422,8 @@ namespace
     // step 1 corrupted memory in four runs out of five. PS2X_VSTEP_ALWAYS=1 restores the ungated behaviour.
     void bt3VStep(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        static const int s_step = [](){ const char *v = std::getenv("PS2X_VSTEP"); return v && v[0] ? std::atoi(v) : 0; }();
+        static const int s_envStep = [](){ const char *v = std::getenv("PS2X_VSTEP"); return v && v[0] ? std::atoi(v) : 0; }();
+        const int s_step = ps2VStepActive() ? 1 : s_envStep;   // [fps60] the overlay's toggle, else the env override
         static const bool s_always = [](){ const char *v = std::getenv("PS2X_VSTEP_ALWAYS"); return v && v[0] && v[0] != '0'; }();
         if (s_step > 0 && getRegU32(ctx, 4) == 2u && (s_always || ps2HalfStepFightActive())) ctx->r[4] = _mm_set_epi64x(0, (int64_t)s_step);   // $a0 = step
         if (g_orig102060) g_orig102060(rdram, ctx, runtime);
@@ -4610,8 +4617,8 @@ namespace
         if (const char *aw = std::getenv("PS2X_ADDRWATCH"); aw && aw[0]) ps2AddrWatchEnable(aw);   // [addrwatch]
         if (const char *st = std::getenv("PS2X_STORETRACE"); st && st[0]) ps2StoreTraceEnable(st);   // [storetrace]
         if (const char *hs = std::getenv("PS2X_HALFSTEP"); hs && hs[0]) ps2HalfStepEnable(hs);        // [halfstep]
-        if (std::getenv("PS2X_VSTEP"))
-        {   // [vstep] [logicrate]
+        if (true)
+        {   // [vstep] [logicrate] [fps60] hooks are always installed so the overlay toggle needs no restart
             g_orig102060 = runtime.lookupFunction(0x00102060u);
             if (g_orig102060) runtime.replaceFunction(0x00102060u, &bt3VStep);
             g_orig115950 = runtime.lookupFunction(0x00115950u);

@@ -40,6 +40,7 @@ public:
         bool widescreen = false;
         bool outline = true;
         bool texPack = true;   // [texreplace] use the PCSX2 replacement pack when one is indexed
+        bool fps60 = false;   // [fps60] 60 fps mode: fight step 1 + the pacing table (applies between fights)
         int inkStrength = 199;   // [inkstrength] cel-outline darkener, % of Cs (199 = hardware 255/128)
         int inkWidth = 100;      // [pgsink] paraLLEl-GS: outline stroke width, % of a PS2 texel (100 = native, 25 = thinnest)
         unsigned inkColor = 0;   // [pgsink] paraLLEl-GS: outline colour 0xRRGGBB (0 = the game's black)

@@ -1,3 +1,4 @@
+#include "ps2_runtime.h"   // [fps60] ps2Set60Fps
 #include "runtime/ps2_texreplace.h"
 #include "ps2_settings_overlay.h"
 #include "runtime/ps2_gs_pgs.h"   // [pgsink] backend ink width
@@ -403,6 +404,7 @@ bool PS2SettingsOverlay::Settings::operator==(const Settings &o) const
            widescreen == o.widescreen &&
            outline == o.outline &&
            texPack == o.texPack &&
+           fps60 == o.fps60 &&
            inkStrength == o.inkStrength &&
            shadows == o.shadows &&
            dofBlur == o.dofBlur &&
@@ -551,6 +553,8 @@ void PS2SettingsOverlay::loadSettings()
                     m_settings.fullscreen = (val == "1" || val == "true");
                 else if (key == "widescreen")
                     m_settings.widescreen = (val == "1" || val == "true");
+                else if (key == "fps60")
+                    m_settings.fps60 = (val == "1" || val == "true");
                 else if (key == "window_w")
                     m_settings.windowW = std::atoi(val.c_str());
                 else if (key == "window_h")
@@ -766,6 +770,7 @@ void PS2SettingsOverlay::saveSettings() const
     file << "hud_off_l=" << m_settings.hudOffL << "\n";
     file << "hud_off_c=" << m_settings.hudOffC << "\n";
     file << "hud_off_r=" << m_settings.hudOffR << "\n";
+    file << "fps60=" << (m_settings.fps60 ? "1" : "0") << "\n";
     file << "widescreen=" << (m_settings.widescreen ? "1" : "0") << "\n\n";
 
     file << "[controllers]\n";
@@ -837,6 +842,7 @@ void PS2SettingsOverlay::syncFromRuntime()
 
 void PS2SettingsOverlay::applySettings()
 {
+    ps2Set60Fps(m_settings.fps60, nullptr);   // [fps60]
     s_widescreen = m_settings.widescreen;
     PS2AudioBackend::setMasterVolume(m_settings.masterVolume);
     PS2AudioBackend::setMusicVolume(m_settings.musicVolume);
@@ -1356,6 +1362,11 @@ void PS2SettingsOverlay::drawVideoTab()
             ImGui::EndDisabled();
             ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
         }
+    }
+    if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
+    {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
+        ps2Set60Fps(m_settings.fps60, nullptr);
+        m_dirty = true;
     }
     if (m_settings.outline)
     {   // [inkstrength] how hard the outline darkener subtracts. 199% is the exact GS

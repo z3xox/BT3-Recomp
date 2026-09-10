@@ -331,6 +331,9 @@ void ps2StepCensusFrame(const R5900Context *ctx)
 // [halfstep] the experiment the census exists for. sites.txt lines: "<pc-hex> f|i" (f = float accumulator: store
 // old + (new-old)/2; i = integer counter: apply the store on even render frames only, keep the old value on odd
 // ones). Only the render-kick thread's stores are touched; everything else is untouched.
+std::atomic<int> g_ps2VStepMode{0};      // [fps60] 0 = 30 fps (untouched), 1 = 60 fps (step 1 + pacing table)
+static std::atomic<int> g_vstepWanted{-1};   // the overlay's wish; applied only BETWEEN fights (see ps2HalfStepFrame)
+static std::atomic<int> g_vstepLoaded{0};
 std::atomic<int> g_ps2HalfStep{0};          // the macros' switch: raised by ps2HalfStepFrame only on fight frames
 static std::atomic<int> g_hsEnabled{0};     // the experiment is configured
 std::atomic<uint64_t> g_ps2HalfStepLogicFrame{0};
@@ -515,6 +518,19 @@ void ps2HalfStepWrite128(uint8_t *rdram, uint32_t guestAddr, uint64_t &lo, uint6
     g_hsFloat.fetch_add(1, std::memory_order_relaxed);
     lo = (uint64_t)nw[0] | ((uint64_t)nw[1] << 32); hi = (uint64_t)nw[2] | ((uint64_t)nw[3] << 32);
 }
+// [fps60] the overlay's switch. The site table ships as a data file next to the runner; it is loaded once, on the
+// first enable, and the mode then rides on g_ps2VStepMode. Off restores stock 30 fps behaviour everywhere.
+void ps2Set60Fps(bool on, const char *sitesPath)
+{
+    if (on && !g_vstepLoaded.exchange(1))
+    {
+        const char *cands[3] = { sitesPath, std::getenv("PS2X_HALFSTEP"), "fps60_sites.txt" };
+        for (const char *c : cands)
+            if (c && c[0])
+                if (FILE *f = std::fopen(c, "r")) { std::fclose(f); ps2HalfStepEnable(c); break; }
+    }
+    g_vstepWanted.store(on ? 1 : 0, std::memory_order_relaxed);
+}
 void ps2HalfStepEnable(const char *sitesPath)
 {
     FILE *f = std::fopen(sitesPath, "r");
@@ -557,7 +573,15 @@ void ps2HalfStepFrame(const R5900Context *ctx)
     // loader / intro / menus run the untouched fast path -- not even the hook call (half4 froze in the loader with
     // every modification gated off: the per-store call overhead alone shifts the loader's timing)
     const bool active = ps2HalfStepFightActive();
-    g_ps2HalfStep.store(active ? 1 : 0, std::memory_order_relaxed);
+    // [fps60] a toggle must never land mid-fight: countdowns armed at 30 fps would suddenly be halved, which is the
+    // exact shape that produced the early takeoff and the collapsed launch. Apply the wish only while no fight runs.
+    if (const int want = g_vstepWanted.load(std::memory_order_relaxed); want >= 0 && !active)
+    {
+        g_ps2VStepMode.store(want, std::memory_order_relaxed);
+        g_vstepWanted.store(-1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[fps60] %s\n", want ? "ON (step 1 + pacing table)" : "OFF (30 fps)");
+    }
+    g_ps2HalfStep.store(active && g_ps2VStepMode.load(std::memory_order_relaxed) ? 1 : 0, std::memory_order_relaxed);
     if (fr - g_hsLastReport >= 600u)
     {
         g_hsLastReport = fr;

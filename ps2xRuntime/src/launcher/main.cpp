@@ -3,6 +3,8 @@
 #include "launcher_window.h"
 
 #include <QApplication>
+#include <QGuiApplication>
+#include <QScreen>
 
 int main(int argc, char *argv[])
 {
@@ -24,5 +26,14 @@ int main(int argc, char *argv[])
 
     LauncherWindow win;
     win.show();
+    // macOS can restore a stale window position from a disconnected monitor.
+    // Always bring the launcher back onto the current primary display.
+    if (QScreen *screen = QGuiApplication::primaryScreen())
+    {
+        const QRect area = screen->availableGeometry();
+        win.move(area.center() - QPoint(win.width() / 2, win.height() / 2));
+    }
+    win.raise();
+    win.activateWindow();
     return app.exec();
 }

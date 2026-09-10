@@ -2376,7 +2376,11 @@ void PS2Memory::stage2Loop()
 {
     ps2xEeProfAddCurrentThread("GsThread");   // [eeprof]
 #if !defined(_WIN32)
+#if defined(__APPLE__)
+    pthread_setname_np("GsThread");   // macOS names the current thread
+#else
     pthread_setname_np(pthread_self(), "GsThread");   // visible to perf/top
+#endif
 #endif
     uint64_t accNs = 0;
     uint64_t nItems = 0, nPkts = 0, busyNs = 0; size_t maxDepth = 0; auto tStat = std::chrono::steady_clock::now();

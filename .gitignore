@@ -46,3 +46,6 @@ __pycache__/
 
 # local build trees (build_pre, build_pgs, ...)
 build_*/
+
+# Agent instructions file, local only
+AGENTS.md

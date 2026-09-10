@@ -396,6 +396,18 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
     if (e.addr == a && e.pc == pc) last = e.frame;
     e.addr = a; e.pc = pc; e.frame = frame;
     const bool firstAfterGap = frame - last > 1u;
+    if (k == 5)
+    {   // 'j': an integer accumulator with a large step (ki -= 1600 per dash frame): halve the step, exact for |step| >= 2.
+        // Same gap guard as the floats: the first store after a gap (a one-shot cost or refill) lands unmodified.
+        if (firstAfterGap) return value;
+        int64_t o = (size == 1) ? (int8_t)old : (size == 2) ? (int16_t)old : (int32_t)old;
+        int64_t n = (size == 1) ? (int8_t)value : (size == 2) ? (int16_t)value : (int32_t)value;
+        const int64_t d = n - o;
+        if (d > -2 && d < 2) return value;
+        const int64_t h = o + d / 2;
+        g_hsFloat.fetch_add(1, std::memory_order_relaxed);
+        return (uint32_t)h & ((size == 1) ? 0xFFu : (size == 2) ? 0xFFFFu : 0xFFFFFFFFu);
+    }
     if (k == 3)
     {   // countdown timer ('d'): exact half rate with NO register/memory mismatch. The first decrement after a gap
         // is the first tick after the timer was armed with `old`; storing 2*old + delta makes the countdown take
@@ -485,6 +497,7 @@ void ps2HalfStepEnable(const char *sitesPath)
         else if (kind == 'i' || kind == 'u') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
         else if (kind == 'd') { g_hs[(pc - kBase) >> 2] = 3; ++nd; }
         else if (kind == 'h') { g_hs[(pc - kBase) >> 2] = 4; ++nf; }   // rate assignment: value * 0.5 on every store
+        else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }   // integer step: store old + (new - old) / 2 (ki drain/charge)
     }
     std::fclose(f);
     g_hsEnabled.store(1, std::memory_order_relaxed);   // the macro switch itself is raised per fight frame (zero cost elsewhere)

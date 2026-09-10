@@ -140,6 +140,11 @@ fi
 
 # ---- 4. stage layout ---------------------------------------------------------
 cp -v "$RUNNER"   "$OUT/stage/bt3-runner" | sed 's/^/  /'
+# [fps60] the 60 fps pacing rules must sit beside the runner, or the overlay toggle is inert: the runtime refuses to
+# enable without them. The staged copy is named bt3-runner and lives here, not in the build dir, so copy them too.
+if [[ -f "$SRC/games/bt3/fps60_sites.txt" ]]; then
+    cp -v "$SRC/games/bt3/fps60_sites.txt" "$OUT/stage/fps60_sites.txt" | sed 's/^/  /'
+fi
 cp -v "$LAUNCHER" "$OUT/stage/Launcher"       | sed 's/^/  /'
 if [[ -d "$SRC/ps2xRuntime/src/launcher/assets" ]]; then
     mkdir -p "$OUT/stage/assets"

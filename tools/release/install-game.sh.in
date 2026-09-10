@@ -12,6 +12,7 @@ echo "== installing to $DEST"
 mkdir -p "$DEST"
 
 cp -a "$SRC"/Launcher "$SRC"/bt3-runner "$SRC"/lib "$SRC"/assets "$DEST"/
+[[ -f "$SRC/fps60_sites.txt" ]] && cp -a "$SRC/fps60_sites.txt" "$DEST"/   # [fps60] rules ride with the runner
 
 # already-extracted game data (when present in the portable)
 for extra in data textures; do

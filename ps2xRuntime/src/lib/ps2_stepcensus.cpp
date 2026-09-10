@@ -14,6 +14,8 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unistd.h>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -522,13 +524,36 @@ void ps2HalfStepWrite128(uint8_t *rdram, uint32_t guestAddr, uint64_t &lo, uint6
 // first enable, and the mode then rides on g_ps2VStepMode. Off restores stock 30 fps behaviour everywhere.
 void ps2Set60Fps(bool on, const char *sitesPath)
 {
-    if (on && !g_vstepLoaded.exchange(1))
-    {
-        const char *cands[3] = { sitesPath, std::getenv("PS2X_HALFSTEP"), "fps60_sites.txt" };
-        for (const char *c : cands)
-            if (c && c[0])
-                if (FILE *f = std::fopen(c, "r")) { std::fclose(f); ps2HalfStepEnable(c); break; }
+    if (on && !g_hs && !g_vstepLoaded.exchange(1))
+    {   // The rules ship next to the runner (staged post-build) and in games/bt3/. A clean release build on
+        // 2026-09-11 had the toggle but no file, and the switch was silently inert -- so name every path tried.
+        std::string exeDir;
+        if (char buf[4096]; true)
+        {
+            const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+            if (n > 0) { buf[n] = 0; if (char *slash = std::strrchr(buf, '/')) { *slash = 0; exeDir = buf; } }
+        }
+        std::vector<std::string> cands;
+        if (sitesPath && sitesPath[0]) cands.emplace_back(sitesPath);
+        if (const char *e = std::getenv("PS2X_HALFSTEP"); e && e[0]) cands.emplace_back(e);
+        for (const std::string &base : { exeDir, exeDir + "/..", exeDir + "/../..", std::string(".") })
+            if (!base.empty())
+            {
+                cands.emplace_back(base + "/fps60_sites.txt");
+                cands.emplace_back(base + "/games/bt3/fps60_sites.txt");
+            }
+        bool found = false;
+        for (const std::string &c : cands)
+            if (FILE *f = std::fopen(c.c_str(), "r")) { std::fclose(f); ps2HalfStepEnable(c.c_str()); found = g_hs != nullptr; if (found) break; }
+        if (!found)
+        {
+            std::fprintf(stderr, "[fps60] CANNOT ENABLE: fps60_sites.txt not found. Tried:\n");
+            for (const std::string &c : cands) std::fprintf(stderr, "[fps60]   %s\n", c.c_str());
+            g_vstepLoaded.store(0, std::memory_order_relaxed);
+            return;   // 60 fps without the pacing rules is the game at double speed -- refuse rather than ship that
+        }
     }
+    if (on && !g_hs) { std::fprintf(stderr, "[fps60] CANNOT ENABLE: no pacing rules loaded\n"); return; }
     g_vstepWanted.store(on ? 1 : 0, std::memory_order_relaxed);
 }
 void ps2HalfStepEnable(const char *sitesPath)
@@ -566,6 +591,13 @@ void ps2HalfStepEnable(const char *sitesPath)
 }
 void ps2HalfStepFrame(const R5900Context *ctx)
 {
+    if (const int want = g_vstepWanted.load(std::memory_order_relaxed); want == 0 && g_ps2VStepMode.load(std::memory_order_relaxed))
+    {   // turning it OFF must work even if the table never loaded -- the old code returned first and swallowed it
+        g_ps2VStepMode.store(0, std::memory_order_relaxed);
+        g_vstepWanted.store(-1, std::memory_order_relaxed);
+        g_ps2HalfStep.store(0, std::memory_order_relaxed);
+        std::fprintf(stderr, "[fps60] OFF (30 fps)\n");
+    }
     if (!g_hs || !g_hsEnabled.load(std::memory_order_relaxed)) return;
     if (!g_hsCtx.load(std::memory_order_relaxed)) g_hsCtx.store(ctx);
     const uint64_t fr = g_bt3FrameCount.load(std::memory_order_relaxed);

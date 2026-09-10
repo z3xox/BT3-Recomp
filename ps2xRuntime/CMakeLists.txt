@@ -668,3 +668,11 @@ install(DIRECTORY include/
 # [lab] line-level perf annotate of the VU1 interpreter (-g only, no codegen change)
 set_source_files_properties(src/lib/ps2_vu1.cpp PROPERTIES COMPILE_OPTIONS "-g")
 set_source_files_properties(src/lib/ps2_gs_rasterizer.cpp PROPERTIES COMPILE_OPTIONS "-g")   # [lab] annotate the sprite recorder
+
+# [fps60] the 60 fps pacing rules must sit next to the runner in EVERY build and bundle: without them the overlay
+# toggle is inert (a clean release build shipped an inert button on 2026-09-11).
+add_custom_command(TARGET ps2EntryRunner POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/games/bt3/fps60_sites.txt"
+            "$<TARGET_FILE_DIR:ps2EntryRunner>/fps60_sites.txt"
+    COMMENT "Staging fps60_sites.txt next to ps2EntryRunner")

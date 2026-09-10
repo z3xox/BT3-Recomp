@@ -139,11 +139,17 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
         if (s_trig && g_stRanges && active)
         {
             const uint32_t fr = (uint32_t)g_bt3FrameCount.load();
+            // a store counts when its pc OR its caller ($ra) lies in a range: the game's vector library
+            // (0x120000..0x122400) does most of a module's persistent stores on its behalf. Loops are capped at
+            // 8 lines per pc per frame so matrix math cannot eat the budget (1100 stores/frame from one pc seen).
+            const uint32_t ra = (uint32_t)ctx->r[31][0];
+            static uint32_t s_capFrame = 0; static std::unordered_map<uint32_t, uint32_t> s_perPc;
+            if (fr != s_capFrame) { s_capFrame = fr; s_perPc.clear(); }
             if (fr - s_trigFrame < g_stFrames)
                 for (int r = 0; r < g_stRanges; ++r)
-                    if (ctx->pc >= g_stRange[r][0] && ctx->pc < g_stRange[r][1])
+                    if ((ctx->pc >= g_stRange[r][0] && ctx->pc < g_stRange[r][1]) || (ra >= g_stRange[r][0] && ra < g_stRange[r][1]))
                     {
-                        if (g_stLines.fetch_add(1, std::memory_order_relaxed) < 40000u)
+                        if (s_perPc[ctx->pc ^ (ra << 8)]++ < 8u && g_stLines.fetch_add(1, std::memory_order_relaxed) < 60000u)
                         {
                             uint32_t ov = 0; std::memcpy(&ov, rdram + a, size < 4 ? size : 4); float fo, fn; const uint32_t nv = (uint32_t)valueLo;
                             std::memcpy(&fo, &ov, 4); std::memcpy(&fn, &nv, 4);

@@ -575,11 +575,14 @@ void ps2HalfStepFrame(const R5900Context *ctx)
     const bool active = ps2HalfStepFightActive();
     // [fps60] a toggle must never land mid-fight: countdowns armed at 30 fps would suddenly be halved, which is the
     // exact shape that produced the early takeoff and the collapsed launch. Apply the wish only while no fight runs.
-    if (const int want = g_vstepWanted.load(std::memory_order_relaxed); want >= 0 && !active)
+    // PS2X_FPS60_NOW=1 applies a toggle the instant it is made, mid-fight included. Expect a second or two of
+    // wrong timings after each flip: timers already counting were armed for the other rate.
+    static const bool s_now = [](){ const char *v = std::getenv("PS2X_FPS60_NOW"); return v && v[0] && v[0] != '0'; }();
+    if (const int want = g_vstepWanted.load(std::memory_order_relaxed); want >= 0 && (s_now || !active))
     {
         g_ps2VStepMode.store(want, std::memory_order_relaxed);
         g_vstepWanted.store(-1, std::memory_order_relaxed);
-        std::fprintf(stderr, "[fps60] %s\n", want ? "ON (step 1 + pacing table)" : "OFF (30 fps)");
+        std::fprintf(stderr, "[fps60] %s%s\n", want ? "ON (step 1 + pacing table)" : "OFF (30 fps)", (s_now && active) ? " -- MID-FIGHT" : "");
     }
     g_ps2HalfStep.store(active && g_ps2VStepMode.load(std::memory_order_relaxed) ? 1 : 0, std::memory_order_relaxed);
     if (fr - g_hsLastReport >= 600u)

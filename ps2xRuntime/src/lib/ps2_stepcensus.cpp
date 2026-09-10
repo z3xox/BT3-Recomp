@@ -76,22 +76,43 @@ static uint32_t g_addrWatchList[6] = {0}; static int g_addrWatchCnt = 0;
 // value when the fight gate opened -- so the 500-line budget per slot lands on the move under study (a takeoff,
 // a dash) instead of the idle frames before it
 static uint32_t g_awTrigAddr = 0; static float g_awTrigDelta = 0.f; static uint32_t g_awTrigAddr2 = 0;
+static void parseTrig()
+{
+    const char *tr = std::getenv("PS2X_ADDRWATCH_TRIG"); if (!tr || !tr[0] || g_awTrigAddr) return;
+    char *end = nullptr; g_awTrigAddr = (uint32_t)std::strtoul(tr, &end, 16) & 0x1FFFFFFFu;
+    g_awTrigDelta = (end && *end == ':') ? std::strtof(end + 1, &end) : 1.f;
+    if (end && *end == ',') g_awTrigAddr2 = (uint32_t)std::strtoul(end + 1, nullptr, 16) & 0x1FFFFFFFu;   // "addr:delta,addr2": either slot fires it
+}
+// [storetrace] PS2X_STORETRACE=<hex pc lo>:<hex pc hi>[,<lo>:<hi>..][;frames]: once the trigger has fired, log EVERY
+// store whose pc lies in one of the ranges for the next N frames (default 40, cap 40000 lines) -- a module's whole
+// per-frame update (e.g. the camera) in one run, so its persistent slots and their writers can be read off
+static uint32_t g_stRange[8][2]; static int g_stRanges = 0; static uint32_t g_stFrames = 40; static std::atomic<uint32_t> g_stLines{0};
+void ps2StoreTraceEnable(const char *spec)
+{
+    std::string t(spec); size_t semi = t.find(';');
+    if (semi != std::string::npos) { g_stFrames = (uint32_t)std::strtoul(t.c_str() + semi + 1, nullptr, 10); t = t.substr(0, semi); }
+    size_t p0 = 0;
+    while (p0 < t.size() && g_stRanges < 8)
+    {
+        size_t p1 = t.find(',', p0); if (p1 == std::string::npos) p1 = t.size();
+        std::string r = t.substr(p0, p1 - p0); size_t c = r.find(':');
+        if (c != std::string::npos) { g_stRange[g_stRanges][0] = (uint32_t)std::strtoul(r.c_str(), nullptr, 16); g_stRange[g_stRanges][1] = (uint32_t)std::strtoul(r.c_str() + c + 1, nullptr, 16); ++g_stRanges; }
+        p0 = p1 + 1;
+    }
+    parseTrig(); g_ps2StepCensus.store(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[storetrace] ON: %d pc range(s), %u frames after the trigger\n", g_stRanges, g_stFrames);
+}
 void ps2AddrWatchEnable(const char *list)
 {   // comma-separated hex addresses (up to 3 requested; helper sources fill the remaining slots)
     std::string t(list); size_t p0 = 0;
     while (p0 < t.size() && g_addrWatchCnt < 3) { size_t p1 = t.find(',', p0); if (p1 == std::string::npos) p1 = t.size(); if (p1 > p0) g_addrWatchList[g_addrWatchCnt++] = (uint32_t)std::strtoul(t.substr(p0, p1 - p0).c_str(), nullptr, 16) & 0x1FFFFFFFu; p0 = p1 + 1; }
     g_addrWatch = g_addrWatchList[0]; g_ps2StepCensus.store(1, std::memory_order_relaxed);
-    if (const char *tr = std::getenv("PS2X_ADDRWATCH_TRIG"); tr && tr[0])
-    {
-        char *end = nullptr; g_awTrigAddr = (uint32_t)std::strtoul(tr, &end, 16) & 0x1FFFFFFFu;
-        g_awTrigDelta = (end && *end == ':') ? std::strtof(end + 1, &end) : 1.f;
-        if (end && *end == ',') g_awTrigAddr2 = (uint32_t)std::strtoul(end + 1, nullptr, 16) & 0x1FFFFFFFu;   // "addr:delta,addr2": either slot fires it
-    }
+    parseTrig();
     std::fprintf(stderr, "[addrwatch] ON %d slot(s), first 0x%x; logging CHANGING stores only%s\n", g_addrWatchCnt, g_addrWatch, g_awTrigAddr ? " (held until the trigger slot moves)" : "");
 }
 void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx)
 {
-    if (g_addrWatch && rdram && ctx)
+    if ((g_addrWatch || g_stRanges) && rdram && ctx)
     {
         // watch list: slot 0 = the requested address; a store by a vector-library helper (0x120000..0x122400,
         // dst=$a0 src=$a1) that covers a watched slot adds src+off, up to 6 levels -- the chain from a displayed
@@ -113,7 +134,25 @@ void ps2StepCensusStore(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint6
             }
             s_haveBase = true;
         }
-        for (int k = 0; s_trig && k < s_cnt; ++k)
+        static uint32_t s_trigFrame = 0; static bool s_trigNoted = false;
+        if (s_trig && !s_trigNoted) { s_trigNoted = true; s_trigFrame = (uint32_t)g_bt3FrameCount.load(); }
+        if (s_trig && g_stRanges && active)
+        {
+            const uint32_t fr = (uint32_t)g_bt3FrameCount.load();
+            if (fr - s_trigFrame < g_stFrames)
+                for (int r = 0; r < g_stRanges; ++r)
+                    if (ctx->pc >= g_stRange[r][0] && ctx->pc < g_stRange[r][1])
+                    {
+                        if (g_stLines.fetch_add(1, std::memory_order_relaxed) < 40000u)
+                        {
+                            uint32_t ov = 0; std::memcpy(&ov, rdram + a, size < 4 ? size : 4); float fo, fn; const uint32_t nv = (uint32_t)valueLo;
+                            std::memcpy(&fo, &ov, 4); std::memcpy(&fn, &nv, 4);
+                            std::fprintf(stderr, "[storetrace] f=%u pc=0x%06x ra=0x%06x a=0x%x sz=%u old=0x%x(%g) new=0x%x(%g) a0=0x%x a1=0x%x a2=0x%x\n", fr, ctx->pc, (uint32_t)ctx->r[31][0], a, size, ov, fo, nv, fn, (uint32_t)ctx->r[4][0], (uint32_t)ctx->r[5][0], (uint32_t)ctx->r[6][0]);
+                        }
+                        break;
+                    }
+        }
+        for (int k = 0; s_trig && g_addrWatch && k < s_cnt; ++k)
         {
             const uint32_t w = s_w[k];
             if (!(a <= w && w < a + size) || !active) continue;

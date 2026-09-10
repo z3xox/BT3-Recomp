@@ -15,6 +15,7 @@ namespace ps2_syscalls { uint64_t GetCurrentVSyncTick(); }
 bool ps2HalfStepFightActive();
 void ps2HalfStepNoteLogic(uint64_t frame);
 void ps2AddrWatchEnable(const char *hex);
+void ps2StoreTraceEnable(const char *spec);
 extern std::atomic<uint64_t> g_workerFrameNs;   // [framegate] kick worker busy ns, last frame
 // [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
 // then owns the frame rate, so the busy-bit pacing and the sceGsSyncPath drain can let the guest run ahead.
@@ -4607,6 +4608,7 @@ namespace
         // overflow crash). Disable with PS2X_NO_DEMO_GUARD. The PS2X_DEMOPROBE dump rides on it.
         if (const char *sc = std::getenv("PS2X_STEPCENSUS"); sc && sc[0]) ps2StepCensusEnable(sc);   // [stepcensus]
         if (const char *aw = std::getenv("PS2X_ADDRWATCH"); aw && aw[0]) ps2AddrWatchEnable(aw);   // [addrwatch]
+        if (const char *st = std::getenv("PS2X_STORETRACE"); st && st[0]) ps2StoreTraceEnable(st);   // [storetrace]
         if (const char *hs = std::getenv("PS2X_HALFSTEP"); hs && hs[0]) ps2HalfStepEnable(hs);        // [halfstep]
         if (std::getenv("PS2X_VSTEP"))
         {   // [vstep] [logicrate]

@@ -383,6 +383,16 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
         if (!std::isfinite(f) || std::fabs(f) > 1e6f) return value;
         f *= 0.5f; uint32_t bits; std::memcpy(&bits, &f, 4); g_hsFloat.fetch_add(1, std::memory_order_relaxed); return bits;
     }
+    if (k == 6)
+    {   // 'D': a frame-count DURATION written next to a countdown we double ('d'). The game derives progress as
+        // 1 - counter/duration, so a doubled counter against an untouched duration starts the interpolation at -1
+        // (the dash camera swinging away from the fighter). Double the duration to keep the ratio right.
+        if (size != 4) return value;
+        const int32_t v = (int32_t)value;
+        if (v <= 0 || v > 100000) return value;
+        g_hsFloat.fetch_add(1, std::memory_order_relaxed);
+        return (uint32_t)(v * 2);
+    }
     const uint32_t old = readOld(rdram, a, size);
     if (old == value) return value;
     // One-shot guard: a per-frame quantity is advanced on consecutive frames. A store at a listed site after a gap
@@ -497,7 +507,8 @@ void ps2HalfStepEnable(const char *sitesPath)
         else if (kind == 'i' || kind == 'u') { g_hs[(pc - kBase) >> 2] = 2; ++ni; }
         else if (kind == 'd') { g_hs[(pc - kBase) >> 2] = 3; ++nd; }
         else if (kind == 'h') { g_hs[(pc - kBase) >> 2] = 4; ++nf; }   // rate assignment: value * 0.5 on every store
-        else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }   // integer step: store old + (new - old) / 2 (ki drain/charge)
+        else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }
+        else if (kind == 'D') { g_hs[(pc - kBase) >> 2] = 6; ++ni; }   // duration assignment: value * 2 (pairs with a 'd' countdown)   // integer step: store old + (new - old) / 2 (ki drain/charge)
     }
     std::fclose(f);
     g_hsEnabled.store(1, std::memory_order_relaxed);   // the macro switch itself is raised per fight frame (zero cost elsewhere)

@@ -355,6 +355,9 @@ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uin
         if (!plausibleFloat(old, fo) || !plausibleFloat(value, fn)) return value;
         // an angle wrapping across +-pi (vert60: Goku faced backwards) is a re-labelling, not an advance: pass it
         if (std::fabs(fn - fo) > 3.0f && std::fabs(fo) < 7.0f && std::fabs(fn) < 7.0f) return value;
+        // a reset to exactly 0 through an accumulator's setter (the camera clock restarting for a new camera
+        // move) is an assignment, never a step: pass it through, or the clock restarts at old/2
+        if (fn == 0.0f) return value;
         const float h = fo + (fn - fo) * 0.5f;
         uint32_t bits; std::memcpy(&bits, &h, 4);
         g_hsFloat.fetch_add(1, std::memory_order_relaxed);

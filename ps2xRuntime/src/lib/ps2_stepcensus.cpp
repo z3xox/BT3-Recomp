@@ -14,7 +14,11 @@
 #include <cstring>
 #include <mutex>
 #include <string>
-#include <unistd.h>
+#if defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <unistd.h>
+#endif
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -528,10 +532,22 @@ void ps2Set60Fps(bool on, const char *sitesPath)
     {   // The rules ship next to the runner (staged post-build) and in games/bt3/. A clean release build on
         // 2026-09-11 had the toggle but no file, and the switch was silently inert -- so name every path tried.
         std::string exeDir;
-        if (char buf[4096]; true)
-        {
-            const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
-            if (n > 0) { buf[n] = 0; if (char *slash = std::strrchr(buf, '/')) { *slash = 0; exeDir = buf; } }
+        {   // the runner's own directory, where the build stages fps60_sites.txt (portable: Linux has no
+            // GetModuleFileName, Windows has no /proc/self/exe -- the Linux build cannot catch that break)
+            char buf[4096] = {};
+#if defined(_WIN32)
+            const DWORD n = ::GetModuleFileNameA(nullptr, buf, (DWORD)(sizeof buf - 1));
+            const bool got = (n > 0 && n < sizeof buf - 1);
+#else
+            const ssize_t r = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+            const bool got = (r > 0);
+            if (got) buf[r] = 0;
+#endif
+            if (got)
+            {
+                char *a = std::strrchr(buf, '/'), *b = std::strrchr(buf, '\\');
+                if (char *slash = (a > b ? a : b)) { *slash = 0; exeDir = buf; }
+            }
         }
         std::vector<std::string> cands;
         if (sitesPath && sitesPath[0]) cands.emplace_back(sitesPath);

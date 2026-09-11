@@ -22,6 +22,20 @@
 #include <vector>
 #include <cmath>
 #include <chrono>
+
+// [pgswait] defined in Granite fence.cpp / device.cpp: wall time spent BLOCKED on the GPU.
+// Declared at file scope (never inside an extern "C" body -- clang-cl rejects that).
+extern std::atomic<unsigned long long> g_pgsFenceWaitNs;
+extern std::atomic<unsigned long long> g_pgsFenceWaitCalls;
+extern std::atomic<unsigned long long> g_pgsFenceWaitBlocked;
+extern std::atomic<unsigned long long> g_pgsIdleNs;
+extern std::atomic<unsigned long long> g_pgsIdleCalls;
+extern std::atomic<unsigned long long> g_pgsFrameWaitNs;
+extern std::atomic<unsigned long long> g_pgsFrameWaitCalls;
+extern std::atomic<unsigned long long> g_pgsFrameWaitBlocked;
+extern std::atomic<unsigned long long> g_pgsSemWaitNs;
+extern std::atomic<unsigned long long> g_pgsSemWaitCalls;
+extern std::atomic<unsigned long long> g_pgsQueueIdleCalls;
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1737,6 +1751,26 @@ void onSwap()
                 std::fprintf(stderr, " [%.2fms path%u %uB nloop=%u flg=%u nreg=%u regs=%llx firstAD=0x%x]", s.slowCalls[i].ms, s.slowCalls[i].path, s.slowCalls[i].size,
                              s.slowCalls[i].nloop, s.slowCalls[i].flg, s.slowCalls[i].nreg, (unsigned long long)s.slowCalls[i].regs, s.slowCalls[i].firstAD);
             for (auto &c : s.slowCalls) c = State::SlowCall{}; s.slowOver1ms = 0;
+        }
+        {   // [pgswait] is the cpu gif_transfer time above real CPU work, or blocking on the GPU?
+            static unsigned long long pw = 0, pc = 0, pb = 0, pi = 0, pic = 0;
+            static unsigned long long pfw = 0, pfc = 0, pfb = 0, psw = 0, psc = 0;
+            const unsigned long long w = g_pgsFenceWaitNs.load(std::memory_order_relaxed);
+            const unsigned long long c = g_pgsFenceWaitCalls.load(std::memory_order_relaxed);
+            const unsigned long long b = g_pgsFenceWaitBlocked.load(std::memory_order_relaxed);
+            const unsigned long long i = g_pgsIdleNs.load(std::memory_order_relaxed);
+            const unsigned long long ic = g_pgsIdleCalls.load(std::memory_order_relaxed);
+            const unsigned long long fw = g_pgsFrameWaitNs.load(std::memory_order_relaxed);
+            const unsigned long long fc = g_pgsFrameWaitCalls.load(std::memory_order_relaxed);
+            const unsigned long long fb = g_pgsFrameWaitBlocked.load(std::memory_order_relaxed);
+            const unsigned long long sw2 = g_pgsSemWaitNs.load(std::memory_order_relaxed);
+            const unsigned long long sc = g_pgsSemWaitCalls.load(std::memory_order_relaxed);
+            std::fprintf(stderr, " | gpuwait: FRAMECTX %.1f ms/s (%.0f calls/s, %.0f blocked/s) timeline %.1f ms/s (%.0f calls/s) fence %.1f ms/s idle %.1f ms/s quirk %llu",
+                         double(fw - pfw) / 1e6 / dt, double(fc - pfc) / dt, double(fb - pfb) / dt,
+                         double(sw2 - psw) / 1e6 / dt, double(sc - psc) / dt,
+                         double(w - pw) / 1e6 / dt, double(i - pi) / 1e6 / dt,
+                         (unsigned long long) g_pgsQueueIdleCalls.load(std::memory_order_relaxed));
+            pw = w; pc = c; pb = b; pi = i; pic = ic; pfw = fw; pfc = fc; pfb = fb; psw = sw2; psc = sc;
         }
         std::fprintf(stderr, " | flip: stream calls/s %.0f, scanout fb1=%llx live1=%llx live2=%llx, stream!=live at %.0f%% of swaps",
                      s.streamFlips / dt, (unsigned long long)s.lastFb1, (unsigned long long)s.lastLive1, (unsigned long long)s.lastLive2,

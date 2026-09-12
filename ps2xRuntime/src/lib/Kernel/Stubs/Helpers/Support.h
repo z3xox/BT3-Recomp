@@ -2252,7 +2252,16 @@ namespace
         static const bool s_off = [](){ const char *v = std::getenv("PS2X_ASYNC_GSFENCE"); return v && v[0] == '0'; }();
         if (s_off || !runtime || !PS2Memory::asyncKickEnabled())
             return;
-        Ps2xWaitScope w(waitSite);   // [waitprof] per-site: the drain itself is bracketed too, this names the caller
+        // [waitprof] The drain inside drainKickQueue already brackets WP_KICK_DRAIN, and Ps2xWaitScope
+        // has no nesting guard -- so wrapping WP_KICK_DRAIN again here counted this site's time AND
+        // its count TWICE. That is why perf10 read kick_drain=350.5 ms/s over 736 waits when the truth
+        // is ~175 ms/s over 368. Only add the outer scope when it names a DIFFERENT site.
+        if (waitSite != WP_KICK_DRAIN)
+        {
+            Ps2xWaitScope w(waitSite);
+            runtime->memory().drainKickQueue();
+            return;
+        }
         runtime->memory().drainKickQueue();
     }
 
@@ -2282,6 +2291,27 @@ namespace
     // per-frame drains and touches nothing the present depends on.
     static void applyGsOnStream(PS2Runtime *runtime, std::function<void()> apply, bool displayCritical = false)
     {
+        {   // [drainsite] which caller actually drains? PS2X_DRAINSITE=1. Mode 2 changed the drain
+            // count by nothing, so the per-frame drain is not applyGsRegPairs -- name it for certain.
+            static const bool s_on = [](){ const char *v = std::getenv("PS2X_DRAINSITE"); return v && v[0] && v[0] != '0'; }();
+            if (s_on)
+            {
+                static std::atomic<unsigned long> nDisp{0}, nOther{0}, dDisp{0}, dOther{0};
+                static std::atomic<unsigned long long> t0{0};
+                const bool willDrain = !((gsQueueMode() == 1) || (gsQueueMode() == 2 && !displayCritical));
+                (displayCritical ? nDisp : nOther).fetch_add(1, std::memory_order_relaxed);
+                if (willDrain) (displayCritical ? dDisp : dOther).fetch_add(1, std::memory_order_relaxed);
+                const unsigned long long now = (unsigned long long)std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                unsigned long long prev = t0.load(std::memory_order_relaxed);
+                if (prev == 0) t0.store(now, std::memory_order_relaxed);
+                else if (now - prev >= 10ull && t0.compare_exchange_strong(prev, now))
+                {
+                    std::fprintf(stderr, "[drainsite] 10s: dispEnv calls=%lu drains=%lu | other(regPairs/clear) calls=%lu drains=%lu\n",
+                                 nDisp.exchange(0), dDisp.exchange(0), nOther.exchange(0), dOther.exchange(0));
+                }
+            }
+        }
         // 0 = off (drain then apply). 1 = queue everything (breaks the present latch, see above).
         // 2 = queue everything EXCEPT display-critical writes.
         // 3 = as 2, plus applyGsDispEnv splits itself (see below) so NO drain is left in the swap path.

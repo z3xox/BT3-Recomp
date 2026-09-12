@@ -52,8 +52,17 @@ The number that matters is **blocked/s divided by swaps/s**.
 * Root cause: `flush_submit()` -> `next_frame_context()` -> `frame().begin()` ->
   `wait(UINT64_MAX)`, an unconditional wait so the incoming context's command
   pools can be recycled.
-* `PS2X_PGS_FRAMECTX=3` (deeper ring) is a **null result** - it cannot change the
-  blocking frequency. Do not retry it.
+* ~~`PS2X_PGS_FRAMECTX=3` is a null result~~ **WRONG, corrected 2026-09-12.** The ring
+  is **flush-depth, not frame-depth**: FRAMECTX runs 429 calls/s at 52 swaps/s =
+  **8.2 advances per frame**, 1.75 of them blocking. At depth 2 an advance waits on
+  work two flushes old - a quarter of a frame - so 3 was far too small a step to
+  measure anything. The knob was also clamped to [2,4] on the same wrong assumption.
+  Cap is now 32 and **the default is 16**, user-measured on both fight modes:
+  1P vs COM 52.5 -> 59.8 swaps/s (locked 60), splitscreen ~42 -> 45.6 (peaks 54.7),
+  worst single gifTransfer call 10.66 ms -> 3.0-3.4 ms, `calls>1ms/s` 61-70 -> 17-44,
+  no visual cost in either mode. `PS2X_PGS_FRAMECTX=2` restores upstream behaviour.
+  Cost: `PerFrame::begin()` is where deferred Vulkan destruction happens, so resources
+  retire ~2 frames later at depth 16 - worth watching memory over a long session.
 * Skipping the advance is **not** a safe fix: `PerFrame::begin()` is also the only
   place deferred Vulkan destruction happens (images, buffers, views, samplers,
   semaphores, descriptor pools, device memory), so skipping trades a stall for

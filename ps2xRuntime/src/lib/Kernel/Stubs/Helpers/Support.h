@@ -2344,17 +2344,28 @@ namespace
             // parse was writing a bogus PMODE (0x1bf000001ff0000, 30x/s) that the drain used to hide by
             // letting the game's own bus store land after it. With [pmodeguard] rejecting that write at
             // source there is nothing left for the drain to protect against here.
-            {
+            {   // [gsqueue3] Scanout CONFIG only. dispfb is deliberately NOT here -- see below.
                 auto &regs = runtime->memory().gs();
                 regs.pmode = e.pmode;   regs.smode2 = e.smode2;
-                regs.dispfb1 = e.dispfb; regs.display1 = e.display;
-                regs.dispfb2 = e.dispfb; regs.display2 = e.display;
+                regs.display1 = e.display; regs.display2 = e.display;
                 regs.bgcolor = e.bgcolor;
             }
+            // [gsqueue3] dispfb travels WITH the flip, not with the config. The presenter takes
+            // the buffer from the stream latch (ps2_gs_pgs.cpp:410, streamDispfb1) but compares it
+            // against r->dispfb1; writing the register inline while the latch is queued made those
+            // two disagree on 62-66% of swaps, alternating 0x1000/0x1070 -- the last two frames
+            // shown in turn, which is the flicker seen in a fight. Queue them together and they
+            // stay in step. The rest of the env is scanout configuration the presenter reads live
+            // and no kick depends on, so it stays inline.
             const unsigned long long dispfb = e.dispfb;
             PS2Memory::KickJob j;
             j.kind = PS2Memory::KickJob::GsApply;
-            j.fn = [dispfb]() { ps2xGsDisplayFlipHook(dispfb); };
+            j.fn = [runtime, dispfb]()
+            {
+                auto &regs = runtime->memory().gs();
+                regs.dispfb1 = dispfb; regs.dispfb2 = dispfb;
+                ps2xGsDisplayFlipHook(dispfb);
+            };
             runtime->memory().enqueueKickJob(std::move(j));
             return;
         }

@@ -4036,7 +4036,15 @@ namespace
             if (s_gate && heavy && PS2Memory::asyncKickEnabled())
             {
                 static uint64_t s_lastTick = 0;
-                const uint64_t want = s_lastTick + 2u;
+                // [fps60gate] The 2-tick target IS a 30 fps lock: two vsyncs at 60 Hz = 33.3 ms. That is
+                // right for the game's native 30 fps fight loop, and it is what sync mode produced on
+                // console. But it was hardcoded, so it also fired with the 60 fps mode ON -- the mode
+                // whose whole purpose is to run the fight loop every vblank. The gate then paced 60 fps
+                // logic at 30, and no amount of making the renderer faster could show up, because the
+                // brake is applied per frame regardless of how quickly the frame was produced.
+                // Match the target to the frame step the game is actually running: 1 tick at 60, 2 at 30.
+                const uint64_t ticks = ps2VStepActive() ? 1u : 2u;
+                const uint64_t want = s_lastTick + ticks;
                 // Bounded: never wait more than ~50 ms, so a stalled vblank worker cannot hang
                 // the guest (the failure mode I wrongly suspected of [asyncpace] earlier tonight).
                 Ps2xWaitScope wgate(WP_FRAMEGATE);   // [waitprof]

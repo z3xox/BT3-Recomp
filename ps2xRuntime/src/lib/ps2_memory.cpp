@@ -2337,8 +2337,12 @@ extern std::atomic<unsigned long long> g_gsProfOursNs, g_gsProfOursCalls;
 // nothing is pinned at all -- and mode 6 showed per-unit cost RISING as the pipeline packed
 // (vu1 15.49 -> 17.60 ms/swap), which is what contention looks like.
 #if defined(_WIN32)
+// Declared rather than pulling in <windows.h>: this file does not include it, and dragging it in
+// for one call brings the min/max macros and a lot else with it.
+extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessorNumber(void);
 #  define PS2X_CUR_CORE() ((int)GetCurrentProcessorNumber())
 #elif defined(__linux__)
+#  include <sched.h>
 #  define PS2X_CUR_CORE() (sched_getcpu())
 #else
 #  define PS2X_CUR_CORE() (-1)

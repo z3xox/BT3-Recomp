@@ -1493,7 +1493,15 @@ void applyPseudoRegsLocked(State &s, const uint8_t *data, size_t size)
                             if (v <= 0xFFFFull) { r->pmode = v; ps2xNotePmodeWrite(1, v); }
                             else                { ps2xNotePmodeWrite(3, v); }
                             s.privHist[0x00 >> 4]++; s.pseudoSeen++; break;
-                        case 0x42: r->smode2 = v; s.privHist[0x20 >> 4]++; s.pseudoSeen++; break;
+                        case 0x42:
+                            // [smode2guard] Same class of bug as [pmodeguard] on 0x41, and the one
+                            // that still broke the picture under PS2X_ASYNC_GSQUEUE=3: SMODE2 has
+                            // four meaningful bits (INT, FFMD, DPMS) and this path writes 0x44,
+                            // which sets bit 6 -- undefined. It reaches the scanout as
+                            // "scanout 640x224", i.e. half height, on 2 of 12 windows. Harmless
+                            // only while the drain keeps the game's own bus store landing last.
+                            if (v <= 0xFull) { r->smode2 = v; }
+                            s.privHist[0x20 >> 4]++; s.pseudoSeen++; break;
                         case 0x59: r->dispfb1 = v; s.privHist[0x70 >> 4]++; s.pseudoSeen++; break;
                         case 0x5a: r->display1 = v; s.privHist[0x80 >> 4]++; s.pseudoSeen++; break;
                         case 0x5b: r->dispfb2 = v; s.privHist[0x90 >> 4]++; s.pseudoSeen++; break;

@@ -101,10 +101,10 @@ index 4ee4f963..569661d3 100644
  	bool has_timeline = true;
  
 diff --git a/vulkan/fence.cpp b/vulkan/fence.cpp
-index b6900cf4..3ee9f871 100644
+index b6900cf4..7b5b307b 100644
 --- a/vulkan/fence.cpp
 +++ b/vulkan/fence.cpp
-@@ -22,6 +22,55 @@
+@@ -22,6 +22,59 @@
  
  #include "fence.hpp"
  #include "device.hpp"
@@ -130,6 +130,10 @@ index b6900cf4..3ee9f871 100644
 +std::atomic<unsigned long long> g_pgsWaitNsBy[4][3];
 +std::atomic<unsigned long long> g_pgsWaitCallsBy[4][3];
 +extern "C" void ps2x_pgs_set_thread_tag(int tag) { g_pgsThreadTag = (tag >= 0 && tag < 4) ? tag : 0; }
++extern "C" void ps2x_pgs_set_thread_tag_if_unset(int tag)
++{   // [pgswait2] onSwap runs on whichever thread called swapFrame; it must not relabel a thread
++	if (g_pgsThreadTag == 0) ps2x_pgs_set_thread_tag(tag);
++}
 +void pgsWaitNote(int fam, unsigned long long ns)
 +{
 +	const int t = (g_pgsThreadTag >= 0 && g_pgsThreadTag < 4) ? g_pgsThreadTag : 0;
@@ -160,7 +164,7 @@ index b6900cf4..3ee9f871 100644
  
  namespace Vulkan
  {
-@@ -43,6 +92,7 @@ const VkFence &FenceHolder::get_fence() const
+@@ -43,6 +96,7 @@ const VkFence &FenceHolder::get_fence() const
  
  void FenceHolder::wait()
  {
@@ -168,7 +172,7 @@ index b6900cf4..3ee9f871 100644
  	auto &table = device->get_device_table();
  
  	// Waiting for the same VkFence in parallel is not allowed, and there seems to be some shenanigans on Intel
-@@ -106,6 +156,7 @@ void FenceHolder::wait()
+@@ -106,6 +160,7 @@ void FenceHolder::wait()
  
  bool FenceHolder::wait_timeout(uint64_t timeout)
  {

@@ -390,6 +390,22 @@ PS2AudioBackend::StreamProgress PS2AudioBackend::streamProgress(uint32_t streamI
     // previously-filled sub-buffer free again.
     auto dev = m_impl->deviceProgress.find(streamId);
     p.consumedSamples = (dev != m_impl->deviceProgress.end()) ? dev->second.played : 0u;
+    // [bgmstall] STARTUP CREDIT. `played` is the right answer once audio is flowing, but before
+    // the stream has ever started it is 0 and stays 0 -- and the guest will not queue more until
+    // it moves. It sends one buffer (~2432 frames), we need a 4-chunk cushion to start, and both
+    // sides wait forever: the FIRST BGM is lost (title silent, voice fine because voice is a
+    // different path), and music only appears once a later stream tears down and restarts. That
+    // is the 5aa0782 regression.
+    // So, until the stream starts, credit what we are holding -- bounded by one cushion's worth.
+    // That is enough for the guest to keep feeding until we can start, and no more: it can never
+    // credit audio the device has not taken once playback is under way, which is the property
+    // 5aa0782 added (BT3 sending STOP while the first call-out was still inside the device).
+    if (!it->second.started)
+    {
+        const uint64_t priming = std::min<uint64_t>(it->second.fed, kStreamChunkFrames * 4u);
+        if (priming > p.consumedSamples)
+            p.consumedSamples = priming;
+    }
     p.gapSamples = it->second.gap;
     p.pending = it->second.ring.size();
     return p;
@@ -506,7 +522,21 @@ void PS2AudioBackend::serviceStreams()
         // Prints only while the pair is NOT playing, from 5 s in, so a good boot stays quiet.
         static auto t0 = std::chrono::steady_clock::now();
         static auto tLast = t0;
+        static auto tBeat = t0;
         const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - tBeat).count() >= 5.0)
+        {   // [bgmbeat] objective "is music actually playing": the device's played counter. Rising
+            // = audio is coming out. Flat with a started stream = started but starved.
+            tBeat = now;
+            const auto dl = m_impl->deviceProgress.find(kLeftId);
+            std::fprintf(stderr, "[bgmbeat] %.0fs started=%d played=%llu Lring=%zu Rring=%zu rate=%u\n",
+                         std::chrono::duration<double>(now - t0).count(),
+                         (itL != m_streams.end() && itL->second.started) ? 1 : 0,
+                         (unsigned long long)(dl != m_impl->deviceProgress.end() ? dl->second.played : 0),
+                         itL != m_streams.end() ? itL->second.ring.size() : 0,
+                         itR != m_streams.end() ? itR->second.ring.size() : 0,
+                         itL != m_streams.end() ? itL->second.sampleRate : 0);
+        }
         const bool hasL = itL != m_streams.end(), hasR = itR != m_streams.end();
         // Only a genuine fault is worth printing. Neither side present just means the game is not
         // playing music yet (menus before the title, loading) -- silence there is correct, and
@@ -579,12 +609,6 @@ void PS2AudioBackend::serviceStreams()
             // largest cushion this stream will ever have. Waiting past that point deadlocks --
             // no playback means no buffer returns means no further data.
             const size_t have = std::min(L.ring.size(), R.ring.size());
-            {   // [bgmstall] trace the start path itself -- the detector below never fired, so
-                // either this code is not reached each service call or `have` keeps moving.
-                static unsigned n = 0;
-                if (n < 40) { ++n; std::fprintf(stderr, "[bgmstall-t] call %u: have=%zu L=%zu R=%zu stallFrames=%zu force=%d\n",
-                                                n, have, L.ring.size(), R.ring.size(), L.stallFrames, L.forceStart ? 1 : 0); }
-            }
             const bool forced = (L.forceStart || R.forceStart) && have >= kStreamChunkFrames;
             // [bgmstall] STARTUP DEADLOCK, regression from 5aa0782 ("stabilize audio streaming").
             // That commit stopped crediting the guest for PCM the moment it was copied into
@@ -612,7 +636,13 @@ void PS2AudioBackend::serviceStreams()
                 }
             }
             const bool stalled = L.forceStart && have >= kStreamChunkFrames;
-            if (have >= kStreamChunkFrames * 4u || forced || stalled)
+            // [bgmstall] PS2X_SNDCUSHION=<chunks>: how many chunks the pair waits for before it
+            // starts. 4 is the original. The guest can only deliver ~2432 frames before it blocks
+            // waiting for playback credit (see the 5aa0782 note), so any cushion above 2 chunks is
+            // unreachable from a cold start and the pair deadlocks.
+            static const size_t s_cushion = [](){ const char *v = std::getenv("PS2X_SNDCUSHION");
+                const long n = v && v[0] ? std::strtol(v, nullptr, 10) : 0; return (n > 0 && n <= 8) ? size_t(n) : size_t(4); }();
+            if (have >= kStreamChunkFrames * s_cushion || forced || stalled)
             {
                 PlayAudioStream(s);
                 L.started = R.started = true;

@@ -1,0 +1,30 @@
+diff --git a/vulkan/device.cpp b/vulkan/device.cpp
+index 4ee4f963..22d66c8b 100644
+--- a/vulkan/device.cpp
++++ b/vulkan/device.cpp
+@@ -972,7 +972,24 @@ void Device::set_context(const Context &context)
+ 	init_workarounds();
+ 	init_pipeline_cache();
+ 	init_timeline_semaphores();
+-	init_frame_contexts(2); // By default, regular double buffer between CPU and GPU.
++	{   // [framectx] BT3-Recomp: the frame-context ring is FLUSH-depth, not frame-depth.
++		// paraLLEl-GS calls flush_submit ~8 times per frame under BT3's packet rate, and each
++		// advance blocks in Device::PerFrame::wait until the GPU retires the context it is
++		// reusing. At the upstream depth of 2 that means waiting on work submitted two flushes
++		// ago -- a quarter of a frame -- which showed up as 1-10 ms stalls on packets as small
++		// as 208 bytes. Measured in DBZ Budokai Tenkaichi 3 fights, 2 -> 16:
++		//   1P vs COM    52.5 -> 59.8 fps        splitscreen  ~42 -> 45.6
++		//   worst single gif_transfer call 10.66 ms -> 3.0 ms
++		// The GPU is only ~40% busy there, so this is latency, not throughput.
++		// Cost: PerFrame::begin() is also where deferred Vulkan destruction happens, so
++		// resources retire N advances later (~2 frames at depth 16).
++		// PS2X_PGS_FRAMECTX overrides; 2 restores upstream behaviour.
++		const char *v = getenv("PS2X_PGS_FRAMECTX");
++		unsigned n = (v && v[0]) ? unsigned(atoi(v)) : 16u;
++		if (n < 2u) n = 2u;
++		if (n > 32u) n = 32u;
++		init_frame_contexts(n);
++	} // By default, regular double buffer between CPU and GPU.
+ 
+ 	managers.memory.init(this);
+ 	managers.semaphore.init(this);

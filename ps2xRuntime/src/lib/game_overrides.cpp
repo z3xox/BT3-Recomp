@@ -1125,20 +1125,47 @@ namespace
     // 35 KB is overwritten by bank B's 656 KB -- which is why a correct index still produced the
     // wrong sound. Snapshot each blob as it arrives instead, in upload order.
     std::mutex g_seBlobM;
-    std::vector<std::vector<uint8_t>> g_seBlobs;
 
-    uint32_t seBlobCount()
+    // [sereload] The bank table is a FIXED SIX SLOTS that get OVERWRITTEN, not a growing list.
+    //
+    // Every fight re-uploads its banks, and the old code appended them, so the second fight's
+    // per-character banks became slots 6 and 7 while the game went on asking for bank bits 16
+    // and 32 (slots 4 and 5) -- and got fight one's characters. That is the "voices stay with
+    // the previous character after switching" bug. Measured across a six-fight session:
+    //
+    //     boot     704 -> slot 0   (menu/system, uploaded ONCE and never reloaded)
+    //     fight N 5120 -> slot 1   5440 -> slot 2   832 -> slot 3
+    //             3712 -> slot 4   3712 -> slot 5   (the two per-character banks)
+    //
+    // so a reload group is exactly FIVE headers, always slots 1..5 in that order. The upload
+    // ADDRESS cannot identify a bank: it marches upward every reload (0x124c40, 0x12c880,
+    // 0x1344c0, 0x13c100, 0x143d40, 0x14b980 ...), which is why this keys on group position.
+    // Per-character header size stays 3712 while the blobs differ each fight, so size alone
+    // cannot separate slots 4 and 5 either -- only order does.
+    //
+    // Bounded by construction now: six slots instead of a list that used to run to its 32-entry
+    // cap and then silently stop capturing (~20 MB of stale banks held at the same time).
+    constexpr uint32_t kSeSlots = 6u;  // bank bitmask bits 1, 2, 4, 8, 16, 32
+    struct SeSlot
     {
-        std::lock_guard<std::mutex> lk(g_seBlobM);
-        return static_cast<uint32_t>(g_seBlobs.size());
-    }
-    // Read a byte out of snapshot `idx`; returns false past the end.
+        uint32_t addr = 0u;
+        std::vector<uint8_t> hdr;
+        std::vector<uint8_t> blob;
+    };
+    SeSlot g_seSlot[kSeSlots];
+    // Slots whose header has arrived but whose sample blob has not. Blobs carry no identity of
+    // their own, so they are matched to headers FIFO -- which is exactly the observed order:
+    // [hdr 1][blob 1] then [hdr 2..5][blob 2..5].
+    std::vector<uint32_t> g_sePendingBlob;
+    uint32_t g_seNextSlot = 0u;  // 0, then 1..5 wrapping: slot 0 is never re-uploaded
+
+    // Read a byte out of slot `idx`'s sample blob; returns false past the end.
     bool seBlobByte(uint32_t idx, uint32_t off, uint8_t &out)
     {
         std::lock_guard<std::mutex> lk(g_seBlobM);
-        if (idx >= g_seBlobs.size() || off >= g_seBlobs[idx].size())
+        if (idx >= kSeSlots || off >= g_seSlot[idx].blob.size())
             return false;
-        out = g_seBlobs[idx][off];
+        out = g_seSlot[idx].blob[off];
         return true;
     }
 
@@ -1163,13 +1190,6 @@ namespace
     // parse as having no Vagi chunk even though the bytes we saw on the way past plainly had
     // one. Keeping our own copy sidesteps the question entirely, the same way blob snapshots
     // already sidestep the reuse of the sample staging address.
-    struct SeBank
-    {
-        uint32_t addr = 0u;
-        std::vector<uint8_t> hdr;
-    };
-    std::vector<SeBank> g_seBankHdrs;
-    constexpr size_t kSeMaxBanks = 32u;
 
     // Little-endian scalar reads out of a snapshot.
     uint32_t seRd32(const std::vector<uint8_t> &b, uint32_t off)
@@ -1199,10 +1219,18 @@ void bt3NoteSeBankBlob(const uint8_t *data, uint32_t size)
     if (!data || !size)
         return;
     std::lock_guard<std::mutex> lk(g_seBlobM);
-    if (g_seBlobs.size() >= kSeMaxBanks)
+    if (g_sePendingBlob.empty())
+    {
+        // A blob with no header waiting for it. Never seen in any captured session; log it
+        // rather than guess a slot, because guessing is how the wrong character ends up talking.
+        std::fprintf(stderr, "[se] bank blob (%u bytes) with no header awaiting it -- DROPPED\n",
+                     size);
         return;
-    g_seBlobs.emplace_back(data, data + size);
-    std::fprintf(stderr, "[se] bank blob %zu captured (%u bytes)\n", g_seBlobs.size() - 1u, size);
+    }
+    const uint32_t slot = g_sePendingBlob.front();
+    g_sePendingBlob.erase(g_sePendingBlob.begin());
+    g_seSlot[slot].blob.assign(data, data + size);
+    std::fprintf(stderr, "[se] bank blob -> slot %u (%u bytes)\n", slot, size);
 }
 
 // Called from SIF.cpp for every DMA into the IOP sound region. A bank's header is uploaded
@@ -1232,11 +1260,24 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
     if (!hasVagi)
         return;
     std::lock_guard<std::mutex> lk(g_seBlobM);
-    if (g_seBankHdrs.size() >= kSeMaxBanks)
-        return;
-    g_seBankHdrs.push_back(SeBank{dst, std::vector<uint8_t>(data, data + size)});
-    std::fprintf(stderr, "[se] bank header slot %zu at 0x%x (%u bytes)\n",
-                 g_seBankHdrs.size() - 1u, dst, size);
+    const uint32_t slot = g_seNextSlot;
+    // Slot 0 is loaded once at boot; every reload group restarts at slot 1.
+    g_seNextSlot = (slot + 1u >= kSeSlots) ? 1u : (slot + 1u);
+    // A bank's header size is its sample-table size and is stable across reloads (5120, 5440,
+    // 832, 3712, 3712). If a slot's size changes, the group was not the expected five uploads
+    // and every slot after this one is now mis-assigned -- say so loudly instead of quietly
+    // playing the wrong sound, which is the failure this whole change is about.
+    const bool reload = !g_seSlot[slot].hdr.empty();
+    if (reload && g_seSlot[slot].hdr.size() != size)
+        std::fprintf(stderr, "[se] WARNING slot %u header size changed %zu -> %u: reload group "
+                             "was not the expected 5 banks, slot mapping may be off\n",
+                     slot, g_seSlot[slot].hdr.size(), size);
+    g_seSlot[slot].addr = dst;
+    g_seSlot[slot].hdr.assign(data, data + size);
+    g_seSlot[slot].blob.clear();   // the old blob belongs to the bank being replaced
+    g_sePendingBlob.push_back(slot);
+    std::fprintf(stderr, "[se] bank header -> slot %u at 0x%x (%u bytes)%s\n",
+                 slot, dst, size, reload ? " [reload]" : "");
 }
 
 std::atomic<int> g_rayHookArm{0};   // [rayhook] external linkage: set by the [raysrc] probe in ps2_memory.cpp
@@ -1519,7 +1560,6 @@ namespace
         // Command entry +4 selects the BANK (1 = bank A / 8 samples, 2 = bank B / 79) and +5 is
         // the sample index within it. Reading +4 as the sound id is why every menu action played
         // the same sample: +4 barely varies, +5 is the real selector.
-        const uint32_t nblobs = seBlobCount();
         // `bank` is a bitmask -- one bit per loaded bank slot.
         if (bank == 0u || (bank & (bank - 1u)) != 0u)
         {
@@ -1530,19 +1570,21 @@ namespace
         {
             std::vector<uint8_t> hdrSnap;
             uint32_t hdrAddr = 0u;
+            bool haveBlob = false;
             {
                 std::lock_guard<std::mutex> lk(g_seBlobM);
-                if (slot >= g_seBankHdrs.size())
+                if (slot >= kSeSlots || g_seSlot[slot].hdr.empty())
                 {
                     seDrop(bank, idx, "no header captured for this slot");
                     return;
                 }
-                hdrSnap = g_seBankHdrs[slot].hdr;
-                hdrAddr = g_seBankHdrs[slot].addr;
+                hdrSnap = g_seSlot[slot].hdr;
+                hdrAddr = g_seSlot[slot].addr;
+                haveBlob = !g_seSlot[slot].blob.empty();
             }
             const struct { uint32_t hdr; uint32_t blob; } bk{hdrAddr, slot};
             uint32_t pay = 0u, cnt = 0u;
-            if (bk.blob >= nblobs)
+            if (!haveBlob)
             {
                 seDrop(bank, idx, "bank data not captured yet");
                 return;
@@ -1704,7 +1746,7 @@ namespace
         }
         static std::atomic<uint32_t> miss{0};
         if (miss.fetch_add(1) < 8u)
-            std::fprintf(stderr, "[se] bank%u sample%u NOT FOUND (blobs=%u)\n", bank, idx, nblobs);
+            std::fprintf(stderr, "[se] bank%u sample%u NOT FOUND (slot %u)\n", bank, idx, slot);
     }
 
     // Hook on sceSifCallRpc: service the SE command the IOP would have handled.

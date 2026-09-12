@@ -1588,6 +1588,9 @@ void setGs(GS *gs) { State &s = st(); std::lock_guard<std::mutex> lk(s.mtx); s.r
 // the same packet: applyPseudoRegs (ours), the widescreen-HUD rewrite (ours), and the backend's
 // own parse. Which one owns the time has never been measured.
 std::atomic<unsigned long long> g_gsProfPseudoNs{0}, g_gsProfWsHudNs{0}, g_gsProfBackendNs{0}, g_gsProfCalls{0};
+// [gsprof] our own GS parse (GS::processGIFPacket via the arbiter). guestprof's gif= counter is
+// per-guest-thread and this runs on GsThread, so gif=0 in every log said nothing about it.
+std::atomic<unsigned long long> g_gsProfOursNs{0}, g_gsProfOursCalls{0};
 bool gsProfOn() { static const bool v = envOn("PS2X_GSPROF"); return v; }
 static thread_local bool t_suppressed = false;
 void setSuppressed(bool on) { t_suppressed = on; }
@@ -1832,10 +1835,13 @@ void onSwap()
                 static unsigned long long pp = 0, pw = 0, pb = 0, pc = 0;
                 const unsigned long long a1 = g_gsProfPseudoNs.load(), b1 = g_gsProfWsHudNs.load(),
                                          c1 = g_gsProfBackendNs.load(), d1 = g_gsProfCalls.load();
-                std::fprintf(stderr, " | gsprof ms/s: pseudoRegs %.1f wsHud %.1f backendParse %.1f (%.0f calls/s)",
+                static unsigned long long po = 0, poc = 0;
+                const unsigned long long o1 = g_gsProfOursNs.load(), o2 = g_gsProfOursCalls.load();
+                std::fprintf(stderr, " | gsprof ms/s: pseudoRegs %.1f wsHud %.1f backendParse %.1f (%.0f calls/s) ourParse %.1f (%.0f calls/s)",
                              double(a1 - pp) / 1e6 / dt, double(b1 - pw) / 1e6 / dt,
-                             double(c1 - pb) / 1e6 / dt, double(d1 - pc) / dt);
-                pp = a1; pw = b1; pb = c1; pc = d1;
+                             double(c1 - pb) / 1e6 / dt, double(d1 - pc) / dt,
+                             double(o1 - po) / 1e6 / dt, double(o2 - poc) / dt);
+                pp = a1; pw = b1; pb = c1; pc = d1; po = o1; poc = o2;
             }
             {   // [pgswait2] the same blocking, split by thread: WHICH unit of the pipeline is stalling?
                 static unsigned long long pby[4][3] = {};

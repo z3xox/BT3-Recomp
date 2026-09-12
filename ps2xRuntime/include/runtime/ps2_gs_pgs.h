@@ -34,6 +34,7 @@ void privWrite(uint32_t regOff, uint64_t value, GSRegisters *regs);
 void setRegs(GSRegisters *regs);
 // The DISPFB1 flip as it passes through stage 2 (stream order); the swap scans out this buffer.
 void streamFlip(uint64_t dispfb1);
+bool gsProfOn();   // [gsprof]
 // Called at the frame swap (GsGpuRenderer::swapFrame): flush, scan out, read the frame back for the present thread.
 void onSwap();
 // [pgsfit] Present thread: the size the frame is drawn at on screen. Auto scanout resolution picks the smallest 2x/4x
@@ -58,6 +59,7 @@ inline void setSuppressed(bool) {}
 inline void privWrite(uint32_t, uint64_t, GSRegisters *) {}
 inline void setRegs(GSRegisters *) {}
 inline void streamFlip(uint64_t) {}
+inline bool gsProfOn() { return false; }
 inline void onSwap() {}
 inline void setPresentSize(uint32_t, uint32_t) {}
 inline bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }

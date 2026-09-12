@@ -2327,6 +2327,9 @@ void ps2xRunPreSwapGsApply()
     }
 }
 
+namespace ps2x_pgs {   // [gsprof] counters live in ps2_gs_pgs.cpp
+extern std::atomic<unsigned long long> g_gsProfOursNs, g_gsProfOursCalls;
+}
 extern "C" void ps2x_pgs_set_thread_tag(int tag);   // [pgswait2] Granite/vulkan/fence.cpp
 
 void PS2Memory::ensureKickWorker()
@@ -2484,7 +2487,17 @@ void PS2Memory::stage2Loop()
                 }
                 flush();
                 ps2x_pgs::setSuppressed(true);
-                for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);
+                {   // [gsprof] time OUR parse: is it running at all under EXCLUSIVE, and what does it cost?
+                    const bool prof = ps2x_pgs::gsProfOn();
+                    const auto to = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);
+                    if (prof)
+                    {
+                        ps2x_pgs::g_gsProfOursNs.fetch_add((unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - to).count(), std::memory_order_relaxed);
+                        ps2x_pgs::g_gsProfOursCalls.fetch_add(it.pkts.size(), std::memory_order_relaxed);
+                    }
+                }
                 ps2x_pgs::setSuppressed(false);
             }
             else for (const auto &pkt : it.pkts) m_gifArbiter->process(pkt);

@@ -567,6 +567,24 @@ if (APPLE AND NOT PS2X_FORCE_PGS)
     set(PS2X_DISABLE_PGS ON)
     set(PS2X_PGS_SKIP_REASON "not supported on macOS (Granite needs clock_nanosleep)")
 endif()
+# [pgs submodule] Fetch it ourselves rather than requiring every clone to remember
+# --recursive. Without this a plain `git clone` + build produces a runner with NO
+# paraLLEl-GS renderer and only a STATUS line to say so, which is easy to miss and
+# very expensive to discover later. git is already a hard build requirement here (the
+# raylib 5.5 patch below is applied with `git apply`), so leaning on it costs nothing.
+# safe.directory='*' is passed with -c so we never write to the user's real gitconfig.
+if (NOT EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS
+    AND EXISTS "${CMAKE_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    message(STATUS "[pgs] paraLLEl-GS checkout missing -- initialising submodules")
+    execute_process(COMMAND git -c safe.directory=* -C "${CMAKE_SOURCE_DIR}"
+                            submodule update --init --recursive
+                            ps2xRuntime/third_party/parallel-gs
+                    RESULT_VARIABLE _pgs_sub OUTPUT_VARIABLE _pgs_subout ERROR_VARIABLE _pgs_subout)
+    if (NOT _pgs_sub EQUAL 0)
+        message(WARNING "[pgs] could not initialise the paraLLEl-GS submodule:\n${_pgs_subout}")
+    endif()
+endif()
+
 if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
     # [framectx] Granite's frame-context ring defaults to 2, which is FLUSH-depth not frame-depth:
     # paraLLEl-GS calls flush_submit ~8x per frame at BT3's packet rate and each advance blocks
@@ -614,7 +632,16 @@ else()
     else()
         set(_pgs_why "no checkout at ${PS2X_PGS_DIR}")
     endif()
-    message(STATUS "[pgs] paraLLEl-GS backend not built (${_pgs_why})")
+    if (PS2X_DISABLE_PGS OR PS2X_PGS_SKIP_REASON)
+        message(STATUS "[pgs] paraLLEl-GS backend not built (${_pgs_why})")
+    else()
+        # Not fatal -- the software/GL path still builds -- but this is the renderer, and
+        # the old STATUS line scrolled past unnoticed in a wall of configure output.
+        message(WARNING "[pgs] paraLLEl-GS backend NOT BUILT (${_pgs_why}).\n"
+                        "The runner will have no paraLLEl-GS renderer. Fix the checkout with:\n"
+                        "    git -C \"${CMAKE_SOURCE_DIR}\" submodule update --init --recursive\n"
+                        "or configure with -DPS2X_DISABLE_PGS=ON to build without it deliberately.")
+    endif()
 endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE

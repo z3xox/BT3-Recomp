@@ -1583,6 +1583,12 @@ bool enabled()
 bool packMode() { static const bool p = envOn("PS2X_PGS") && envOn("PS2X_PGS_PACK"); return p; }
 bool coalesce() { static const bool c = envOn("PS2X_PGS_COALESCE") && !packMode(); return c; }   // pack mode needs per-packet order
 void setGs(GS *gs) { State &s = st(); std::lock_guard<std::mutex> lk(s.mtx); s.replacer.gs = gs; }
+// [gsprof] PS2X_GSPROF=1: split the gifTransfer body. It is 83% of GsThread, which is the
+// busiest unit in the pipeline (689 ms/s of a 23.8 ms swap), and it contains up to THREE walks of
+// the same packet: applyPseudoRegs (ours), the widescreen-HUD rewrite (ours), and the backend's
+// own parse. Which one owns the time has never been measured.
+std::atomic<unsigned long long> g_gsProfPseudoNs{0}, g_gsProfWsHudNs{0}, g_gsProfBackendNs{0}, g_gsProfCalls{0};
+bool gsProfOn() { static const bool v = envOn("PS2X_GSPROF"); return v; }
 static thread_local bool t_suppressed = false;
 void setSuppressed(bool on) { t_suppressed = on; }
 bool exclusive() { static const bool ex = envOn("PS2X_PGS_EXCLUSIVE") && !packMode(); return ex; }   // pack mode keeps our (state-only) parse
@@ -1595,7 +1601,17 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
     if (!initLocked(s)) return false;
     const auto t0 = std::chrono::steady_clock::now();
     if (g_packFlushReq.exchange(0)) { s.iface.invalidate_all_cached_textures(); std::fprintf(stderr, "[pgs] texture replacement %s: cached textures dropped\n", g_packOn.load() ? "ON" : "OFF"); }   // [pgslive]
-    if (exclusive()) applyPseudoRegsLocked(s, data, size);
+    const bool prof = gsProfOn();
+    if (prof) g_gsProfCalls.fetch_add(1, std::memory_order_relaxed);
+    if (exclusive())
+    {
+        const auto tp = std::chrono::steady_clock::now();
+        applyPseudoRegsLocked(s, data, size);
+        if (prof) g_gsProfPseudoNs.fetch_add((unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tp).count(), std::memory_order_relaxed);
+    }
+    // [gsprof] clock reads only when profiling: gifTransfer runs ~450k times/s in a fight
+    const auto tws = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {   // [pgswshud] widescreen HUD squeeze (PS2X_PGS_WSHUD=0 disables): rewrite HUD vertex X before the backend parses
         static const bool s_wshud = [](){ const char *v = std::getenv("PS2X_PGS_WSHUD"); return !(v && v[0] == '0'); }();
         static const bool s_inkShiftEnvOn = [](){ const char *v = std::getenv("PS2X_PGS_INKSHIFT"); return v && v[0] && std::atof(v) > 0.0; }();
@@ -1609,7 +1625,12 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
             data = xdata; size = xsize;
         }
     }
+    if (prof) g_gsProfWsHudNs.fetch_add((unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - tws).count(), std::memory_order_relaxed);
+    const auto tbe = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     s.iface.gif_transfer(pathId - 1u, data, size);
+    if (prof) g_gsProfBackendNs.fetch_add((unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - tbe).count(), std::memory_order_relaxed);
     {   // [vramprobe] PS2X_PGS_VRAMPROBE=1: after the depth-mask pass, print the frame's alpha per column and the Z top bytes
         static const bool s_probe = envOn("PS2X_PGS_VRAMPROBE"); static unsigned s_n = 0;
         if (s_probe && s_n < 4 && g_pgsProbeReq.exchange(0) != 0)
@@ -1794,6 +1815,16 @@ void onSwap()
                          double(w - pw) / 1e6 / dt, double(i - pi) / 1e6 / dt,
                          (unsigned long long) g_pgsQueueIdleCalls.load(std::memory_order_relaxed));
             pw = w; pc = c; pb = b; pi = i; pic = ic; pfw = fw; pfc = fc; pfb = fb; psw = sw2; psc = sc;
+            if (gsProfOn())
+            {   // [gsprof] where the gifTransfer body goes
+                static unsigned long long pp = 0, pw = 0, pb = 0, pc = 0;
+                const unsigned long long a1 = g_gsProfPseudoNs.load(), b1 = g_gsProfWsHudNs.load(),
+                                         c1 = g_gsProfBackendNs.load(), d1 = g_gsProfCalls.load();
+                std::fprintf(stderr, " | gsprof ms/s: pseudoRegs %.1f wsHud %.1f backendParse %.1f (%.0f calls/s)",
+                             double(a1 - pp) / 1e6 / dt, double(b1 - pw) / 1e6 / dt,
+                             double(c1 - pb) / 1e6 / dt, double(d1 - pc) / dt);
+                pp = a1; pw = b1; pb = c1; pc = d1;
+            }
             {   // [pgswait2] the same blocking, split by thread: WHICH unit of the pipeline is stalling?
                 static unsigned long long pby[4][3] = {};
                 static const char *kTag[4] = { "other", "game", "kick", "gs" };

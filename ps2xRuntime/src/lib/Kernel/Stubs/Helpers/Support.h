@@ -2279,7 +2279,7 @@ namespace
         // 3 = 2 + split applyGsDispEnv so no drain is left in the swap path
         static const int s_mode = [](){ const char *v = std::getenv("PS2X_ASYNC_GSQUEUE");
                                         const int m = v && v[0] ? std::atoi(v) : 0;
-                                        std::fprintf(stderr, "[gsqueue] PS2X_ASYNC_GSQUEUE=%d (0 = drain, 1 = queue all [BROKEN], 2 = queue non-display [no-op], 3 = no drain)\n", m);
+                                        std::fprintf(stderr, "[gsqueue] PS2X_ASYNC_GSQUEUE=%d (0 = drain, 1 = queue all [BROKEN], 2 = queue non-display [no-op], 3 = no drain [BROKEN], 6 = flip only, no reg writes)\n", m);
                                         return m; }();
         return s_mode;
     }
@@ -2337,6 +2337,27 @@ namespace
             return;
         const GsDispEnvMem e = env;
         ps2xNotePmodeWrite(2, (unsigned long long)e.pmode);   // [pmodesrc]
+        if (gsQueueMode() == 6 && PS2Memory::asyncKickEnabled())
+        {   // [gsqueue6] Do not write the display registers here AT ALL -- only carry the flip.
+            //
+            // The premise, from the [pmodesrc] probe: the value actually presented is written by
+            // NEITHER this stub NOR our GS parse. Per second in a fight the parse wrote
+            // 0x1bf000001ff0000 x300 and this stub wrote 0x8007 x600, yet the presented PMODE was
+            // 0x7f23 -- the game's own memory-bus store (ps2_memory.cpp:951-964), which lands last
+            // every frame. If the bus store owns these registers, this stub's copy is redundant,
+            // and the drain that exists to order it against the other two writers is protecting
+            // nothing. The flip hook still has to be stream-ordered, so it is still queued.
+            //
+            // If the picture stays correct, the per-frame drain in splitscreen (3.40 ms/frame, one
+            // per frame, which empties the pipeline and idles KickWorker 4.81 ms/frame and
+            // GsThread 3.28) can go without touching display coherence at all.
+            const unsigned long long dispfb = e.dispfb;
+            PS2Memory::KickJob j;
+            j.kind = PS2Memory::KickJob::GsApply;
+            j.fn = [dispfb]() { ps2xGsDisplayFlipHook(dispfb); };
+            runtime->memory().enqueueKickJob(std::move(j));
+            return;
+        }
         if (gsQueueMode() == 3 && PS2Memory::asyncKickEnabled())
         {   // [gsqueue3] No drain, and the write stays exactly where it was in time: regs inline (the
             // scanout registers the presenter reads), flip hook queued (streamFlip must be stream

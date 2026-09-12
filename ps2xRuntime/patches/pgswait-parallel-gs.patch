@@ -75,7 +75,7 @@ index 10120fb..f484ce0 100644
  	if (debug_mode.deterministic_timeline_query)
  		renderer.wait_timeline(value);
 diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
-index 29452b2..0a59919 100644
+index 29452b2..a16ff63 100644
 --- a/gs/gs_renderer.cpp
 +++ b/gs/gs_renderer.cpp
 @@ -4,6 +4,9 @@
@@ -106,7 +106,7 @@ index 29452b2..0a59919 100644
  void GSRenderer::flush_submit(uint64_t value)
  {
  	if (!device)
-@@ -1212,7 +1219,26 @@ void GSRenderer::flush_submit(uint64_t value)
+@@ -1212,7 +1219,32 @@ void GSRenderer::flush_submit(uint64_t value)
  
  	// If we have a timeline trace, we'd like it to be somewhat readable.
  	// Only do garbage collection at frame boundaries.
@@ -124,8 +124,14 @@ index 29452b2..0a59919 100644
 +	g_pgsFlushSubmits.fetch_add(1, std::memory_order_relaxed);
 +	if (frame_boundary_flush)
 +		g_pgsFlushBoundary.fetch_add(1, std::memory_order_relaxed);
++	// DEFAULT ON since 2026-09-12, user-measured on four configurations with no regression and no
++	// accumulation over a long fight (GPU/copies/CopyVRAM/TextureUpload all flat window to window):
++	//   3x 1P vs COM   52.3 -> 58.8 swaps/s   (holds 60)
++	//   4x 1P vs COM   39.4 -> 41.6           (now GPU-saturated at 21.3 ms/swap)
++	//   splitscreen 2x 45.6 -> 49.2, and the spread collapses from 41-55 to 46-51
++	// PS2X_PGS_GCFRAME=0 restores an advance on every flush_submit.
 +	static const bool s_gcframe = [](){ const char *v = getenv("PS2X_PGS_GCFRAME");
-+		const bool on = v && v[0] && v[0] != '0';
++		const bool on = !(v && v[0] == '0');
 +		fprintf(stderr, "[gcframe] PS2X_PGS_GCFRAME=%d (1 = advance the frame context only at frame boundaries)\n", on ? 1 : 0);
 +		return on; }();
 +	const bool advance = !s_gcframe || frame_boundary_flush;
@@ -134,7 +140,7 @@ index 29452b2..0a59919 100644
  		device->next_frame_context();
  
  	log_timestamps();
-@@ -1358,6 +1384,118 @@ Vulkan::ImageHandle GSRenderer::copy_cached_texture(const Vulkan::Image &img, co
+@@ -1358,6 +1390,118 @@ Vulkan::ImageHandle GSRenderer::copy_cached_texture(const Vulkan::Image &img, co
  	return copy_img;
  }
  
@@ -253,7 +259,7 @@ index 29452b2..0a59919 100644
  Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &desc)
  {
  	if (!device)
-@@ -1445,6 +1583,8 @@ Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &d
+@@ -1445,6 +1589,8 @@ Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &d
  		up.replaced = replaced;
  		texture_uploads.push_back(std::move(up));
  	}

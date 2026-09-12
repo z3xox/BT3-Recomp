@@ -1603,7 +1603,9 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
         // packet in EXCLUSIVE mode, the mode whose banner says "our GS parse skipped". Returning true
         // is the honest answer. Behind a flag because our parse also maintains the GS state mirror
         // (runtime->gs()), and anything still reading that in exclusive mode would go stale.
-        static const bool s_skip = envOn("PS2X_PGS_SKIPOURPARSE");
+        static const bool s_skip = [](){ const bool on = envOn("PS2X_PGS_SKIPOURPARSE");
+            std::fprintf(stderr, "[skipourparse] PS2X_PGS_SKIPOURPARSE=%d (1 = our GS parse really is skipped in EXCLUSIVE)\n", on ? 1 : 0);
+            return on; }();
         return s_skip;
     }
     State &s = st();

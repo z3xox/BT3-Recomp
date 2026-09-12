@@ -567,6 +567,46 @@ if (APPLE AND NOT PS2X_FORCE_PGS)
     set(PS2X_DISABLE_PGS ON)
     set(PS2X_PGS_SKIP_REASON "not supported on macOS (Granite needs clock_nanosleep)")
 endif()
+# [pgswait patches] This branch's diagnostics live in the paraLLEl-GS + Granite submodules, which
+# are carried as patch files rather than commits (Granite points at upstream Themaister/Granite).
+# Applying them by hand is three commands with easy-to-miss relative paths -- notably
+# `git -C Granite apply ../../../...`, three levels, not two -- and getting it wrong fails the
+# BUILD at link time with undefined pgswait symbols, or silently drops the instrumentation.
+# So apply them here, the same way main applies granite-framectx.
+#
+# Detects the EFFECT, not the patch, and never resets anything: if the marker symbol is already
+# present the patch is skipped. A patch that will not apply is a WARNING, not an error -- the
+# runtime references these symbols, so a genuinely broken state still fails loudly at link.
+foreach(_p IN ITEMS "parallel-gs:${PS2X_PGS_DIR}:pgswait-parallel-gs.patch:g_pgsFlushSubmits:gs/gs_renderer.cpp"
+                    "granite:${PS2X_PGS_DIR}/Granite:pgswait-granite.patch:pgsWaitNote:vulkan/fence.cpp")
+    string(REPLACE ":" ";" _pl "${_p}")
+    list(GET _pl 0 _pname)
+    list(GET _pl 1 _pdir)
+    list(GET _pl 2 _pfile)
+    list(GET _pl 3 _pmark)
+    list(GET _pl 4 _pprobe)
+    set(_ppatch "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_pfile}")
+    if (EXISTS "${_pdir}/${_pprobe}" AND EXISTS "${_ppatch}")
+        file(READ "${_pdir}/${_pprobe}" _psrc)
+        string(FIND "${_psrc}" "${_pmark}" _phas)
+        unset(_psrc)
+        if (_phas EQUAL -1)
+            execute_process(COMMAND git -c safe.directory=* -C "${_pdir}" apply --ignore-whitespace "${_ppatch}"
+                            RESULT_VARIABLE _pres ERROR_VARIABLE _perr)
+            if (_pres EQUAL 0)
+                message(STATUS "[pgswait] ${_pname} patch applied")
+            else()
+                message(WARNING "[pgswait] ${_pname} patch did NOT apply to ${_pdir}.\n"
+                                "Reset and retry by hand:\n"
+                                "    git -C \"${_pdir}\" checkout -- .\n"
+                                "    git -C \"${_pdir}\" apply \"${_ppatch}\"\n${_perr}")
+            endif()
+        else()
+            message(STATUS "[pgswait] ${_pname} patch already applied")
+        endif()
+    endif()
+endforeach()
+
 if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
     add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs inside the baseline container: configures, builds, and bundles the
 # deploy stage. Invoked by tools/release/build.sh with:
-#   $1 = repo source root (mounted read-only)
+#   $1 = repo source root (mounted rw: the ISO step and the submodule init both write to it)
 #   $2 = runner build dir  (mounted rw, persistent _deps/cache)
 #   $3 = launcher build dir (mounted rw)
 #   $4 = output dir         (mounted rw; receives stage/ and floor-report)
@@ -20,6 +20,47 @@ export CCACHE_MAXSIZE=8G
 log() { echo "== $*"; }
 
 mkdir -p "$OUT/stage/lib" "$OUT/stage/savedata/BASLUS-21678DBZT3" "$OUT/stage/logs"
+
+# ---- 0. submodules ---------------------------------------------------------
+# Nothing here used to init them, so a non-recursive clone built a runner with NO
+# paraLLEl-GS backend at all and said almost nothing about it -- the CMake check is
+# `if (EXISTS .../parallel-gs/CMakeLists.txt)`, which just silently skips. A release
+# artefact quietly missing the renderer is the worst possible way to find out, so
+# init them here and refuse to build if the backend is still absent.
+#
+# safe.directory='*' because the container runs as the host UID against a bind mount;
+# passing it with -c avoids writing to the user's real gitconfig.
+PGS_DIR="$SRC/ps2xRuntime/third_party/parallel-gs"
+if [[ "${PS2X_DISABLE_PGS:-0}" == "1" ]]; then
+    log "PS2X_DISABLE_PGS=1: skipping the paraLLEl-GS submodule check"
+else
+    if [[ -e "$SRC/.git" && -f "$SRC/.gitmodules" ]]; then
+        log "initialising submodules"
+        git -C "$SRC" -c safe.directory='*' submodule update --init --recursive
+    else
+        log "no git checkout at $SRC (tarball build?) -- skipping submodule init"
+    fi
+    if [[ ! -f "$PGS_DIR/CMakeLists.txt" || ! -f "$PGS_DIR/Granite/vulkan/device.cpp" ]]; then
+        cat >&2 <<EOF
+
+ERROR: the paraLLEl-GS backend is missing from the source tree.
+
+  expected: $PGS_DIR/CMakeLists.txt
+            $PGS_DIR/Granite/vulkan/device.cpp
+
+CMake skips the backend silently when these are absent, so the build would have
+succeeded and produced a runner with no paraLLEl-GS renderer. Fix the checkout:
+
+    git -C <repo> submodule update --init --recursive
+
+or clone with --recursive. To build deliberately without the backend, re-run with
+PS2X_DISABLE_PGS=1.
+
+EOF
+        exit 1
+    fi
+    log "paraLLEl-GS submodule present"
+fi
 
 # ---- 0. generate the player tables from the ISO (optional) ------------------
 # A fresh clone has no game code: games/bt3/setup.py --gen-only extracts the

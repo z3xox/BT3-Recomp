@@ -586,36 +586,49 @@ if (NOT EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS
 endif()
 
 if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
-    # [framectx] Granite's frame-context ring defaults to 2, which is FLUSH-depth not frame-depth:
-    # paraLLEl-GS calls flush_submit ~8x per frame at BT3's packet rate and each advance blocks
-    # until the GPU retires the context it reuses. Depth 16 is worth ~7 fps in a fight. The change
-    # lives in the Granite submodule (upstream Themaister/Granite, not a fork we can commit to), so
-    # apply it here rather than making every clone run a git command by hand.
+    # [pgs patches] Two upstream fixes that live in the paraLLEl-GS / Granite submodules. Both
+    # point at repos we cannot commit to (Granite is upstream Themaister/Granite), so they are
+    # carried as patch files and applied here rather than making every clone run git by hand.
     #
-    # Detects the EFFECT, not the patch: if PS2X_PGS_FRAMECTX is already in device.cpp -- whether
-    # from this patch or from the fuller pgswait diagnostic patch used on dev branches -- do
-    # nothing. That matters because a --check-and-reset scheme would happily throw away the
-    # pgswait instrumentation. This never resets anything; worst case it declines to act.
-    set(_gr_dir "${PS2X_PGS_DIR}/Granite")
-    set(_gr_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/granite-framectx.patch")
-    if (EXISTS "${_gr_dir}/vulkan/device.cpp" AND EXISTS "${_gr_patch}")
-        file(READ "${_gr_dir}/vulkan/device.cpp" _gr_src)
-        string(FIND "${_gr_src}" "PS2X_PGS_FRAMECTX" _gr_has)
-        unset(_gr_src)
-        if (_gr_has EQUAL -1)
-            execute_process(COMMAND git -C "${_gr_dir}" apply --ignore-whitespace "${_gr_patch}"
-                            RESULT_VARIABLE _gr_apply ERROR_VARIABLE _gr_err)
-            if (_gr_apply EQUAL 0)
-                message(STATUS "granite framectx patch applied (frame-context ring 2 -> 16; PS2X_PGS_FRAMECTX overrides)")
+    #   granite-framectx     frame-context ring 2 -> 16. The ring is FLUSH-depth, not frame-depth,
+    #                        and paraLLEl-GS flushes ~7x per frame under BT3's packet rate.
+    #   parallel-gs-gcframe  advance that ring only at the REAL frame boundary. flush_submit is
+    #                        not one: 6 of those 7 calls are FlushReason::HostAccess sync points,
+    #                        and each advance blocked in Device::PerFrame::wait. Worth 3x 1P-vs-COM
+    #                        52.3 -> 58.8 fps, splitscreen 45.6 -> 49.2 with a much tighter spread.
+    #
+    # Each entry detects the EFFECT, not the patch: if the marker is already in the probe file --
+    # from this patch or from the fuller pgswait diagnostic patch used on dev branches -- it is
+    # skipped, and nothing is ever reset. Failure is a WARNING: both are pure performance, so a
+    # checkout they cannot patch should still build and run, just slower.
+    foreach(_e IN ITEMS "granite-framectx:${PS2X_PGS_DIR}/Granite:granite-framectx.patch:PS2X_PGS_FRAMECTX:vulkan/device.cpp"
+                        "gcframe:${PS2X_PGS_DIR}:parallel-gs-gcframe.patch:frame_boundary_flush:gs/gs_renderer.hpp")
+        string(REPLACE ":" ";" _el "${_e}")
+        list(GET _el 0 _ename)
+        list(GET _el 1 _edir)
+        list(GET _el 2 _efile)
+        list(GET _el 3 _emark)
+        list(GET _el 4 _eprobe)
+        set(_epatch "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_efile}")
+        if (EXISTS "${_edir}/${_eprobe}" AND EXISTS "${_epatch}")
+            file(READ "${_edir}/${_eprobe}" _esrc)
+            string(FIND "${_esrc}" "${_emark}" _ehas)
+            unset(_esrc)
+            if (_ehas EQUAL -1)
+                execute_process(COMMAND git -c safe.directory=* -C "${_edir}" apply --ignore-whitespace "${_epatch}"
+                                RESULT_VARIABLE _eres ERROR_VARIABLE _eerr)
+                if (_eres EQUAL 0)
+                    message(STATUS "[pgs] ${_ename} patch applied")
+                else()
+                    message(WARNING "[pgs] ${_ename} patch did not apply to ${_edir} -- the backend still builds, just slower. Apply by hand:\n"
+                                    "    git -C \"${_edir}\" apply \"${_epatch}\"\n${_eerr}")
+                endif()
             else()
-                # Not fatal: the backend still builds at upstream depth 2, just slower.
-                message(WARNING "granite framectx patch did not apply to ${_gr_dir} -- the paraLLEl-GS backend will run at the upstream ring depth of 2 (worth ~7 fps in a fight). Apply it by hand:\n"
-                                "    git -C \"${_gr_dir}\" apply \"${_gr_patch}\"\n${_gr_err}")
+                message(STATUS "[pgs] ${_ename}: already present, nothing to do")
             endif()
-        else()
-            message(STATUS "granite framectx: PS2X_PGS_FRAMECTX already present, nothing to do")
         endif()
-    endif()
+    endforeach()
+
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
     add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
     target_sources(ps2_runtime PRIVATE src/lib/ps2_gs_pgs.cpp)

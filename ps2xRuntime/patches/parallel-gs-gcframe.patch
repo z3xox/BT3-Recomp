@@ -1,0 +1,59 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 10120fb..d3d70b2 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -4316,6 +4316,7 @@ void GSInterface::flush()
+ {
+ 	flush_pending_transfer(true);
+ 	uint64_t value = tracker.mark_submission_timeline();
++	renderer.frame_boundary_flush = true;   // [gcframe] this one IS the frame boundary
+ 	renderer.flush_submit(value);
+ 	if (debug_mode.deterministic_timeline_query)
+ 		renderer.wait_timeline(value);
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 29452b2..125c84c 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-License-Identifier: LGPL-3.0+
+ 
+ #include "gs_renderer.hpp"
++#include <cstdlib>
+ #include "logging.hpp"
+ #include "gs_interface.hpp"
+ #include "gs_registers_debug.hpp"
+@@ -1212,7 +1213,21 @@ void GSRenderer::flush_submit(uint64_t value)
+ 
+ 	// If we have a timeline trace, we'd like it to be somewhat readable.
+ 	// Only do garbage collection at frame boundaries.
+-	if (!device->get_system_handles().timeline_trace_file)
++	//
++	// [gcframe] BT3-Recomp: flush_submit is NOT a frame boundary in this integration. Measured at
++	// 7.0 calls per frame -- one from GSInterface::flush() (the real boundary) and the rest from
++	// FlushReason::HostAccess sync points, where the CPU needs VRAM the GPU may still be writing.
++	// Every advance waits in Device::PerFrame::wait for the context it reuses, which cost 4.3 ms
++	// per swap of blocking against a GPU that was 41% idle. Advancing only at the true boundary:
++	//   3x  1P vs COM   52.3 -> 58.8 fps (holds 60)     4x  39.4 -> 41.6
++	//   splitscreen 2x  45.6 -> 49.2, window spread 41-55 -> 46-51
++	// No accumulation over a long fight (GPU, copies, CopyVRAM, TextureUpload all flat).
++	// PS2X_PGS_GCFRAME=0 restores an advance on every flush_submit.
++	static const bool s_gcframe = [](){ const char *v = getenv("PS2X_PGS_GCFRAME");
++		return !(v && v[0] == '0'); }();
++	const bool advance = !s_gcframe || frame_boundary_flush;
++	frame_boundary_flush = false;
++	if (!device->get_system_handles().timeline_trace_file && advance)
+ 		device->next_frame_context();
+ 
+ 	log_timestamps();
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index efb7bee..b6a444f 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -314,6 +314,7 @@ public:
+ 
+ 	// Submit to GPU and signal when done.
+ 	void flush_submit(uint64_t timeline);
++	bool frame_boundary_flush = false;   // [gcframe] set by GSInterface::flush()
+ 
+ 	// Wait until timeline reaches value. After waiting, it may be safe to read from host VRAM.
+ 	void wait_timeline(uint64_t value);

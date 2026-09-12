@@ -1460,8 +1460,23 @@ void applyPseudoRegsLocked(State &s, const uint8_t *data, size_t size)
                         uint64_t v, a; std::memcpy(&v, q, 8); std::memcpy(&a, q + 8, 8);
                         switch (a & 0xFFu)
                         {
-                        case 0x41: r->pmode = v; s.privHist[0x00 >> 4]++; s.pseudoSeen++; break;
-                        case 0x42: r->smode2 = v; s.privHist[0x20 >> 4]++; s.pseudoSeen++; break;
+                        case 0x41:
+                            // [pmodeguard] This path writes 0x1bf000001ff0000 about thirty times a
+                            // second -- not a PMODE at all. PMODE has 16 meaningful bits (EN1, EN2,
+                            // CRTMD, MMOD, AMOD, SLBG, ALP); that value is a DISPLAY-shaped one in
+                            // the PMODE slot. It is harmless only because the game's own bus store
+                            // (0x7f23, the value actually presented) lands after it once the kick
+                            // queue is drained -- reorder anything on this path and the garbage
+                            // reaches the scanout as black and squished frames. Drop it at source.
+                            if (v <= 0xFFFFull) { r->pmode = v; }
+                            s.privHist[0x00 >> 4]++; s.pseudoSeen++; break;
+                        case 0x42:
+                            // [smode2guard] Same defect on SMODE2, which has four meaningful bits
+                            // (INT, FFMD, DPMS). This path writes 0x44 -- bit 6 is undefined -- and
+                            // it reaches the scanout as "640x224", i.e. half height. Same reason it
+                            // normally stays invisible: the drain lets the real writer land last.
+                            if (v <= 0xFull) { r->smode2 = v; }
+                            s.privHist[0x20 >> 4]++; s.pseudoSeen++; break;
                         case 0x59: r->dispfb1 = v; s.privHist[0x70 >> 4]++; s.pseudoSeen++; break;
                         case 0x5a: r->display1 = v; s.privHist[0x80 >> 4]++; s.pseudoSeen++; break;
                         case 0x5b: r->dispfb2 = v; s.privHist[0x90 >> 4]++; s.pseudoSeen++; break;

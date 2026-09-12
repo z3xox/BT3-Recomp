@@ -12,6 +12,8 @@
 #include <mutex>
 #include <vector>
 extern "C" void ps2xGsDisplayFlipHook(unsigned long long dispfb);   // [displatch] ps2_gs_gpu.cpp
+void ps2xSetPreSwapGsApply(std::function<void()> fn);   // [preswap] ps2_memory.cpp
+void ps2xNotePmodeWrite(int src, unsigned long long v);   // [pmodesrc] ps2_memory.cpp
 
 namespace
 {
@@ -2277,7 +2279,7 @@ namespace
         // 3 = 2 + split applyGsDispEnv so no drain is left in the swap path
         static const int s_mode = [](){ const char *v = std::getenv("PS2X_ASYNC_GSQUEUE");
                                         const int m = v && v[0] ? std::atoi(v) : 0;
-                                        std::fprintf(stderr, "[gsqueue] PS2X_ASYNC_GSQUEUE=%d (0 = drain, 1 = queue all [BROKEN], 2 = queue non-display)\n", m);
+                                        std::fprintf(stderr, "[gsqueue] PS2X_ASYNC_GSQUEUE=%d (0 = drain, 1 = queue all [BROKEN], 2 = queue non-display [no-op], 3 = no drain)\n", m);
                                         return m; }();
         return s_mode;
     }
@@ -2334,6 +2336,28 @@ namespace
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
         const GsDispEnvMem e = env;
+        ps2xNotePmodeWrite(2, (unsigned long long)e.pmode);   // [pmodesrc]
+        if (gsQueueMode() == 3 && PS2Memory::asyncKickEnabled())
+        {   // [gsqueue3] No drain, and the write stays exactly where it was in time: regs inline (the
+            // scanout registers the presenter reads), flip hook queued (streamFlip must be stream
+            // ordered). This is the 2026-09-12 mode 3 that flickered -- it only did so because the GS
+            // parse was writing a bogus PMODE (0x1bf000001ff0000, 30x/s) that the drain used to hide by
+            // letting the game's own bus store land after it. With [pmodeguard] rejecting that write at
+            // source there is nothing left for the drain to protect against here.
+            {
+                auto &regs = runtime->memory().gs();
+                regs.pmode = e.pmode;   regs.smode2 = e.smode2;
+                regs.dispfb1 = e.dispfb; regs.display1 = e.display;
+                regs.dispfb2 = e.dispfb; regs.display2 = e.display;
+                regs.bgcolor = e.bgcolor;
+            }
+            const unsigned long long dispfb = e.dispfb;
+            PS2Memory::KickJob j;
+            j.kind = PS2Memory::KickJob::GsApply;
+            j.fn = [dispfb]() { ps2xGsDisplayFlipHook(dispfb); };
+            runtime->memory().enqueueKickJob(std::move(j));
+            return;
+        }
         applyGsOnStream(runtime, [runtime, e]()
         {
             auto &regs = runtime->memory().gs();

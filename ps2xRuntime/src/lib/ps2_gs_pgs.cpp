@@ -25,6 +25,7 @@
 
 // [pgswait] defined in Granite fence.cpp / device.cpp: wall time spent BLOCKED on the GPU.
 // Declared at file scope (never inside an extern "C" body -- clang-cl rejects that).
+void ps2xNotePmodeWrite(int src, unsigned long long v);   // [pmodesrc]
 extern std::atomic<unsigned long long> g_pgsFenceWaitNs;
 extern std::atomic<unsigned long long> g_pgsFenceWaitCalls;
 extern std::atomic<unsigned long long> g_pgsFenceWaitBlocked;
@@ -1479,7 +1480,17 @@ void applyPseudoRegsLocked(State &s, const uint8_t *data, size_t size)
                         uint64_t v, a; std::memcpy(&v, q, 8); std::memcpy(&a, q + 8, 8);
                         switch (a & 0xFFu)
                         {
-                        case 0x41: r->pmode = v; s.privHist[0x00 >> 4]++; s.pseudoSeen++; break;
+                        case 0x41:
+                            // [pmodeguard] PMODE has 16 meaningful bits (EN1, EN2, CRTMD, MMOD, AMOD,
+                            // SLBG, ALP); anything above is reserved. This path was writing
+                            // 0x1bf000001ff0000 thirty times a second -- a DISPLAY-shaped value landing
+                            // in the PMODE slot. Harmless only because the game's own bus store
+                            // (0x7f23, the value actually presented) lands after it once the kick queue
+                            // is drained; remove the drain and this garbage reaches the scanout, which
+                            // is the black/squished flicker seen under GSQUEUE=1/3. Drop it at source.
+                            if (v <= 0xFFFFull) { r->pmode = v; ps2xNotePmodeWrite(1, v); }
+                            else                { ps2xNotePmodeWrite(3, v); }
+                            s.privHist[0x00 >> 4]++; s.pseudoSeen++; break;
                         case 0x42: r->smode2 = v; s.privHist[0x20 >> 4]++; s.pseudoSeen++; break;
                         case 0x59: r->dispfb1 = v; s.privHist[0x70 >> 4]++; s.pseudoSeen++; break;
                         case 0x5a: r->display1 = v; s.privHist[0x80 >> 4]++; s.pseudoSeen++; break;

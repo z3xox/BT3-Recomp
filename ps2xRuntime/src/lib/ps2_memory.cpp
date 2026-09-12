@@ -2269,6 +2269,64 @@ bool PS2Memory::asyncKickEnabled()
     return s_on;
 }
 
+// [preswap] PS2X_ASYNC_GSQUEUE=5: the sceGs display-env write does not need the kick queue
+// DRAINED -- it needs to be the LAST writer of the display registers before the present, which is
+// exactly where drain-then-apply happened to put it. The GS parse writes pmode ~1078x/s from the
+// packet stream (value 8007 here) while the stub writes it once a frame (7f23); mode 0 wins only
+// because the drain lets the stub go last. Queue it anywhere earlier (mode 1) and later parse
+// writes bury it. So: park the newest env and apply it on the GsThread immediately before
+// swapFrame, which is already a stream-ordered end-of-frame point (enqueueGpuSwapMarker ->
+// KickJob::SwapFrame -> stage2 kind 1). Same final state as mode 0, no wait.
+static std::mutex g_preSwapMtx;
+static std::function<void()> g_preSwapFn;
+// [pmodesrc] who writes PMODE, and with what? src 1 = GS parse (pseudo path), 2 = sceGs stub.
+void ps2xNotePmodeWrite(int src, unsigned long long v)
+{
+    static const bool on = [](){ const char *e = std::getenv("PS2X_PMODESRC"); return e && e[0] && e[0] != '0'; }();
+    if (!on) return;
+    static std::mutex mx; static std::map<std::pair<int,unsigned long long>, unsigned long> hist;
+    static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(mx);
+    ++hist[{src, v}];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - t0 >= std::chrono::seconds(10))
+    {
+        t0 = now;
+        std::fprintf(stderr, "[pmodesrc] 10s:");
+        for (auto &kv : hist) std::fprintf(stderr, " %s=0x%llx x%lu", kv.first.first == 1 ? "parse" : "stub", kv.first.second, kv.second);
+        std::fprintf(stderr, "\n"); hist.clear();
+    }
+}
+
+std::atomic<unsigned long> g_preSwapSet{0}, g_preSwapRun{0}, g_preSwapFired{0};   // [preswap] diag
+void ps2xSetPreSwapGsApply(std::function<void()> fn)
+{
+    g_preSwapSet.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_preSwapMtx);
+    g_preSwapFn = std::move(fn);   // last write of the frame wins, as with drain-then-apply
+}
+void ps2xRunPreSwapGsApply()
+{
+    g_preSwapRun.fetch_add(1, std::memory_order_relaxed);
+    std::function<void()> f;
+    { std::lock_guard<std::mutex> lk(g_preSwapMtx); f.swap(g_preSwapFn); }
+    if (f) { g_preSwapFired.fetch_add(1, std::memory_order_relaxed); f(); }
+    {   // [preswap] diag every 10 s
+        static const bool on = [](){ const char *v = std::getenv("PS2X_DRAINSITE"); return v && v[0] && v[0] != '0'; }();
+        static std::atomic<unsigned long long> t0{0};
+        if (on)
+        {
+            const unsigned long long now = (unsigned long long)std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            unsigned long long prev = t0.load(std::memory_order_relaxed);
+            if (prev == 0) t0.store(now, std::memory_order_relaxed);
+            else if (now - prev >= 10ull && t0.compare_exchange_strong(prev, now))
+                std::fprintf(stderr, "[preswap] 10s: set=%lu runPoints=%lu fired=%lu\n",
+                             g_preSwapSet.exchange(0), g_preSwapRun.exchange(0), g_preSwapFired.exchange(0));
+        }
+    }
+}
+
 extern "C" void ps2x_pgs_set_thread_tag(int tag);   // [pgswait2] Granite/vulkan/fence.cpp
 
 void PS2Memory::ensureKickWorker()

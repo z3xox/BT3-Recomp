@@ -1,5 +1,5 @@
 diff --git a/vulkan/device.cpp b/vulkan/device.cpp
-index 4ee4f963..569661d3 100644
+index 4ee4f963..8ab39fd0 100644
 --- a/vulkan/device.cpp
 +++ b/vulkan/device.cpp
 @@ -31,6 +31,52 @@
@@ -55,7 +55,7 @@ index 4ee4f963..569661d3 100644
  #include <string.h>
  #include <stdlib.h>
  
-@@ -972,7 +1018,18 @@ void Device::set_context(const Context &context)
+@@ -972,7 +1018,30 @@ void Device::set_context(const Context &context)
  	init_workarounds();
  	init_pipeline_cache();
  	init_timeline_semaphores();
@@ -64,18 +64,30 @@ index 4ee4f963..569661d3 100644
 +		// Granite double-buffers CPU/GPU, so the CPU cannot begin frame N+2 until the GPU retires N.
 +		// That is exactly what blocks in Device::PerFrame::wait -- measured ~2.9 ms/swap in a BT3
 +		// fight and INVARIANT to the frame cap (2.76 ms at 30 fps vs 2.90 at 60), i.e. the CPU waits
-+		// because the GPU makes it, not because it has slack. 3 buys a frame of run-ahead.
++		// because the GPU makes it, not because it has slack.
++		//
++		// 2026-09-12: the ring is NOT frame-depth, it is FLUSH-depth, and I clamped it to 4 on the
++		// wrong assumption. Measured in a 1P-vs-COM fight: FRAMECTX 429 calls/s at 52 swaps/s = 8.2
++		// advances PER FRAME, of which 91/s (1.75 per frame) block, for 1-10.7 ms each -- the tail
++		// that shows up as tiny 160-256 byte packets taking 10 ms. With depth 2 an advance waits on
++		// work submitted two flushes ago, a quarter of a frame; depth 4 is still sub-frame, which is
++		// why the earlier PS2X_PGS_FRAMECTX=3 test was a null result. To cover a frame the ring has
++		// to exceed the flushes per frame, so allow up to 32. The GPU is only 40% busy here (7.6 ms
++		// of a 19.2 ms swap), so this is latency, not throughput.
++		//
++		// Cost of depth: PerFrame::begin() is also where deferred Vulkan destruction happens, so
++		// resources are retired N advances later -- at 8 advances/frame, depth 16 is ~2 frames.
 +		const char *v = getenv("PS2X_PGS_FRAMECTX");
 +		unsigned n = (v && v[0]) ? unsigned(atoi(v)) : 2u;
 +		if (n < 2u) n = 2u;
-+		if (n > 4u) n = 4u;
++		if (n > 32u) n = 32u;
 +		LOGI("[pgswait] frame contexts = %u (PS2X_PGS_FRAMECTX, default 2)\n", n);
 +		init_frame_contexts(n);
 +	}
  
  	managers.memory.init(this);
  	managers.semaphore.init(this);
-@@ -1768,7 +1825,7 @@ VkResult Device::submit_batches(Helper::BatchComposer &composer, VkQueue queue,
+@@ -1768,7 +1837,7 @@ VkResult Device::submit_batches(Helper::BatchComposer &composer, VkQueue queue,
  	VkResult result = queue_submit(queue, uint32_t(submits.size()), submits.data(), fence);
  
  	if (ImplementationQuirks::get().queue_wait_on_submission)
@@ -84,7 +96,7 @@ index 4ee4f963..569661d3 100644
  	if (queue_unlock_callback)
  		queue_unlock_callback();
  
-@@ -2558,6 +2615,7 @@ void Device::destroy_framebuffer_nolock(VkFramebuffer framebuffer)
+@@ -2558,6 +2627,7 @@ void Device::destroy_framebuffer_nolock(VkFramebuffer framebuffer)
  
  void Device::wait_idle()
  {
@@ -92,7 +104,7 @@ index 4ee4f963..569661d3 100644
  	DRAIN_FRAME_LOCK();
  	wait_idle_nolock();
  }
-@@ -2868,6 +2926,7 @@ void Device::PerFrame::trim_command_pools()
+@@ -2868,6 +2938,7 @@ void Device::PerFrame::trim_command_pools()
  
  bool Device::PerFrame::wait(uint64_t timeout)
  {

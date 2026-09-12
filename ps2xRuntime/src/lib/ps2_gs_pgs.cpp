@@ -1595,7 +1595,17 @@ bool exclusive() { static const bool ex = envOn("PS2X_PGS_EXCLUSIVE") && !packMo
 
 bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
 {
-    if (!data || size < 16 || pathId < 1 || pathId > 3 || t_suppressed) return false;
+    if (!data || size < 16 || pathId < 1 || pathId > 3) return false;
+    if (t_suppressed)
+    {   // [skipourparse] Suppressed means the COALESCED bulk call already submitted this packet, so
+        // it genuinely was consumed -- but returning false told GifArbiter::process otherwise, and
+        // its exclusive-mode early-out is conditional on true. Result: our full GS parse ran on every
+        // packet in EXCLUSIVE mode, the mode whose banner says "our GS parse skipped". Returning true
+        // is the honest answer. Behind a flag because our parse also maintains the GS state mirror
+        // (runtime->gs()), and anything still reading that in exclusive mode would go stale.
+        static const bool s_skip = envOn("PS2X_PGS_SKIPOURPARSE");
+        return s_skip;
+    }
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);
     if (!initLocked(s)) return false;

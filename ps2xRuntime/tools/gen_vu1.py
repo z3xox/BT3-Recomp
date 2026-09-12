@@ -40,6 +40,13 @@ BRANCH_OPS = {0x20: 'B', 0x21: 'BAL', 0x24: 'JR', 0x25: 'JALR', 0x28: 'IBEQ', 0x
 Q_BC_OPS = {0x1C, 0x20, 0x21, 0x24, 0x25}          # jOP for op < 0x3C, jSOP for the "A" group
 CLIP_SOP = 0x1F                                     # jSOP of the CLIP upper op
 CLIP_READ_LOWER = {0x12, 0x13, 0x1C}                # FCAND / FCOR / FCGET (lower opHi)
+# [macelide] MAC-flag readers. commitF computes the Z/S nibbles on EVERY vector commit -- two SSE
+# compares, two movemasks, two table lookups and a status write, wrapped around math that is often
+# a single instruction. Measured on the user's splitscreen fight: turning it off took vu1 from
+# 15.15 to 11.34 ms/swap (-25%) and 42.9 -> 45.7 fps. No BT3 microprogram reads these: the
+# clippers use CLIP + FCAND/FCGET, which is the separate CLIP register. Decide per program so an
+# un-recompiled microprogram running on the interpreter keeps its flags.
+MAC_READ_LOWER = {0x18, 0x1A, 0x1B}                 # FMEQ / FMAND / FMOR
 
 def jsop(w):
     return (w & 3) | ((w >> 4) & 0x7C)
@@ -64,6 +71,10 @@ def lower_touches_qwait(lo, loi):
 
 def lower_reads_clip(lo, loi):
     return (not loi) and ((lo >> 25) & 0x7F) in CLIP_READ_LOWER
+
+
+def lower_reads_mac(lo, loi):
+    return (not loi) and ((lo >> 25) & 0x7F) in MAC_READ_LOWER
 
 def upper_is_nop(up):
     funct = up & 0x3F
@@ -288,9 +299,21 @@ def main():
         parts.append(code)
         parts.append('')
     parts.append('namespace vujit {')
+    # [macelide] does this program ever READ the MAC flags? If not, its commits can skip
+    # computing them entirely. Scanned over the program's own extent only.
+    def prog_reads_mac(image, extent):
+        for off in range(0, extent, 8):
+            lo = int.from_bytes(image[off:off + 4], 'little')
+            up = int.from_bytes(image[off + 4:off + 8], 'little')
+            loi = bool(up & 0x80000000)   # I-bit: the lower word is an immediate, not an opcode
+            if lower_reads_mac(lo, loi):
+                return True
+        return False
+
     parts.append('const Prog kPrograms[] = {')
     for bh, image, extent in progs:
-        parts.append(f'    {{ 0x{extent:x}u, 0x{fnv(image[:extent]):016x}ull, &vu1jit_{bh} }},   // body md5 {bh}')
+        needs_mac = prog_reads_mac(image, extent)
+        parts.append(f'    {{ 0x{extent:x}u, 0x{fnv(image[:extent]):016x}ull, &vu1jit_{bh}, {"true" if needs_mac else "false"} }},   // body md5 {bh}{"" if needs_mac else "  [macelide] no MAC reads"}')
     parts.append('};')
     parts.append(f'const int kProgramCount = {len(progs)};')
     parts.append('}')

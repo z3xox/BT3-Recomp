@@ -11,12 +11,28 @@ below the build fails to link.
 
 ## Apply
 
+**These patches are NOT idempotent.** `git apply` fails with `patch does not apply`
+both when a patch is already applied and when it is genuinely broken, and the two
+look identical. Always reset the files first — that makes re-applying safe and makes
+a real failure mean something:
+
     cd ps2xRuntime/third_party/parallel-gs
-    git apply ../../patches/pgswait-parallel-gs.patch      # base: 42c6701 (fork/bt3-texreplace)
-    git -C Granite apply ../../../patches/pgswait-granite.patch   # base: 16e7395f (submodule pin)
+    git checkout -- gs/ tools/
+    git apply ../../patches/pgswait-parallel-gs.patch            # base: 42c6701 (fork/bt3-texreplace)
+    git -C Granite checkout -- vulkan/
+    git -C Granite apply ../../../patches/pgswait-granite.patch  # base: 16e7395f (submodule pin)
+
+The resets discard only a previously applied version of these same patches. If you
+have other local edits in `third_party/parallel-gs`, save them first.
+
+To ask which state you are in without changing anything:
+
+    git apply --reverse --check ../../patches/pgswait-parallel-gs.patch   # succeeds => already applied
 
 Then rebuild as usual. Confirm it took effect: the log must contain
-`[pgswait] frame contexts = 2 (PS2X_PGS_FRAMECTX, default 2)`.
+`[pgswait] frame contexts = 2 (PS2X_PGS_FRAMECTX, default 2)`, and the `[pgs]` line
+must carry a `gpuwait-by-thread` field (that field is the marker for the 2026-09-12
+refresh specifically — if it is missing, the Granite patch is the old version).
 
 ## Run
 

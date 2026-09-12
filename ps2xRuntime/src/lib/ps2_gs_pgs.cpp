@@ -34,6 +34,10 @@ extern std::atomic<unsigned long long> g_pgsFrameWaitNs;
 extern std::atomic<unsigned long long> g_pgsFrameWaitCalls;
 extern std::atomic<unsigned long long> g_pgsFrameWaitBlocked;
 extern std::atomic<unsigned long long> g_pgsSemWaitNs;
+// [pgswait2] per-thread attribution (defined in Granite/vulkan/fence.cpp)
+extern std::atomic<unsigned long long> g_pgsWaitNsBy[4][3];
+extern std::atomic<unsigned long long> g_pgsWaitCallsBy[4][3];
+extern "C" void ps2x_pgs_set_thread_tag(int tag);
 extern std::atomic<unsigned long long> g_pgsSemWaitCalls;
 extern std::atomic<unsigned long long> g_pgsQueueIdleCalls;
 #include <cstdio>
@@ -1679,6 +1683,10 @@ void privWrite(uint32_t regOff, uint64_t value, GSRegisters *regs)
 
 void onSwap()
 {
+    {   // [pgswait2] onSwap only ever runs on the game thread -- tag it once so GPU blocking is attributable
+        static thread_local bool s_tagged = false;
+        if (!s_tagged) { s_tagged = true; ps2x_pgs_set_thread_tag(1); }
+    }
     if (!enabled()) return;
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);
@@ -1771,6 +1779,21 @@ void onSwap()
                          double(w - pw) / 1e6 / dt, double(i - pi) / 1e6 / dt,
                          (unsigned long long) g_pgsQueueIdleCalls.load(std::memory_order_relaxed));
             pw = w; pc = c; pb = b; pi = i; pic = ic; pfw = fw; pfc = fc; pfb = fb; psw = sw2; psc = sc;
+            {   // [pgswait2] the same blocking, split by thread: WHICH unit of the pipeline is stalling?
+                static unsigned long long pby[4][3] = {};
+                static const char *kTag[4] = { "other", "game", "kick", "gs" };
+                std::fprintf(stderr, " | gpuwait-by-thread ms/s:");
+                for (int t = 0; t < 4; t++)
+                {
+                    double tot = 0.0; double per[3];
+                    for (int f = 0; f < 3; f++)
+                    {
+                        const unsigned long long v = g_pgsWaitNsBy[t][f].load(std::memory_order_relaxed);
+                        per[f] = double(v - pby[t][f]) / 1e6 / dt; pby[t][f] = v; tot += per[f];
+                    }
+                    if (tot >= 0.05) std::fprintf(stderr, " %s=%.1f(fence %.1f tl %.1f fctx %.1f)", kTag[t], tot, per[0], per[1], per[2]);
+                }
+            }
         }
         std::fprintf(stderr, " | flip: stream calls/s %.0f, scanout fb1=%llx live1=%llx live2=%llx, stream!=live at %.0f%% of swaps",
                      s.streamFlips / dt, (unsigned long long)s.lastFb1, (unsigned long long)s.lastLive1, (unsigned long long)s.lastLive2,

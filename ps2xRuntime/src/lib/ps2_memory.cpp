@@ -2269,6 +2269,8 @@ bool PS2Memory::asyncKickEnabled()
     return s_on;
 }
 
+extern "C" void ps2x_pgs_set_thread_tag(int tag);   // [pgswait2] Granite/vulkan/fence.cpp
+
 void PS2Memory::ensureKickWorker()
 {
     // Caller holds m_kickMtx.
@@ -2375,6 +2377,7 @@ void PS2Memory::arbiterDrainOrHandoff()
 void PS2Memory::stage2Loop()
 {
     ps2xEeProfAddCurrentThread("GsThread");   // [eeprof]
+    ps2x_pgs_set_thread_tag(3);   // [pgswait2]
 #if !defined(_WIN32)
 #if defined(__APPLE__)
     pthread_setname_np("GsThread");   // macOS names the current thread
@@ -2461,6 +2464,7 @@ void PS2Memory::stage2Loop()
 void PS2Memory::kickWorkerLoop()
 {
     ps2xEeProfAddCurrentThread("KickWorker");   // [eeprof]
+    ps2x_pgs_set_thread_tag(2);   // [pgswait2]
     t_onKickWorker = true;   // [vu1pipe]
     for (;;)
     {

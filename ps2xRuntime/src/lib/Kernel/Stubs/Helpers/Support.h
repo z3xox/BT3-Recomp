@@ -2263,13 +2263,23 @@ namespace
     // worker drains per frame (sceGsSwapDBuff: display env + two draw envs), i.e. the game thread waiting
     // 83% of a splitscreen frame ([eeprof]/[waitprof], 2026-09-08). Reads (store-image, sceGsSyncPath)
     // keep the real fence. PS2X_ASYNC_GSQUEUE=0 restores drain-then-apply.
-    static void applyGsOnStream(PS2Runtime *runtime, std::function<void()> apply)
+    // [gsqueue2] displayCritical = this write drives the PRESENT latch (ps2xGsDisplayFlipHook in
+    // applyGsDispEnv). Mode 1 deferred those onto the worker too and the picture broke: the latch
+    // then ran off-thread from the presenter, so the scanned-out buffer disagreed with the stream
+    // (stream!=live at 44-99% of swaps, display alternating squished/normal). Mode 2 keeps display
+    // writes on the drain path and queues only the rest -- which is where the drains actually are:
+    // sceGsSwapDBuff is 1 applyGsDispEnv + 2 applyGsRegPairs, so mode 2 removes TWO of three
+    // per-frame drains and touches nothing the present depends on.
+    static void applyGsOnStream(PS2Runtime *runtime, std::function<void()> apply, bool displayCritical = false)
     {
-        // DEFAULT OFF since 2026-09-08 evening: queued writes removed one of three worker drains per frame but
-        // gained nothing measurable on the i5-12400 (newest3/5: 23.9/24.7 fps vs 23.9 before) and the 4x
-        // cutscene-skip crash (newest4) appeared with it in. PS2X_ASYNC_GSQUEUE=1 re-enables for testing.
-        static const bool s_queue = [](){ const char *v = std::getenv("PS2X_ASYNC_GSQUEUE"); return v && v[0] == '1'; }();
-        if (s_queue && runtime && PS2Memory::asyncKickEnabled())
+        // 0 = off (drain then apply). 1 = queue everything (breaks the present latch, see above).
+        // 2 = queue everything EXCEPT display-critical writes.
+        static const int s_queue = [](){ const char *v = std::getenv("PS2X_ASYNC_GSQUEUE");
+                                         const int m = v && v[0] ? std::atoi(v) : 0;
+                                         std::fprintf(stderr, "[gsqueue] PS2X_ASYNC_GSQUEUE=%d (0 = drain, 1 = queue all, 2 = queue non-display)\n", m);
+                                         return m; }();
+        const bool queueThis = (s_queue == 1) || (s_queue == 2 && !displayCritical);
+        if (queueThis && runtime && PS2Memory::asyncKickEnabled())
         {
             PS2Memory::KickJob j;
             j.kind = PS2Memory::KickJob::GsApply;
@@ -2297,7 +2307,7 @@ namespace
             regs.display2 = e.display;
             regs.bgcolor = e.bgcolor;
             ps2xGsDisplayFlipHook(e.dispfb);   // [displatch] the present's per-frame latch (ps2_gs_gpu.cpp)
-        });
+        }, /*displayCritical=*/true);   // [gsqueue2] never defer the flip latch
     }
 
     static void applyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)

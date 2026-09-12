@@ -1396,9 +1396,16 @@ namespace ps2_stubs
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
             if (hasSeededGsClearPacket(db.clear0))
-            {
+            {   // [gsqueue2] MUST go on the same stream as the applyGsRegPairs above: this reads
+                // m_ctx[idx] (FRAME/ZBUF/SCISSOR), which those pairs set. Left inline while they are
+                // queued, the clear runs against the PREVIOUS frame's context -- the ordering
+                // inversion that mode 1 shipped in 2026-09-08 and very likely the 4x cutscene crash.
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
+                const uint32_t clearRgba = static_cast<uint32_t>(db.clear0.rgbaq.value);
+                applyGsOnStream(runtime, [runtime, clearContext, clearRgba]()
+                {
+                    runtime->gs().clearFramebufferContext(clearContext, clearRgba);
+                });
             }
             applyGsClearPacket(runtime, db.clear0);
         }
@@ -1407,9 +1414,16 @@ namespace ps2_stubs
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
             if (hasSeededGsClearPacket(db.clear1))
-            {
+            {   // [gsqueue2] MUST go on the same stream as the applyGsRegPairs above: this reads
+                // m_ctx[idx] (FRAME/ZBUF/SCISSOR), which those pairs set. Left inline while they are
+                // queued, the clear runs against the PREVIOUS frame's context -- the ordering
+                // inversion that mode 1 shipped in 2026-09-08 and very likely the 4x cutscene crash.
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
+                const uint32_t clearRgba = static_cast<uint32_t>(db.clear1.rgbaq.value);
+                applyGsOnStream(runtime, [runtime, clearContext, clearRgba]()
+                {
+                    runtime->gs().clearFramebufferContext(clearContext, clearRgba);
+                });
             }
             applyGsClearPacket(runtime, db.clear1);
         }

@@ -1,8 +1,8 @@
 diff --git a/vulkan/device.cpp b/vulkan/device.cpp
-index 4ee4f963..bf118c74 100644
+index 4ee4f963..569661d3 100644
 --- a/vulkan/device.cpp
 +++ b/vulkan/device.cpp
-@@ -31,6 +31,50 @@
+@@ -31,6 +31,52 @@
  #include "quirks.hpp"
  #include "timer.hpp"
  #include <algorithm>
@@ -19,6 +19,7 @@ index 4ee4f963..bf118c74 100644
 +std::atomic<unsigned long long> g_pgsFrameWaitCalls{0};
 +std::atomic<unsigned long long> g_pgsFrameWaitBlocked{0};
 +std::atomic<unsigned long long> g_pgsQueueIdleCalls{0};
++void pgsWaitNote(int fam, unsigned long long ns);   // [pgswait2] fence.cpp
 +
 +namespace
 +{
@@ -35,6 +36,7 @@ index 4ee4f963..bf118c74 100644
 +		g_pgsFrameWaitNs.fetch_add(ns, std::memory_order_relaxed);
 +		g_pgsFrameWaitCalls.fetch_add(1, std::memory_order_relaxed);
 +		if (ns > 50000ull) g_pgsFrameWaitBlocked.fetch_add(1, std::memory_order_relaxed);
++		pgsWaitNote(2, ns);   // [pgswait2]
 +	}
 +};
 +
@@ -53,7 +55,7 @@ index 4ee4f963..bf118c74 100644
  #include <string.h>
  #include <stdlib.h>
  
-@@ -972,7 +1016,18 @@ void Device::set_context(const Context &context)
+@@ -972,7 +1018,18 @@ void Device::set_context(const Context &context)
  	init_workarounds();
  	init_pipeline_cache();
  	init_timeline_semaphores();
@@ -73,7 +75,7 @@ index 4ee4f963..bf118c74 100644
  
  	managers.memory.init(this);
  	managers.semaphore.init(this);
-@@ -1768,7 +1823,7 @@ VkResult Device::submit_batches(Helper::BatchComposer &composer, VkQueue queue,
+@@ -1768,7 +1825,7 @@ VkResult Device::submit_batches(Helper::BatchComposer &composer, VkQueue queue,
  	VkResult result = queue_submit(queue, uint32_t(submits.size()), submits.data(), fence);
  
  	if (ImplementationQuirks::get().queue_wait_on_submission)
@@ -82,7 +84,7 @@ index 4ee4f963..bf118c74 100644
  	if (queue_unlock_callback)
  		queue_unlock_callback();
  
-@@ -2558,6 +2613,7 @@ void Device::destroy_framebuffer_nolock(VkFramebuffer framebuffer)
+@@ -2558,6 +2615,7 @@ void Device::destroy_framebuffer_nolock(VkFramebuffer framebuffer)
  
  void Device::wait_idle()
  {
@@ -90,7 +92,7 @@ index 4ee4f963..bf118c74 100644
  	DRAIN_FRAME_LOCK();
  	wait_idle_nolock();
  }
-@@ -2868,6 +2924,7 @@ void Device::PerFrame::trim_command_pools()
+@@ -2868,6 +2926,7 @@ void Device::PerFrame::trim_command_pools()
  
  bool Device::PerFrame::wait(uint64_t timeout)
  {
@@ -99,10 +101,10 @@ index 4ee4f963..bf118c74 100644
  	bool has_timeline = true;
  
 diff --git a/vulkan/fence.cpp b/vulkan/fence.cpp
-index b6900cf4..e70451be 100644
+index b6900cf4..3ee9f871 100644
 --- a/vulkan/fence.cpp
 +++ b/vulkan/fence.cpp
-@@ -22,6 +22,37 @@
+@@ -22,6 +22,55 @@
  
  #include "fence.hpp"
  #include "device.hpp"
@@ -117,6 +119,23 @@ index b6900cf4..e70451be 100644
 +std::atomic<unsigned long long> g_pgsFenceWaitNs{0};
 +std::atomic<unsigned long long> g_pgsFenceWaitCalls{0};
 +std::atomic<unsigned long long> g_pgsFenceWaitBlocked{0};
++
++// [pgswait2] PER-THREAD attribution of GPU blocking. The totals alone cannot say WHICH thread
++// stalls: gif_transfer runs on GsThread, onSwap on the GameThread, and they share one mutex, so
++// 484 ms/s of blocking means very different things depending on where it lands. Tag set once per
++// thread by the runtime (ps2x_pgs_set_thread_tag).
++//   tag: 0 = other, 1 = GameThread, 2 = KickWorker, 3 = GsThread
++//   fam: 0 = fence, 1 = timeline semaphore, 2 = frame context
++thread_local int g_pgsThreadTag = 0;
++std::atomic<unsigned long long> g_pgsWaitNsBy[4][3];
++std::atomic<unsigned long long> g_pgsWaitCallsBy[4][3];
++extern "C" void ps2x_pgs_set_thread_tag(int tag) { g_pgsThreadTag = (tag >= 0 && tag < 4) ? tag : 0; }
++void pgsWaitNote(int fam, unsigned long long ns)
++{
++	const int t = (g_pgsThreadTag >= 0 && g_pgsThreadTag < 4) ? g_pgsThreadTag : 0;
++	g_pgsWaitNsBy[t][fam].fetch_add(ns, std::memory_order_relaxed);
++	g_pgsWaitCallsBy[t][fam].fetch_add(1, std::memory_order_relaxed);
++}
 +
 +namespace
 +{
@@ -133,6 +152,7 @@ index b6900cf4..e70451be 100644
 +		g_pgsFenceWaitNs.fetch_add(ns, std::memory_order_relaxed);
 +		g_pgsFenceWaitCalls.fetch_add(1, std::memory_order_relaxed);
 +		if (ns > 50000ull) g_pgsFenceWaitBlocked.fetch_add(1, std::memory_order_relaxed);
++		pgsWaitNote(0, ns);   // [pgswait2]
 +	}
 +};
 +}
@@ -140,7 +160,7 @@ index b6900cf4..e70451be 100644
  
  namespace Vulkan
  {
-@@ -43,6 +74,7 @@ const VkFence &FenceHolder::get_fence() const
+@@ -43,6 +92,7 @@ const VkFence &FenceHolder::get_fence() const
  
  void FenceHolder::wait()
  {
@@ -148,7 +168,7 @@ index b6900cf4..e70451be 100644
  	auto &table = device->get_device_table();
  
  	// Waiting for the same VkFence in parallel is not allowed, and there seems to be some shenanigans on Intel
-@@ -106,6 +138,7 @@ void FenceHolder::wait()
+@@ -106,6 +156,7 @@ void FenceHolder::wait()
  
  bool FenceHolder::wait_timeout(uint64_t timeout)
  {
@@ -157,10 +177,10 @@ index b6900cf4..e70451be 100644
  	auto &table = device->get_device_table();
  
 diff --git a/vulkan/semaphore.cpp b/vulkan/semaphore.cpp
-index 03e55b2e..87a56ac7 100644
+index 03e55b2e..e5ffd0c9 100644
 --- a/vulkan/semaphore.cpp
 +++ b/vulkan/semaphore.cpp
-@@ -22,6 +22,30 @@
+@@ -22,6 +22,33 @@
  
  #include "semaphore.hpp"
  #include "device.hpp"
@@ -170,6 +190,7 @@ index 03e55b2e..87a56ac7 100644
 +// [pgswait] blocking timeline waits (wait_timeline passes UINT64_MAX). timeout==0 is a poll.
 +std::atomic<unsigned long long> g_pgsSemWaitNs{0};
 +std::atomic<unsigned long long> g_pgsSemWaitCalls{0};
++void pgsWaitNote(int fam, unsigned long long ns);   // [pgswait2] fence.cpp
 +
 +namespace
 +{
@@ -181,9 +202,11 @@ index 03e55b2e..87a56ac7 100644
 +	~PgsSemTimer()
 +	{
 +		if (!on) return;
-+		g_pgsSemWaitNs.fetch_add((unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(
-+				std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
++		const auto ns = (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(
++				std::chrono::steady_clock::now() - t0).count();
++		g_pgsSemWaitNs.fetch_add(ns, std::memory_order_relaxed);
 +		g_pgsSemWaitCalls.fetch_add(1, std::memory_order_relaxed);
++		pgsWaitNote(1, ns);   // [pgswait2]
 +	}
 +};
 +}
@@ -191,7 +214,7 @@ index 03e55b2e..87a56ac7 100644
  
  #ifndef _WIN32
  #include <unistd.h>
-@@ -84,6 +108,7 @@ void SemaphoreHolder::recycle_semaphore()
+@@ -84,6 +111,7 @@ void SemaphoreHolder::recycle_semaphore()
  
  bool SemaphoreHolder::wait_timeline_timeout(uint64_t value, uint64_t timeout)
  {

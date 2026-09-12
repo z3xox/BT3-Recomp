@@ -50,3 +50,55 @@ The number that matters is **blocked/s divided by swaps/s**.
   the outline page.
 * `PS2X_PGS_SSPAGES=<page list>` - restrict which pages may be super-sampled.
   **Narrowing is not free**: every variant visibly aliases terrain silhouettes.
+
+## Update 2026-09-12: per-thread attribution, and what it changed
+
+The `[pgs]` line now also prints:
+
+    gpuwait-by-thread ms/s: other=<n>(fence .. tl .. fctx ..) game=<n>(..) kick=<n>(..) gs=<n>(..)
+
+Measured in a fight: `other=560 (100% timeline)`, `game=210 (100% frame context)`,
+`kick=0`, `gs=0`.
+
+**`other` is `PGS-Waiter`** — the Granite thread in `gs/gs_renderer.cpp:761` whose
+entire job is to sit in `wait_timeline` and publish completions. Its 560 ms/s is
+by design and on no critical path. **Do not read it as a stall.** The real GPU
+stall is 210 ms/s and it is all on the game thread. GsThread blocks on the GPU
+exactly zero — its ~583 ms/s of busy is genuine CPU parse work.
+
+That reprices the whole problem. Per swap at 35.3 fps (28.3 ms wall):
+KickWorker 17.0 ms, GsThread 16.5 ms, GameThread EE ~11.3 ms, GPU 8.3 ms — 53 ms
+of work in 28.3 ms of wall, i.e. only **1.9x overlap out of a possible 4x**. The
+slowest single unit is 17.0 ms = **59 fps available from overlap alone, with
+nothing made faster**. The port is serialization-bound, not throughput-bound.
+
+## The serialization: `PS2X_ASYNC_GSQUEUE=3`
+
+`sceGsSwapDBuff` = 1 `applyGsDispEnv` + 2 `applyGsRegPairs`, and every one of them
+drained the whole kick pipeline (`kick_drain` 350 ms/s on the game thread; also why
+`worker_idle`=369 and `stage2_idle`=290 — three times a frame both downstream
+threads run dry).
+
+    0  drain then apply (default, unchanged behaviour)
+    1  queue everything            -- BREAKS THE PICTURE, do not use
+    2  queue all but display writes -- nearly useless on its own, see below
+    3  2 + split applyGsDispEnv     -- no drain left in the swap path  <-- TEST THIS
+
+Mode 1 broke because it deferred `regs.*` onto the worker while the presenter reads
+`r->display1` directly on the game thread (`ps2_gs_pgs.cpp:414`) and `display1`
+carries MAGH — hence the display alternating squished/normal. Mode 2 is nearly
+useless because `applyGsDispEnv` runs *first*, so the drain it keeps is the one that
+finds the queue full; the two it queues hit an already-empty queue. Mode 3 splits the
+call: `regs.*` inline (presenter reads them here), flip hook queued (`streamFlip`
+must be stream-ordered or it presents an unfinished frame).
+
+Verified on Linux in a splitscreen fight — drain counts (waits/10s):
+mode 0 = `kick_drain` 2340 / `fence_syncpath` 1170; mode 3 = 1152 / 1152, i.e. every
+swap-path drain gone. Picture correct by screenshot, `stream!=live` 0%, no crash.
+
+**It cannot be priced on that box**: there `fence_syncpath == kick_drain`, so 100% of
+the paying drains come from `sceGsSyncPath`, which fires 115x/s and empties the queue
+just before the swap path would. On Windows `fence_syncpath=0.0(0)` and
+`kick_drain=350.5` — all of it on the path mode 3 clears. Measure it there:
+
+    PS2X_ASYNC_GSQUEUE=3   vs unset, in a fight, comparing swaps/s and kick_drain.

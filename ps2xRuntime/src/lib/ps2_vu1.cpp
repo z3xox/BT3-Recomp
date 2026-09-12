@@ -30,6 +30,16 @@ extern const Prog kPrograms[];
 extern const int kProgramCount;
 }
 static thread_local bool t_vuNoJit = false;
+
+// [vu1cost] PS2X_VU1COST=<N>: sampled per-program timing on the recompiled path (0/unset = off).
+// WHY: runs=... from [vumicro] cannot rank cost, because most runs ENTER NEAR THE END of a program
+// and do almost no work (3b5dfe97 takes 23.0M of its 28.0M runs at entry 0x3e8 -- two pairs from the
+// end of a 127-pair program). runs x pairs said 80/14/6; entry-weighted said 95/3/1.4. This measures
+// it instead. guestprof gives the total to scale against (vu1 447 ms/s in a splitscreen fight).
+// Every Nth run is wrapped in steady_clock and the mean is scaled by the run count; a single run is
+// sub-microsecond so one sample is clock-noise -- only the mean over ~200k samples is used.
+// VU1 runs on one thread (see [vucounters]), so plain counters are correct here.
+namespace { struct VuCost { uint64_t ns = 0, sampled = 0, runs = 0; }; VuCost g_vuCost[8]; }
 // [vumicro] where the microprogram census / the [vu1jit] miss dump write their 16 KB images: PS2X_VUMICRO_DIR
 // (default: the working directory). Used to be a hard-coded developer path.
 static void vumicroDumpPath(char *out, size_t cap, uint64_t hash)
@@ -1080,7 +1090,43 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 if ((s_jitRuns % 20000ul) == 0ul) std::fprintf(stderr, "[vu1jit] verify: %lu runs, %lu mismatches, %lu unmatched microcodes\n", s_jitRuns, s_jitBad, s_jitMiss);
                 return;
             }
-            s_jitProg->fn(*this, m_state, vuData, dataSize, gs, memory, maxCycles);
+            {   // [vu1cost] sampled per-program timing
+                static const unsigned s_costN = [](){ const char *v = std::getenv("PS2X_VU1COST");
+                    const unsigned n = (v && v[0]) ? (unsigned)std::strtoul(v, nullptr, 10) : 0u; return n; }();
+                if (!s_costN) { s_jitProg->fn(*this, m_state, vuData, dataSize, gs, memory, maxCycles); }
+                else
+                {
+                    VuCost &c = g_vuCost[(s_jitProg - &vujit::kPrograms[0]) & 7];
+                    if ((++c.runs % s_costN) != 0u) { s_jitProg->fn(*this, m_state, vuData, dataSize, gs, memory, maxCycles); }
+                    else
+                    {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        s_jitProg->fn(*this, m_state, vuData, dataSize, gs, memory, maxCycles);
+                        c.ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+                        ++c.sampled;
+                    }
+                    static std::chrono::steady_clock::time_point s_ct = std::chrono::steady_clock::now();
+                    const auto now = std::chrono::steady_clock::now();
+                    const double dt = std::chrono::duration<double>(now - s_ct).count();
+                    if (dt >= 5.0)
+                    {
+                        double est[8] = {}, tot = 0.0;
+                        for (int i = 0; i < vujit::kProgramCount && i < 8; ++i)
+                            if (g_vuCost[i].sampled) { est[i] = (double(g_vuCost[i].ns) / double(g_vuCost[i].sampled)) * double(g_vuCost[i].runs); tot += est[i]; }
+                        std::fprintf(stderr, "[vu1cost] %.1fs:", dt);
+                        for (int i = 0; i < vujit::kProgramCount && i < 8; ++i)
+                            if (g_vuCost[i].runs)
+                                std::fprintf(stderr, " %08llx: %.0f runs/s, %.1f ms/s (%.1f%%)",
+                                             (unsigned long long)(vujit::kPrograms[i].hash & 0xFFFFFFFFull),
+                                             double(g_vuCost[i].runs) / dt, est[i] / 1e6 / dt,
+                                             tot > 0.0 ? 100.0 * est[i] / tot : 0.0);
+                        std::fprintf(stderr, "\n");
+                        for (int i = 0; i < 8; ++i) g_vuCost[i] = VuCost{};
+                        s_ct = now;
+                    }
+                }
+            }
             {   // [jitstat] periodic fallback report on the recompiled path (PS2X_VUFASTSTATS=1)
                 static const bool s_js = [](){ const char *v = std::getenv("PS2X_VUFASTSTATS"); return v && v[0] && v[0] != '0'; }();
                 static thread_local uint64_t s_jr = 0;

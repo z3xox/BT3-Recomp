@@ -1581,7 +1581,19 @@ bool enabled()
     return v != 0;
 }
 bool packMode() { static const bool p = envOn("PS2X_PGS") && envOn("PS2X_PGS_PACK"); return p; }
-bool coalesce() { static const bool c = envOn("PS2X_PGS_COALESCE") && !packMode(); return c; }   // pack mode needs per-packet order
+bool coalesce()
+{   // [coalesce] DEFAULT OFF, and that is why GsThread does 430k gifTransfer calls/s -- one per
+    // packet. Every one of those pays a mutex acquisition, the wsHud condition, and a pseudoRegs
+    // walk (29 + 90 ms/s between them), all of which are PER CALL, not per byte. play_pgs.sh
+    // defaults it on (COAL:-1) so Linux runs never showed this; the Windows env never set it.
+    // Pairs with PS2X_PGS_SKIPOURPARSE: the coalesced path is the one where a suppressed
+    // gifTransfer used to return false and let our GS parse run on every packet.
+    static const bool c = [](){ const bool on = envOn("PS2X_PGS_COALESCE") && !packMode();
+        std::fprintf(stderr, "[coalesce] PS2X_PGS_COALESCE=%d%s\n", on ? 1 : 0,
+                     packMode() ? " (forced off: pack mode needs per-packet order)" : "");
+        return on; }();
+    return c;
+}
 void setGs(GS *gs) { State &s = st(); std::lock_guard<std::mutex> lk(s.mtx); s.replacer.gs = gs; }
 // [gsprof] PS2X_GSPROF=1: split the gifTransfer body. It is 83% of GsThread, which is the
 // busiest unit in the pipeline (689 ms/s of a 23.8 ms swap), and it contains up to THREE walks of
@@ -1594,6 +1606,14 @@ std::atomic<unsigned long long> g_gsProfOursNs{0}, g_gsProfOursCalls{0};
 bool gsProfOn() { static const bool v = envOn("PS2X_GSPROF"); return v; }
 static thread_local bool t_suppressed = false;
 void setSuppressed(bool on) { t_suppressed = on; }
+bool skipOurParse()
+{   // [skipourparse] printed at init, not lazily: with coalescing off the suppressed path is never
+    // reached, so a lazy banner never printed and perf17 could not prove the setting either way.
+    static const bool s = [](){ const bool on = envOn("PS2X_PGS_SKIPOURPARSE");
+        std::fprintf(stderr, "[skipourparse] PS2X_PGS_SKIPOURPARSE=%d (only matters with PS2X_PGS_COALESCE=1)\n", on ? 1 : 0);
+        return on; }();
+    return s;
+}
 bool exclusive() { static const bool ex = envOn("PS2X_PGS_EXCLUSIVE") && !packMode(); return ex; }   // pack mode keeps our (state-only) parse
 
 bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
@@ -1606,10 +1626,7 @@ bool gifTransfer(uint8_t pathId, const uint8_t *data, size_t size)
         // packet in EXCLUSIVE mode, the mode whose banner says "our GS parse skipped". Returning true
         // is the honest answer. Behind a flag because our parse also maintains the GS state mirror
         // (runtime->gs()), and anything still reading that in exclusive mode would go stale.
-        static const bool s_skip = [](){ const bool on = envOn("PS2X_PGS_SKIPOURPARSE");
-            std::fprintf(stderr, "[skipourparse] PS2X_PGS_SKIPOURPARSE=%d (1 = our GS parse really is skipped in EXCLUSIVE)\n", on ? 1 : 0);
-            return on; }();
-        return s_skip;
+        return skipOurParse();
     }
     State &s = st();
     std::lock_guard<std::mutex> lk(s.mtx);

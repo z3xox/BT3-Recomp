@@ -40,6 +40,8 @@ extern std::atomic<unsigned long long> g_pgsWaitNsBy[4][3];
 extern std::atomic<unsigned long long> g_pgsWaitCallsBy[4][3];
 extern "C" void ps2x_pgs_set_thread_tag(int tag);
 extern "C" void ps2x_pgs_set_thread_tag_if_unset(int tag);
+// [gcframe] flush_submit call split (parallel-gs/gs/gs_renderer.cpp)
+namespace ParallelGS { extern std::atomic<unsigned long long> g_pgsFlushSubmits, g_pgsFlushBoundary; }
 extern std::atomic<unsigned long long> g_pgsSemWaitCalls;
 extern std::atomic<unsigned long long> g_pgsQueueIdleCalls;
 #include <cstdio>
@@ -1854,6 +1856,12 @@ void onSwap()
                                          c1 = g_gsProfBackendNs.load(), d1 = g_gsProfCalls.load();
                 static unsigned long long po = 0, poc = 0;
                 const unsigned long long o1 = g_gsProfOursNs.load(), o2 = g_gsProfOursCalls.load();
+                {   // [gcframe] how many flush_submit calls per frame, and how many are real boundaries
+                    static unsigned long long pfs = 0, pfb = 0;
+                    const unsigned long long fs = ParallelGS::g_pgsFlushSubmits.load(), fb = ParallelGS::g_pgsFlushBoundary.load();
+                    std::fprintf(stderr, " | flushes/s %.0f (boundary %.0f)", double(fs - pfs) / dt, double(fb - pfb) / dt);
+                    pfs = fs; pfb = fb;
+                }
                 std::fprintf(stderr, " | gsprof ms/s: pseudoRegs %.1f wsHud %.1f backendParse %.1f (%.0f calls/s) ourParse %.1f (%.0f calls/s)",
                              double(a1 - pp) / 1e6 / dt, double(b1 - pw) / 1e6 / dt,
                              double(c1 - pb) / 1e6 / dt, double(d1 - pc) / dt,

@@ -2330,6 +2330,40 @@ void ps2xRunPreSwapGsApply()
 namespace ps2x_pgs {   // [gsprof] counters live in ps2_gs_pgs.cpp
 extern std::atomic<unsigned long long> g_gsProfOursNs, g_gsProfOursCalls;
 }
+// [coremig] PS2X_COREMIG=1: is the scheduler moving the pipeline threads between cores?
+// GameThread -> KickWorker -> GsThread hand ~194 MB/s of packet buffers along, so if they migrate
+// across CCXs or P/E clusters the shared data keeps landing in the wrong cache. Thread pinning in
+// ps2_runtime.cpp is #ifdef __linux__ and covers only two threads even there, so on Windows
+// nothing is pinned at all -- and mode 6 showed per-unit cost RISING as the pipeline packed
+// (vu1 15.49 -> 17.60 ms/swap), which is what contention looks like.
+#if defined(_WIN32)
+#  define PS2X_CUR_CORE() ((int)GetCurrentProcessorNumber())
+#elif defined(__linux__)
+#  define PS2X_CUR_CORE() (sched_getcpu())
+#else
+#  define PS2X_CUR_CORE() (-1)
+#endif
+void ps2xCoreMigNote(const char *name)
+{
+    static const bool s_on = [](){ const char *v = std::getenv("PS2X_COREMIG"); return v && v[0] && v[0] != '0'; }();
+    if (!s_on) return;
+    thread_local int lastCore = -1;
+    thread_local unsigned long moves = 0, samples = 0;
+    thread_local std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    const int c = PS2X_CUR_CORE();
+    ++samples;
+    if (lastCore >= 0 && c != lastCore) ++moves;
+    lastCore = c;
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = std::chrono::duration<double>(now - t0).count();
+    if (dt >= 5.0)
+    {
+        std::fprintf(stderr, "[coremig] %-11s core %2d, %.0f moves/s (%.1f%% of %.0f samples/s)\n",
+                     name, c, moves / dt, samples ? 100.0 * double(moves) / double(samples) : 0.0, samples / dt);
+        moves = 0; samples = 0; t0 = now;
+    }
+}
+
 extern "C" void ps2x_pgs_set_thread_tag(int tag);   // [pgswait2] Granite/vulkan/fence.cpp
 
 void PS2Memory::ensureKickWorker()
@@ -2439,6 +2473,7 @@ void PS2Memory::stage2Loop()
 {
     ps2xEeProfAddCurrentThread("GsThread");   // [eeprof]
     ps2x_pgs_set_thread_tag(3);   // [pgswait2]
+    // [coremig] sampled once per stage-2 item below
 #if !defined(_WIN32)
 #if defined(__APPLE__)
     pthread_setname_np("GsThread");   // macOS names the current thread
@@ -2471,6 +2506,7 @@ void PS2Memory::stage2Loop()
                 }
             }
         }
+        ps2xCoreMigNote("GsThread");   // [coremig]
         const auto t0 = std::chrono::steady_clock::now();
         switch (it.kind)
         {
@@ -2547,6 +2583,7 @@ void PS2Memory::kickWorkerLoop()
                 return;
             job = std::move(m_kickQueue.front());
             m_kickQueue.pop_front();
+            ps2xCoreMigNote("KickWorker");   // [coremig]
             m_kickBusy = true;
         }
         const auto _jobT0 = std::chrono::steady_clock::now();   // [framegate]

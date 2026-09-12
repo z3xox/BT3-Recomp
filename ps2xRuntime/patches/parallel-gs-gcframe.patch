@@ -11,18 +11,19 @@ index 10120fb..d3d70b2 100644
  	if (debug_mode.deterministic_timeline_query)
  		renderer.wait_timeline(value);
 diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
-index 29452b2..125c84c 100644
+index 29452b2..35508c3 100644
 --- a/gs/gs_renderer.cpp
 +++ b/gs/gs_renderer.cpp
-@@ -4,6 +4,7 @@
+@@ -4,6 +4,8 @@
  // SPDX-License-Identifier: LGPL-3.0+
  
  #include "gs_renderer.hpp"
 +#include <cstdlib>
++#include <cstdio>
  #include "logging.hpp"
  #include "gs_interface.hpp"
  #include "gs_registers_debug.hpp"
-@@ -1212,7 +1213,21 @@ void GSRenderer::flush_submit(uint64_t value)
+@@ -1212,7 +1214,22 @@ void GSRenderer::flush_submit(uint64_t value)
  
  	// If we have a timeline trace, we'd like it to be somewhat readable.
  	// Only do garbage collection at frame boundaries.
@@ -35,10 +36,11 @@ index 29452b2..125c84c 100644
 +	// per swap of blocking against a GPU that was 41% idle. Advancing only at the true boundary:
 +	//   3x  1P vs COM   52.3 -> 58.8 fps (holds 60)     4x  39.4 -> 41.6
 +	//   splitscreen 2x  45.6 -> 49.2, window spread 41-55 -> 46-51
-+	// No accumulation over a long fight (GPU, copies, CopyVRAM, TextureUpload all flat).
 +	// PS2X_PGS_GCFRAME=0 restores an advance on every flush_submit.
 +	static const bool s_gcframe = [](){ const char *v = getenv("PS2X_PGS_GCFRAME");
-+		return !(v && v[0] == '0'); }();
++		const bool on = !(v && v[0] == '0');
++		fprintf(stderr, "[gcframe] PS2X_PGS_GCFRAME=%d (1 = advance the frame context only at frame boundaries)\n", on ? 1 : 0);
++		return on; }();
 +	const bool advance = !s_gcframe || frame_boundary_flush;
 +	frame_boundary_flush = false;
 +	if (!device->get_system_handles().timeline_trace_file && advance)

@@ -1,0 +1,4 @@
+# [pgswait] patch files must keep LF endings. A Windows checkout with core.autocrlf=true
+# rewrites them to CRLF, which git apply reports as "trailing whitespace" on every added line
+# and which can make context lines fail to match the LF sources they patch.
+*.patch -text

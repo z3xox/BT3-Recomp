@@ -396,8 +396,12 @@ bool initLocked(State &s)
     s.timestamps = envOn("PS2X_PGS_TIMESTAMPS");
     if (s.timestamps) { DebugMode dm = {}; dm.timestamps = true; s.iface.set_debug_mode(dm); }
     s.failed = false; s.inited = true;
-    std::fprintf(stderr, "[pgs] paraLLEl-GS backend up: %s, ssaa=%u, force_bilinear=%d, replaced_per_sample=%d, skipkick=%u, %s\n",
-                 s.device.get_gpu_properties().deviceName, unsigned(opts.super_sampling), s.hacks.force_bilinear ? 1 : 0, s.hacks.replaced_per_sample ? 1 : 0, unsigned(s.hacks.skip_kick_mask),
+    // [sstex] print super_sampled_textures too: it is the one knob that changes how much SHADING
+    // costs at a given ssaa (per-sample vs per-pixel reads of render targets), and it was the only
+    // setting on this line that could not be confirmed from a log -- replaced_per_sample is a
+    // different thing entirely (PS2X_PGS_REPLPERSAMPLE, a texture-replacement hack).
+    std::fprintf(stderr, "[pgs] paraLLEl-GS backend up: %s, ssaa=%u, sstex=%d, force_bilinear=%d, replaced_per_sample=%d, skipkick=%u, %s\n",
+                 s.device.get_gpu_properties().deviceName, unsigned(opts.super_sampling), opts.super_sampled_textures ? 1 : 0, s.hacks.force_bilinear ? 1 : 0, s.hacks.replaced_per_sample ? 1 : 0, unsigned(s.hacks.skip_kick_mask),
                  exclusive() ? "EXCLUSIVE (our GS parse skipped)" : packMode() ? "PACK mode (our GS parse state-only, replacements via the backend)" : "dual (our GL renderer keeps running)");
     return true;
 }

@@ -568,6 +568,36 @@ if (APPLE AND NOT PS2X_FORCE_PGS)
     set(PS2X_PGS_SKIP_REASON "not supported on macOS (Granite needs clock_nanosleep)")
 endif()
 if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
+    # [framectx] Granite's frame-context ring defaults to 2, which is FLUSH-depth not frame-depth:
+    # paraLLEl-GS calls flush_submit ~8x per frame at BT3's packet rate and each advance blocks
+    # until the GPU retires the context it reuses. Depth 16 is worth ~7 fps in a fight. The change
+    # lives in the Granite submodule (upstream Themaister/Granite, not a fork we can commit to), so
+    # apply it here rather than making every clone run a git command by hand.
+    #
+    # Detects the EFFECT, not the patch: if PS2X_PGS_FRAMECTX is already in device.cpp -- whether
+    # from this patch or from the fuller pgswait diagnostic patch used on dev branches -- do
+    # nothing. That matters because a --check-and-reset scheme would happily throw away the
+    # pgswait instrumentation. This never resets anything; worst case it declines to act.
+    set(_gr_dir "${PS2X_PGS_DIR}/Granite")
+    set(_gr_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/granite-framectx.patch")
+    if (EXISTS "${_gr_dir}/vulkan/device.cpp" AND EXISTS "${_gr_patch}")
+        file(READ "${_gr_dir}/vulkan/device.cpp" _gr_src)
+        string(FIND "${_gr_src}" "PS2X_PGS_FRAMECTX" _gr_has)
+        unset(_gr_src)
+        if (_gr_has EQUAL -1)
+            execute_process(COMMAND git -C "${_gr_dir}" apply --ignore-whitespace "${_gr_patch}"
+                            RESULT_VARIABLE _gr_apply ERROR_VARIABLE _gr_err)
+            if (_gr_apply EQUAL 0)
+                message(STATUS "granite framectx patch applied (frame-context ring 2 -> 16; PS2X_PGS_FRAMECTX overrides)")
+            else()
+                # Not fatal: the backend still builds at upstream depth 2, just slower.
+                message(WARNING "granite framectx patch did not apply to ${_gr_dir} -- the paraLLEl-GS backend will run at the upstream ring depth of 2 (worth ~7 fps in a fight). Apply it by hand:\n"
+                                "    git -C \"${_gr_dir}\" apply \"${_gr_patch}\"\n${_gr_err}")
+            endif()
+        else()
+            message(STATUS "granite framectx: PS2X_PGS_FRAMECTX already present, nothing to do")
+        endif()
+    endif()
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
     add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
     target_sources(ps2_runtime PRIVATE src/lib/ps2_gs_pgs.cpp)

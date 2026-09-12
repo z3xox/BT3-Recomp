@@ -1,19 +1,30 @@
 # Frame-context ring depth (paraLLEl-GS / Granite)
 
-Worth ~7 fps in a BT3 fight. Not applied automatically, because it patches the
-Granite submodule, which points at upstream `Themaister/Granite`.
+Worth ~7 fps in a BT3 fight.
 
-## Apply
+## Applied automatically
 
-    cd ps2xRuntime/third_party/parallel-gs
-    git -C Granite checkout -- vulkan/
-    git -C Granite apply ../../../patches/granite-framectx.patch
+CMake applies this at configure time (`ps2xRuntime/CMakeLists.txt`, the paraLLEl-GS
+block). Nothing to run by hand. On configure you will see one of:
 
-Then rebuild. Confirm it took: the log must read
+    -- granite framectx patch applied (frame-context ring 2 -> 16; PS2X_PGS_FRAMECTX overrides)
+    -- granite framectx: PS2X_PGS_FRAMECTX already present, nothing to do
+
+It detects the **effect**, not the patch: if `PS2X_PGS_FRAMECTX` is already in
+`device.cpp` -- from this patch, or from the fuller `pgswait` diagnostic patch used on
+dev branches -- it does nothing. It never resets or overwrites anything, so it cannot
+clobber a more complete patch. If it cannot apply it warns and carries on at the
+upstream depth of 2; the build still works, just slower.
+
+Confirm at runtime: the log must read
 
     [pgswait] frame contexts = 16
 
-`PS2X_PGS_FRAMECTX=<n>` overrides at runtime; `2` restores upstream behaviour.
+`PS2X_PGS_FRAMECTX=<n>` overrides; `2` restores upstream behaviour.
+
+## By hand, if you ever need to
+
+    git -C ps2xRuntime/third_party/parallel-gs/Granite apply ps2xRuntime/patches/granite-framectx.patch
 
 ## What it does
 

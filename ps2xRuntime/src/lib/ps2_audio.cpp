@@ -390,22 +390,21 @@ PS2AudioBackend::StreamProgress PS2AudioBackend::streamProgress(uint32_t streamI
     // previously-filled sub-buffer free again.
     auto dev = m_impl->deviceProgress.find(streamId);
     p.consumedSamples = (dev != m_impl->deviceProgress.end()) ? dev->second.played : 0u;
-    // [bgmstall] STARTUP CREDIT. `played` is the right answer once audio is flowing, but before
-    // the stream has ever started it is 0 and stays 0 -- and the guest will not queue more until
-    // it moves. It sends one buffer (~2432 frames), we need a 4-chunk cushion to start, and both
-    // sides wait forever: the FIRST BGM is lost (title silent, voice fine because voice is a
-    // different path), and music only appears once a later stream tears down and restarts. That
-    // is the 5aa0782 regression.
-    // So, until the stream starts, credit what we are holding -- bounded by one cushion's worth.
-    // That is enough for the guest to keep feeding until we can start, and no more: it can never
-    // credit audio the device has not taken once playback is under way, which is the property
-    // 5aa0782 added (BT3 sending STOP while the first call-out was still inside the device).
-    if (!it->second.started)
-    {
-        const uint64_t priming = std::min<uint64_t>(it->second.fed, kStreamChunkFrames * 4u);
-        if (priming > p.consumedSamples)
-            p.consumedSamples = priming;
-    }
+    // [bgmstall] 5aa0782 replaced `fed` with the device's `played` here so BT3 could not send
+    // STOP while the first call-out was still inside the device. It also throttles the guest to
+    // exactly the playback rate, so the ring never builds a cushion:
+    //     measured  started=1 played=6144 Lring=0 Rring=0  -- 0.26 s of audio in 2.5 s of wall
+    //     clock, both rings empty. Not deadlocked, STARVED; the music is inaudible.
+    // Before a stream has started it is worse: `played` is 0 and cannot move, so the guest sends
+    // one buffer and waits forever and the FIRST BGM is lost (title silent, voice unaffected --
+    // voice does not use this credit loop). A bounded lead (played + 4 chunks) was tried and is
+    // still throttled whenever `played` lags, which it does from the moment the stream starts.
+    // So restore the behaviour that worked. Audible music now beats a subtler STOP guarantee;
+    // PS2X_SNDCREDIT=played restores 5aa0782 for whoever revisits that.
+    static const bool s_creditPlayed = [](){ const char *v = std::getenv("PS2X_SNDCREDIT");
+        return v && std::strcmp(v, "played") == 0; }();
+    if (!s_creditPlayed)
+        p.consumedSamples = it->second.fed;
     p.gapSamples = it->second.gap;
     p.pending = it->second.ring.size();
     return p;
@@ -506,6 +505,10 @@ void PS2AudioBackend::serviceStreams()
     // stream keeps them sample-locked by construction. Other ids (SE banks) stay mono.
     // PS2X_SNDNOPAIR=1 restores the old independent-mono behaviour.
     constexpr uint32_t kLeftId = 0u, kRightId = 1u, kPairKey = 0xFFFF0000u;
+    // [bgmtime] seconds since the backend started servicing, so the pair's lifecycle can be
+    // lined up against what is on screen (copyright -> title -> menu).
+    static const auto s_bgmT0 = std::chrono::steady_clock::now();
+    const double tNow = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_bgmT0).count();
     static const bool s_noPair = []() {
         const char *v = std::getenv("PS2X_SNDNOPAIR");
         return v && v[0] && v[0] != '0';
@@ -524,7 +527,8 @@ void PS2AudioBackend::serviceStreams()
         static auto tLast = t0;
         static auto tBeat = t0;
         const auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - tBeat).count() >= 5.0)
+        static const bool s_beat = [](){ const char *v = std::getenv("PS2X_SNDBEAT"); return v && v[0] && v[0] != '0'; }();
+        if (s_beat && std::chrono::duration<double>(now - tBeat).count() >= 5.0)
         {   // [bgmbeat] objective "is music actually playing": the device's played counter. Rising
             // = audio is coming out. Flat with a started stream = started but starved.
             tBeat = now;
@@ -582,7 +586,7 @@ void PS2AudioBackend::serviceStreams()
         auto pairIt = m_impl->streams.find(kPairKey);
         if (pairIt != m_impl->streams.end() && L.sampleRate != 0u && L.sampleRate != s_pairOpenRate)
         {
-            std::fprintf(stderr, "[sndplay] pair rate %u -> %u, reopening device\n",
+            std::fprintf(stderr, "[sndplay] t=%.1fs pair rate %u -> %u, reopening device\n", tNow,
                          s_pairOpenRate, L.sampleRate);
             StopAudioStream(pairIt->second);
             UnloadAudioStream(pairIt->second);
@@ -598,7 +602,7 @@ void PS2AudioBackend::serviceStreams()
             m_impl->deviceProgress[kLeftId] = {};
             m_impl->deviceProgress[kRightId] = {};
             s_pairOpenRate = L.sampleRate;
-            std::fprintf(stderr, "[sndplay] opened STEREO PAIR (streams 0+1) rate=%u\n", L.sampleRate);
+            std::fprintf(stderr, "[sndplay] t=%.1fs opened STEREO PAIR (streams 0+1) rate=%u\n", tNow, L.sampleRate);
         }
         AudioStream &s = m_impl->streams[kPairKey];
 
@@ -646,6 +650,7 @@ void PS2AudioBackend::serviceStreams()
             {
                 PlayAudioStream(s);
                 L.started = R.started = true;
+                std::fprintf(stderr, "[bgmtime] t=%.1fs pair STARTED with %zu frames (rate=%u)\n", tNow, have, L.sampleRate);
                 if (forced)
                     std::fprintf(stderr, "[sndplay] pair force-start with %zu frames cushion\n", have);
             }

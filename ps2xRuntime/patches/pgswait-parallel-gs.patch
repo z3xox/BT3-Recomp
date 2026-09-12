@@ -1,8 +1,72 @@
 diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
-index 10120fb..d3d70b2 100644
+index 10120fb..f484ce0 100644
 --- a/gs/gs_interface.cpp
 +++ b/gs/gs_interface.cpp
-@@ -4316,6 +4316,7 @@ void GSInterface::flush()
+@@ -9,9 +9,53 @@
+ #include "shaders/swizzle_utils.h"
+ #include "muglm/muglm_impl.hpp"
+ #include "gs_registers_debug.hpp"
++#include <cstdlib>
+ 
+ namespace ParallelGS
+ {
++namespace
++{
++// [sspages] Restrict WHICH VRAM pages may be promoted to super-sampled textures.
++// Upstream promotes any page PageTracker flagged as a framebuffer write, which in BT3 is the whole
++// post-process chain; [sscensus] shows the cost is ~62% one page (the Z/mask page) and 13% the
++// outline page. PS2X_PGS_SSPAGES=<comma-separated pages> (e.g. "336", or "336,224") limits promotion
++// to those pages; unset = upstream behaviour; a value with no digits (e.g. "none") promotes nothing.
++// This is NOT the same as super_sampled_textures=false, which also changes the render-pass
++// single-sample demotion gate -- this knob isolates the texture promotion alone.
++struct SsPageAllow
++{
++	bool enabled;
++	bool page[512];
++};
++
++const SsPageAllow &ss_page_allow()
++{
++	static const SsPageAllow a = []() {
++		SsPageAllow s = {};
++		const char *v = getenv("PS2X_PGS_SSPAGES");
++		if (v && v[0])
++		{
++			s.enabled = true;
++			for (const char *p = v; *p; )
++			{
++				if (*p < '0' || *p > '9') { ++p; continue; }
++				unsigned n = 0;
++				while (*p >= '0' && *p <= '9') { n = n * 10u + unsigned(*p - '0'); ++p; }
++				s.page[n & 511u] = true;
++			}
++		}
++		return s;
++	}();
++	return a;
++}
++
++inline bool ss_page_allowed(uint32_t base_page)
++{
++	const SsPageAllow &a = ss_page_allow();
++	return !a.enabled || a.page[base_page & 511u];
++}
++}
++
+ GSInterface::GSInterface()
+ 	: tracker(*this), renderer(tracker)
+ {
+@@ -1600,7 +1644,8 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 	if (desc.rect.levels == 1 && super_sampled_textures &&
+ 	    get_bits_per_pixel(desc.tex0.desc.PSM) >= 8 &&
+ 	    PRIMType(prim.desc.PRIM) == PRIMType::Sprite &&
+-	    tracker.texture_may_super_sample(state_tracker.tex.page_rects[0]))
++	    tracker.texture_may_super_sample(state_tracker.tex.page_rects[0]) &&
++	    ss_page_allowed(state_tracker.tex.page_rects[0].base_page))
+ 	{
+ 		desc.samples = 1u << (sampling_rate_x_log2 + sampling_rate_y_log2);
+ 	}
+@@ -4316,6 +4361,7 @@ void GSInterface::flush()
  {
  	flush_pending_transfer(true);
  	uint64_t value = tracker.mark_submission_timeline();
@@ -11,7 +75,7 @@ index 10120fb..d3d70b2 100644
  	if (debug_mode.deterministic_timeline_query)
  		renderer.wait_timeline(value);
 diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
-index 29452b2..56586d9 100644
+index 29452b2..0a59919 100644
 --- a/gs/gs_renderer.cpp
 +++ b/gs/gs_renderer.cpp
 @@ -4,6 +4,9 @@
@@ -24,7 +88,15 @@ index 29452b2..56586d9 100644
  #include "logging.hpp"
  #include "gs_interface.hpp"
  #include "gs_registers_debug.hpp"
-@@ -1113,6 +1116,9 @@ void GSRenderer::flush_qword_clears()
+@@ -17,6 +20,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <climits>
++#include <chrono>
+ 
+ #if defined(__clang__)
+ #pragma clang diagnostic ignored "-Wformat-security"
+@@ -1113,6 +1117,9 @@ void GSRenderer::flush_qword_clears()
  	qword_clears.clear();
  }
  
@@ -34,7 +106,7 @@ index 29452b2..56586d9 100644
  void GSRenderer::flush_submit(uint64_t value)
  {
  	if (!device)
-@@ -1212,7 +1218,26 @@ void GSRenderer::flush_submit(uint64_t value)
+@@ -1212,7 +1219,26 @@ void GSRenderer::flush_submit(uint64_t value)
  
  	// If we have a timeline trace, we'd like it to be somewhat readable.
  	// Only do garbage collection at frame boundaries.
@@ -62,6 +134,134 @@ index 29452b2..56586d9 100644
  		device->next_frame_context();
  
  	log_timestamps();
+@@ -1358,6 +1384,118 @@ Vulkan::ImageHandle GSRenderer::copy_cached_texture(const Vulkan::Image &img, co
+ 	return copy_img;
+ }
+ 
++// [sscensus] Diagnostic (PS2X_PGS_SSCENSUS=1, default off): which VRAM pages get promoted to
++// super-sampled textures, and what that promotion costs. The promotion is decided in
++// GSInterface (desc.samples = 1 << (rate_x+rate_y)) gated on PAGE_STATE_MAY_SUPER_SAMPLE_BIT,
++// which PageTracker sets on EVERY page written as a framebuffer. This census answers whether the
++// cost is concentrated in a few render-target pages (so the qualifier could be narrowed to them)
++// or spread across every RT-reading effect (in which case the cost IS the per-sample quality).
++// Counted here, at the cache-miss path that actually allocates and uploads.
++namespace
++{
++struct SsCensusPage
++{
++	uint64_t uploads, ssUploads, texels, ssTexels;
++	uint32_t maxSamples, psm;
++};
++
++struct SsCensus
++{
++	bool enabled;
++	double interval;
++	SsCensusPage pages[512];
++	uint64_t uploads, ssUploads, replacedUploads, texels, ssTexels;
++	std::chrono::steady_clock::time_point last;
++};
++
++SsCensus &ss_census()
++{
++	// getenv cached: an uncached getenv in a hot path has been a measured regression here before.
++	static SsCensus c = []() {
++		SsCensus s = {};
++		const char *v = getenv("PS2X_PGS_SSCENSUS");
++		s.enabled = v && v[0] && v[0] != '0';
++		// The value is the print interval in seconds (PS2X_PGS_SSCENSUS=5); "1" stays a valid
++		// enable and simply means a 1 s interval, so short offline replays still emit a line.
++		const double iv = v ? atof(v) : 0.0;
++		s.interval = iv >= 0.5 ? iv : 5.0;
++		s.last = std::chrono::steady_clock::now();
++		return s;
++	}();
++	return c;
++}
++
++void ss_census_record(uint32_t tbp0, uint32_t psm, uint32_t width, uint32_t height,
++                      uint32_t samples, bool replaced)
++{
++	SsCensus &c = ss_census();
++	if (!c.enabled)
++		return;
++
++	// Mirrors the allocator: info.layers = desc.samples, +1 when super-sampled.
++	const uint32_t layers = samples > 1 ? samples + 1u : 1u;
++	const uint64_t texels = uint64_t(width) * height * layers;
++	const uint32_t page = (tbp0 / 32u) & 511u;
++	SsCensusPage &p = c.pages[page];
++
++	p.uploads++;
++	p.texels += texels;
++	p.psm = psm;
++	c.uploads++;
++	c.texels += texels;
++	if (replaced)
++		c.replacedUploads++;
++	if (samples > 1)
++	{
++		p.ssUploads++;
++		p.ssTexels += texels;
++		if (samples > p.maxSamples)
++			p.maxSamples = samples;
++		c.ssUploads++;
++		c.ssTexels += texels;
++	}
++
++	const auto now = std::chrono::steady_clock::now();
++	const double dt = std::chrono::duration<double>(now - c.last).count();
++	if (dt < c.interval)
++		return;
++
++	// Rank by super-sampled texel cost: that is exactly what a narrower qualifier would remove.
++	unsigned order[512], n = 0;
++	for (unsigned i = 0; i < 512; i++)
++		if (c.pages[i].ssUploads)
++			order[n++] = i;
++	std::sort(order, order + n, [&](unsigned x, unsigned y) {
++		return c.pages[x].ssTexels > c.pages[y].ssTexels;
++	});
++
++	fprintf(stderr,
++	        "[sscensus] %.1fs: uploads %.0f/s (ss %.0f/s = %.1f%%, replaced %.0f/s) | "
++	        "texels %.1f MT/s (ss %.1f MT/s = %.1f%%) | ss pages %u",
++	        dt, double(c.uploads) / dt, double(c.ssUploads) / dt,
++	        c.uploads ? 100.0 * double(c.ssUploads) / double(c.uploads) : 0.0,
++	        double(c.replacedUploads) / dt,
++	        double(c.texels) / dt / 1e6, double(c.ssTexels) / dt / 1e6,
++	        c.texels ? 100.0 * double(c.ssTexels) / double(c.texels) : 0.0, n);
++
++	for (unsigned i = 0; i < n && i < 8; i++)
++	{
++		const SsCensusPage &q = c.pages[order[i]];
++		fprintf(stderr, " | pg%u psm%u x%u %.0f/s %.2fMT/s (%.0f%%)",
++		        order[i], q.psm, q.maxSamples, double(q.ssUploads) / dt,
++		        double(q.ssTexels) / dt / 1e6,
++		        c.ssTexels ? 100.0 * double(q.ssTexels) / double(c.ssTexels) : 0.0);
++	}
++	fprintf(stderr, "\n");
++	fflush(stderr);
++
++	for (unsigned i = 0; i < 512; i++)
++		c.pages[i] = {};
++	c.uploads = c.ssUploads = c.replacedUploads = c.texels = c.ssTexels = 0;
++	c.last = now;
++}
++}
++
+ Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &desc)
+ {
+ 	if (!device)
+@@ -1445,6 +1583,8 @@ Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &d
+ 		up.replaced = replaced;
+ 		texture_uploads.push_back(std::move(up));
+ 	}
++	ss_census_record(uint32_t(desc.tex0.desc.TBP0), uint32_t(desc.tex0.desc.PSM),
++	                 desc.rect.width, desc.rect.height, desc.samples, replaced);
+ 
+ 	if (enable_timestamps)
+ 	{
 diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
 index efb7bee..b6a444f 100644
 --- a/gs/gs_renderer.hpp
@@ -74,3 +274,55 @@ index efb7bee..b6a444f 100644
  
  	// Wait until timeline reaches value. After waiting, it may be safe to read from host VRAM.
  	void wait_timeline(uint64_t value);
+diff --git a/tools/gs_dump_replayer_ppm.cpp b/tools/gs_dump_replayer_ppm.cpp
+index 3e5394a..14f19cb 100644
+--- a/tools/gs_dump_replayer_ppm.cpp
++++ b/tools/gs_dump_replayer_ppm.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ // [bt3] gs_dump_replayer with a PPM dump of every N-th scanout (offline picture checks against console dumps).
+ #include "gs_interface.hpp"
+ #include "gs_dump_parser.hpp"
+@@ -54,6 +55,19 @@ static void write_ppm(Device &device, const ScanoutResult &res, const char *path
+ 	device.submit(cmd2);
+ }
+ 
++// [pgswait] defined in Granite fence.cpp / device.cpp
++extern std::atomic<unsigned long long> g_pgsFenceWaitNs;
++extern std::atomic<unsigned long long> g_pgsFenceWaitCalls;
++extern std::atomic<unsigned long long> g_pgsFenceWaitBlocked;
++extern std::atomic<unsigned long long> g_pgsIdleNs;
++extern std::atomic<unsigned long long> g_pgsIdleCalls;
++extern std::atomic<unsigned long long> g_pgsFrameWaitNs;
++extern std::atomic<unsigned long long> g_pgsFrameWaitCalls;
++extern std::atomic<unsigned long long> g_pgsFrameWaitBlocked;
++extern std::atomic<unsigned long long> g_pgsQueueIdleCalls;
++extern std::atomic<unsigned long long> g_pgsSemWaitNs;
++extern std::atomic<unsigned long long> g_pgsSemWaitCalls;
++
+ int main(int argc, char **argv)
+ {
+ 	std::string dump_path, prefix = "frame";
+@@ -66,6 +80,7 @@ int main(int argc, char **argv)
+ 	cbs.add("--max", [&](CLIParser &parser) { max_vsyncs = parser.next_uint(); });
+ 	cbs.add("--prefix", [&](CLIParser &parser) { prefix = parser.next_string(); });
+ 	cbs.add("--high-res-scanout", [&](CLIParser &) { high_res_scanout = true; });
++	cbs.add("--ssaa-textures", [&](CLIParser &) { opts.super_sampled_textures = true; });
+ 	cbs.default_handler = [&](const char *arg) { dump_path = arg; };
+ 	CLIParser cli_parser(std::move(cbs), argc - 1, argv + 1);
+ 	if (!cli_parser.parse() || dump_path.empty()) { LOGE("usage: replayer-ppm <dump.gs> [--ssaa N] [--every N] [--max N] [--prefix p]\n"); return EXIT_FAILURE; }
+@@ -96,5 +111,14 @@ int main(int argc, char **argv)
+ 		if (max_vsyncs && vsyncs >= max_vsyncs) break;
+ 	}
+ 	LOGI("Done, %u vsyncs\n", vsyncs);
++	LOGI("[pgswait] fence %.1f ms over %llu calls (%llu blocked >50us) | wait_idle %.1f ms over %llu calls | vsyncs %u\n",
++	     double(g_pgsFenceWaitNs.load()) / 1e6, (unsigned long long) g_pgsFenceWaitCalls.load(),
++	     (unsigned long long) g_pgsFenceWaitBlocked.load(),
++	     double(g_pgsIdleNs.load()) / 1e6, (unsigned long long) g_pgsIdleCalls.load(), vsyncs);
++	LOGI("[pgswait] FRAME-CTX %.1f ms over %llu calls (%llu blocked) | timeline %.1f ms over %llu | queueIdleQuirk %llu\n",
++	     double(g_pgsFrameWaitNs.load()) / 1e6, (unsigned long long) g_pgsFrameWaitCalls.load(),
++	     (unsigned long long) g_pgsFrameWaitBlocked.load(),
++	     double(g_pgsSemWaitNs.load()) / 1e6, (unsigned long long) g_pgsSemWaitCalls.load(),
++	     (unsigned long long) g_pgsQueueIdleCalls.load());
+ 	return 0;
+ }

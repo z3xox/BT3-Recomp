@@ -591,15 +591,35 @@ foreach(_p IN ITEMS "parallel-gs:${PS2X_PGS_DIR}:pgswait-parallel-gs.patch:g_pgs
         string(FIND "${_psrc}" "${_pmark}" _phas)
         unset(_psrc)
         if (_phas EQUAL -1)
+            # Marker absent. Either the tree is clean (apply works) or an OLDER version of this
+            # same patch is applied, in which case the new one conflicts -- exactly what happened
+            # when [gcframe] changed pgswait-parallel-gs.patch for the first time since 9c6179e:
+            # the stale patch was in the tree, the new one would not apply, and the build died at
+            # link with "undefined symbol ParallelGS::g_pgsFlushSubmits". So self-heal like the
+            # raylib patch does: reset the vendored files and apply fresh. These trees are entirely
+            # patch-managed -- the patch file in this repo is the source of truth -- so a reset
+            # costs nothing that is not reproducible.
+            execute_process(COMMAND git -c safe.directory=* -C "${_pdir}" apply --check --ignore-whitespace "${_ppatch}"
+                            RESULT_VARIABLE _pok OUTPUT_QUIET ERROR_QUIET)
+            if (NOT _pok EQUAL 0)
+                message(STATUS "[pgswait] ${_pname}: an older patch is applied -- restoring pristine sources")
+                execute_process(COMMAND git -c safe.directory=* -C "${_pdir}" checkout -- .
+                                RESULT_VARIABLE _prst OUTPUT_QUIET ERROR_QUIET)
+                if (NOT _prst EQUAL 0)
+                    message(FATAL_ERROR "[pgswait] could not restore ${_pdir} (git checkout -- . failed)")
+                endif()
+            endif()
             execute_process(COMMAND git -c safe.directory=* -C "${_pdir}" apply --ignore-whitespace "${_ppatch}"
                             RESULT_VARIABLE _pres ERROR_VARIABLE _perr)
             if (_pres EQUAL 0)
                 message(STATUS "[pgswait] ${_pname} patch applied")
             else()
-                message(WARNING "[pgswait] ${_pname} patch did NOT apply to ${_pdir}.\n"
-                                "Reset and retry by hand:\n"
-                                "    git -C \"${_pdir}\" checkout -- .\n"
-                                "    git -C \"${_pdir}\" apply \"${_ppatch}\"\n${_perr}")
+                # FATAL, unlike main's framectx hook: the runtime REFERENCES these symbols, so
+                # carrying on just trades a clear configure error for an opaque link failure.
+                message(FATAL_ERROR "[pgswait] ${_pname} patch could not be applied to ${_pdir}.\n"
+                                    "The build would fail at link with undefined pgswait symbols.\n"
+                                    "    git -C \"${_pdir}\" checkout -- .\n"
+                                    "    git -C \"${_pdir}\" apply \"${_ppatch}\"\n${_perr}")
             endif()
         else()
             message(STATUS "[pgswait] ${_pname} patch already applied")

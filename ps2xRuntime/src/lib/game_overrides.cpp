@@ -1157,7 +1157,10 @@ namespace
     // their own, so they are matched to headers FIFO -- which is exactly the observed order:
     // [hdr 1][blob 1] then [hdr 2..5][blob 2..5].
     std::vector<uint32_t> g_sePendingBlob;
-    uint32_t g_seNextSlot = 0u;  // 0, then 1..5 wrapping: slot 0 is never re-uploaded
+    // Which per-character slot the next unrecognised bank takes: reset to 4 by any identified
+    // bank, so each load group fills 4 then 5.
+    uint32_t g_sePerChar = 4u;
+    uint32_t g_seSlotCount[kSeSlots] = {};   // Vagi sample count currently in each slot
 
     // Read a byte out of slot `idx`'s sample blob; returns false past the end.
     bool seBlobByte(uint32_t idx, uint32_t off, uint8_t &out)
@@ -1241,7 +1244,9 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
 {
     if (!data || size < 24u)
         return;
+    // Find the Vagi chunk and read its SAMPLE COUNT -- that count is the bank's identity.
     bool hasVagi = false;
+    uint32_t vagiCount = 0u;
     for (uint32_t o = 0, guard = 0; o + 12u <= size && guard < 16u; ++guard)
     {
         uint32_t magic, tag, len;
@@ -1253,6 +1258,8 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
         if (tag == 0x56616769u) // 'Vagi'
         {
             hasVagi = true;
+            if (o + 16u <= size)
+                std::memcpy(&vagiCount, data + o + 12u, 4);
             break;
         }
         o += len;
@@ -1260,24 +1267,55 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
     if (!hasVagi)
         return;
     std::lock_guard<std::mutex> lk(g_seBlobM);
-    const uint32_t slot = g_seNextSlot;
-    // Slot 0 is loaded once at boot; every reload group restarts at slot 1.
-    g_seNextSlot = (slot + 1u >= kSeSlots) ? 1u : (slot + 1u);
-    // A bank's header size is its sample-table size and is stable across reloads (5120, 5440,
-    // 832, 3712, 3712). If a slot's size changes, the group was not the expected five uploads
-    // and every slot after this one is now mis-assigned -- say so loudly instead of quietly
-    // playing the wrong sound, which is the failure this whole change is about.
+
+    // [sebankid] The slot comes from WHAT THE BANK IS, not from its position in the upload group.
+    //
+    // Position was the first attempt and it is wrong: a group is NOT always five banks. Observed
+    // two shapes, both real --
+    //     boot + fight:   79, 84, 10, 56, 56   (five)
+    //     another fight:  79,     10, 56, 56   (four -- no 84-sample common-SFX bank)
+    // -- so counting arrivals slid the two per-character banks down into slots 3 and 4, and the
+    // game asking for bank bit 16/32 got the wrong bank entirely. Reported as a character voice
+    // looping (the fly-up call-out repeating), because a sample index resolved inside a bank that
+    // was never meant to answer it.
+    //
+    // The Vagi sample count identifies each fixed bank uniquely, and the per-character banks are
+    // the only pair that collides -- they are told apart by group order, which is the one thing
+    // position IS reliable for.
+    uint32_t slot;
+    const char *why;
+    switch (vagiCount)
+    {
+        case 8u:  slot = 0u; g_sePerChar = 4u; why = "menu/system, 8"; break;
+        case 79u: slot = 1u; g_sePerChar = 4u; why = "system SE, 79"; break;
+        case 84u: slot = 2u; g_sePerChar = 4u; why = "common fight SFX, 84"; break;
+        case 10u: slot = 3u; g_sePerChar = 4u; why = "10-sample"; break;
+        default:
+            // Anything else is a per-character bank (56 in every bank seen, but a character with
+            // a different count must still land in 4 then 5 rather than be dropped).
+            slot = g_sePerChar;
+            why = "per-character";
+            if (g_sePerChar < kSeSlots - 1u)
+                g_sePerChar++;
+            else
+                std::fprintf(stderr, "[se] WARNING a third per-character bank (%u samples) in one "
+                                     "group -- slot 5 overwritten, mapping may be off\n", vagiCount);
+            break;
+    }
     const bool reload = !g_seSlot[slot].hdr.empty();
-    if (reload && g_seSlot[slot].hdr.size() != size)
-        std::fprintf(stderr, "[se] WARNING slot %u header size changed %zu -> %u: reload group "
-                             "was not the expected 5 banks, slot mapping may be off\n",
-                     slot, g_seSlot[slot].hdr.size(), size);
+    // Same-slot reloads should keep the same sample count. If one changes, the identity table
+    // above no longer matches this build of the game -- say so loudly rather than quietly playing
+    // the wrong sound, which is the failure this whole path exists to prevent.
+    if (reload && g_seSlotCount[slot] != vagiCount)
+        std::fprintf(stderr, "[se] WARNING slot %u sample count changed %u -> %u\n",
+                     slot, g_seSlotCount[slot], vagiCount);
     g_seSlot[slot].addr = dst;
     g_seSlot[slot].hdr.assign(data, data + size);
     g_seSlot[slot].blob.clear();   // the old blob belongs to the bank being replaced
+    g_seSlotCount[slot] = vagiCount;
     g_sePendingBlob.push_back(slot);
-    std::fprintf(stderr, "[se] bank header -> slot %u at 0x%x (%u bytes)%s\n",
-                 slot, dst, size, reload ? " [reload]" : "");
+    std::fprintf(stderr, "[se] bank header -> slot %u at 0x%x (%u bytes, %u samples: %s)%s\n",
+                 slot, dst, size, vagiCount, why, reload ? " [reload]" : "");
 }
 
 std::atomic<int> g_rayHookArm{0};   // [rayhook] external linkage: set by the [raysrc] probe in ps2_memory.cpp

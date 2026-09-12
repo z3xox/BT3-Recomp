@@ -1,6 +1,12 @@
 #include "Common.h"
 #include "LibC.h"
 #include "ps2_log.h"
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <ctime>
+#include <cstdlib>
+#include <cstdio>
 
 namespace ps2_stubs
 {
@@ -1091,10 +1097,52 @@ namespace ps2_stubs
     // the missing "lingering aura" (2026-09-03). Same recurrence as the guest's own rand.
     static uint64_t g_ps2Rand64 = 1ull;
 
+    // [randseed] BT3 never calls srand -- not once in 7810 recompiled guest files -- and it never
+    // reads the RTC or COP0 Count either. It does seed, but from us: FUN_00254d70 memsets a
+    // 16-byte buffer and fills it with FOUR rand() values (the only rand calls in an entire boot,
+    // all from ra=0x254db8), which becomes the game's own RNG state. Leave this LCG at newlib's
+    // seed of 1 and that state is byte-identical every boot, so every early "random" choice is
+    // frozen -- the title-screen character call-out was always the same voice.
+    //
+    // Default is therefore a fresh seed per boot. PS2X_RANDSEED=<n> pins one, which is what any
+    // determinism-dependent tooling wants (replay/parity runs): PS2X_RANDSEED=1 is exactly the
+    // old behaviour.
+    static uint64_t randInitialSeed()
+    {
+        const char *v = std::getenv("PS2X_RANDSEED");
+        uint64_t seed;
+        if (v && v[0] && std::strcmp(v, "time") != 0)
+        {
+            seed = std::strtoull(v, nullptr, 0);
+        }
+        else
+        {
+            // Seconds alone would repeat for two boots in the same second; nanoseconds will not.
+            const uint64_t ns = static_cast<uint64_t>(
+                std::chrono::system_clock::now().time_since_epoch().count());
+            seed = ns * 6364136223846793005ull + 1442695040888963407ull;
+        }
+        std::fprintf(stderr, "[randseed] libc rand seed = %llu (PS2X_RANDSEED=%s)\n",
+                     (unsigned long long)seed, (v && v[0]) ? v : "unset, per-boot");
+        return seed;
+    }
+
+    static std::atomic<uint32_t> g_randCalls{0};
+    uint32_t ps2RandCallCount() { return g_randCalls.load(std::memory_order_relaxed); }
+
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static const uint64_t s_seed = randInitialSeed();
+        static bool s_init = (g_ps2Rand64 = s_seed, true);
+        (void)s_init;
         g_ps2Rand64 = g_ps2Rand64 * 6364136223846793005ull + 1ull;
-        setReturnS32(ctx, static_cast<int32_t>((g_ps2Rand64 >> 32) & 0x7FFFFFFFu));
+        const int32_t r = static_cast<int32_t>((g_ps2Rand64 >> 32) & 0x7FFFFFFFu);
+        const uint32_t n = g_randCalls.fetch_add(1, std::memory_order_relaxed);
+        static const bool s_log = [](){ const char *v = std::getenv("PS2X_RANDLOG");
+                                        return v && v[0] && v[0] != '0'; }();
+        if (s_log && n < 400u)
+            std::fprintf(stderr, "[randlog] #%u -> %d  ra=0x%x\n", n, r, getRegU32(ctx, 31));
+        setReturnS32(ctx, r);
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

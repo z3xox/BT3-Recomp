@@ -36,6 +36,11 @@ constexpr uint8_t jVID(uint32_t w) { return (uint8_t)((w >> 6) & 0xFu); }
 constexpr int16_t jIMM11(uint32_t w) { return (int16_t)(int32_t)((int32_t)(w << 21) >> 21); }
 
 static const int s_jMacMode = [](){ const char *v = std::getenv("PS2X_VU_MACFLAGS"); return v ? std::atoi(v) : 1; }();
+// [macelide] set from Prog::needsMac before each recompiled program runs. false = this program
+// never reads the MAC flags, so commitF can skip computing them. PS2X_VU_MACFLAGS=0 still forces
+// them off everywhere; PS2X_VU_MACELIDE=0 disables the per-program elision (A/B escape hatch).
+bool g_jitMacNeeded = true;
+static const bool s_jMacElide = [](){ const char *v = std::getenv("PS2X_VU_MACELIDE"); return !(v && v[0] == '0'); }();
 static const bool s_jClamp = vuClampEnabled();
 static thread_local float s_jSink[4];   // vf0 write sink (vf0 is the constant (0,0,0,1))
 
@@ -43,7 +48,7 @@ static thread_local float s_jSink[4];   // vf0 write sink (vf0 is the constant (
 template <uint8_t DEST>
 static inline __attribute__((always_inline)) void commitF(VU1State &st, float *dst, __m128 r)
 {
-    if (s_jMacMode != 0)
+    if (s_jMacMode != 0 && (g_jitMacNeeded || !s_jMacElide))
     {
         static constexpr uint8_t rev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
         constexpr uint32_t laneDest = rev4[DEST & 0xFu];

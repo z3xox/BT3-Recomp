@@ -2347,6 +2347,78 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessorNumb
 #else
 #  define PS2X_CUR_CORE() (-1)
 #endif
+// [pinpipe] Keep GameThread / KickWorker / GsThread on distinct PHYSICAL cores.
+// Measured on the user's Windows box in a splitscreen fight, unpinned: GameThread woke on a
+// different core on 71-78% of frames, KickWorker on 43-49%. They hand ~194 MB/s of packet buffers
+// along the pipeline, so every migration starts with none of it hot. ps2_runtime.cpp's older
+// [pinthreads] is #ifdef __linux__, covers only 2 threads, and auto-skips above 2 physical cores.
+// PS2X_PINPIPE=1 enables; "a,b,c" picks the three CPUs explicitly.
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) int __stdcall GetLogicalProcessorInformationEx(int, void *, unsigned long *);
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread(void);
+extern "C" __declspec(dllimport) unsigned long long __stdcall SetThreadAffinityMask(void *, unsigned long long);
+#endif
+static std::vector<int> ps2xPhysicalCores()
+{
+    std::vector<int> out;
+#if defined(_WIN32)
+    unsigned long len = 0;
+    GetLogicalProcessorInformationEx(0 /*RelationProcessorCore*/, nullptr, &len);
+    if (len)
+    {
+        std::vector<unsigned char> buf(len);
+        if (GetLogicalProcessorInformationEx(0, buf.data(), &len))
+            for (unsigned long off = 0; off + 8 <= len;)
+            {
+                // SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: DWORD Relationship; DWORD Size; then
+                // PROCESSOR_RELATIONSHIP { BYTE Flags; BYTE EfficiencyClass; BYTE Reserved[20];
+                // WORD GroupCount; GROUP_AFFINITY GroupMask[]; } with GROUP_AFFINITY = { KAFFINITY
+                // Mask; WORD Group; WORD Reserved[3]; }.
+                const unsigned char *p = buf.data() + off;
+                unsigned long size; std::memcpy(&size, p + 4, 4);
+                if (!size || off + size > len) break;
+                unsigned long long mask; std::memcpy(&mask, p + 8 + 24, 8);
+                for (int b = 0; b < 64; ++b) if (mask & (1ull << b)) { out.push_back(b); break; }
+                off += size;
+            }
+    }
+#elif defined(__linux__)
+    cpu_set_t allowed; CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0)
+        for (int c = 0; c < CPU_SETSIZE && (int)out.size() < 64; ++c)
+            if (CPU_ISSET(c, &allowed)) out.push_back(c);
+#endif
+    return out;
+}
+void ps2xPinPipelineThread(const char *name, int slot)
+{
+    static const std::vector<int> s_pick = [](){
+        std::vector<int> v;
+        const char *e = std::getenv("PS2X_PINPIPE");
+        if (!e || !e[0] || e[0] == '0') return v;
+        if (std::strchr(e, ','))
+        {
+            const char *p = e;
+            while (*p && v.size() < 3) { v.push_back(std::atoi(p)); const char *c = std::strchr(p, ','); if (!c) break; p = c + 1; }
+        }
+        else v = ps2xPhysicalCores();
+        if (v.size() < 3) { std::fprintf(stderr, "[pinpipe] need 3 distinct cores, found %zu -- not pinning\n", v.size()); v.clear(); }
+        else std::fprintf(stderr, "[pinpipe] pinning GameThread->cpu%d KickWorker->cpu%d GsThread->cpu%d\n", v[0], v[1], v[2]);
+        return v; }();
+    if (s_pick.size() < 3 || slot < 0 || slot > 2) return;
+    const int cpu = s_pick[slot];
+#if defined(_WIN32)
+    if (!SetThreadAffinityMask(GetCurrentThread(), 1ull << cpu))
+        std::fprintf(stderr, "[pinpipe] %s: SetThreadAffinityMask(cpu%d) failed\n", name, cpu);
+#elif defined(__linux__)
+    cpu_set_t c; CPU_ZERO(&c); CPU_SET(cpu, &c);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(c), &c) != 0)
+        std::fprintf(stderr, "[pinpipe] %s: pthread_setaffinity_np(cpu%d) failed\n", name, cpu);
+#else
+    (void)name; (void)cpu;
+#endif
+}
+
 void ps2xCoreMigNote(const char *name)
 {
     static const bool s_on = [](){ const char *v = std::getenv("PS2X_COREMIG"); return v && v[0] && v[0] != '0'; }();
@@ -2354,6 +2426,10 @@ void ps2xCoreMigNote(const char *name)
     thread_local int lastCore = -1;
     thread_local unsigned long moves = 0, samples = 0;
     thread_local std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    // [coremig] GsThread calls this ~444k times/s; sampling every call is more overhead than the
+    // thing being measured. Sample 1 in 64 -- migration rate is a ratio, so a subsample is fine.
+    thread_local unsigned skip = 0;
+    if ((++skip & 63u) != 0u) return;
     const int c = PS2X_CUR_CORE();
     ++samples;
     if (lastCore >= 0 && c != lastCore) ++moves;
@@ -2510,6 +2586,7 @@ void PS2Memory::stage2Loop()
                 }
             }
         }
+        { thread_local bool p = false; if (!p) { p = true; ps2xPinPipelineThread("GsThread", 2); } }   // [pinpipe]
         ps2xCoreMigNote("GsThread");   // [coremig]
         const auto t0 = std::chrono::steady_clock::now();
         switch (it.kind)
@@ -2587,6 +2664,7 @@ void PS2Memory::kickWorkerLoop()
                 return;
             job = std::move(m_kickQueue.front());
             m_kickQueue.pop_front();
+            { thread_local bool p = false; if (!p) { p = true; ps2xPinPipelineThread("KickWorker", 1); } }   // [pinpipe]
             ps2xCoreMigNote("KickWorker");   // [coremig]
             m_kickBusy = true;
         }

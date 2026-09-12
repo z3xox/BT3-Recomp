@@ -56,6 +56,7 @@ extern "C" unsigned long long ps2xWinThreadCpuNs();
 #include <cstring>
 
 void ps2xCoreMigNote(const char *name);   // [coremig] ps2_memory.cpp
+void ps2xPinPipelineThread(const char *name, int slot);   // [pinpipe] ps2_memory.cpp
 
 // [wlk] overlay-table externs (file scope — block-scope extern inside the anon namespace mislinks)
 extern PS2Runtime::RecompiledFunction g_ps2OverlayFunctionTable[];
@@ -4229,6 +4230,7 @@ namespace
         {
             // Async kick mode: the frame's draws are still in the kick-worker queue, so the
             // publish must be enqueued after them (stream order), not executed here.
+            { thread_local bool p = false; if (!p) { p = true; ::ps2xPinPipelineThread("GameThread", 0); } }   // [pinpipe]
             ::ps2xCoreMigNote("GameThread");   // [coremig]
             if (PS2Memory::asyncKickEnabled())
                 runtime->memory().enqueueGpuSwapMarker();

@@ -497,6 +497,43 @@ void PS2AudioBackend::serviceStreams()
     auto itL = m_streams.find(kLeftId);
     auto itR = m_streams.find(kRightId);
     const bool paired = !s_noPair && itL != m_streams.end() && itR != m_streams.end();
+    {   // [bgmdiag] Music silent while SFX works is a reported intermittent boot failure, and every
+        // way it can happen is invisible from the outside. The pair is RESERVED unconditionally
+        // below (ids 0/1 are skipped by the mono path whether or not both sides showed up), so if
+        // only one side ever arrives, BGM is silent for the entire run and nothing says so. The
+        // other candidates -- pair present but never started because the lockstep needs BOTH rings
+        // full, or opened at sampleRate 0 -- look identical from the speakers.
+        // Prints only while the pair is NOT playing, from 5 s in, so a good boot stays quiet.
+        static auto t0 = std::chrono::steady_clock::now();
+        static auto tLast = t0;
+        const auto now = std::chrono::steady_clock::now();
+        const bool hasL = itL != m_streams.end(), hasR = itR != m_streams.end();
+        // Only a genuine fault is worth printing. Neither side present just means the game is not
+        // playing music yet (menus before the title, loading) -- silence there is correct, and
+        // warning about it would make the probe noise on every normal boot.
+        const bool lone   = hasL != hasR;                                   // one side, forever reserved
+        const bool stuck  = hasL && hasR && !itL->second.started;           // pair present, never started
+        if ((lone || stuck) && std::chrono::duration<double>(now - t0).count() > 5.0 &&
+            std::chrono::duration<double>(now - tLast).count() >= 5.0)
+        {
+            tLast = now;
+            std::fprintf(stderr,
+                "[bgmdiag] BGM not playing after %.0fs: L=%s%s R=%s%s pairOpen=%d%s\n",
+                std::chrono::duration<double>(now - t0).count(),
+                hasL ? "yes" : "NO", hasL ? "" : " (never arrived)",
+                hasR ? "yes" : "NO", hasR ? "" : " (never arrived)",
+                m_impl->streams.find(kPairKey) != m_impl->streams.end() ? 1 : 0,
+                lone ? "  <- LONE SIDE: ids 0/1 are reserved for the pair, so this stays silent all run"
+                     : "  <- pair present but never started (lockstep needs BOTH rings full)");
+            if (stuck)
+                std::fprintf(stderr,
+                    "[bgmdiag]   L ring=%zu rate=%u opened=%d started=%d force=%d | R ring=%zu rate=%u opened=%d started=%d force=%d\n",
+                    itL->second.ring.size(), itL->second.sampleRate, itL->second.opened ? 1 : 0,
+                    itL->second.started ? 1 : 0, itL->second.forceStart ? 1 : 0,
+                    itR->second.ring.size(), itR->second.sampleRate, itR->second.opened ? 1 : 0,
+                    itR->second.started ? 1 : 0, itR->second.forceStart ? 1 : 0);
+        }
+    }
     if (paired)
     {
         StreamState &L = itL->second;
@@ -542,8 +579,40 @@ void PS2AudioBackend::serviceStreams()
             // largest cushion this stream will ever have. Waiting past that point deadlocks --
             // no playback means no buffer returns means no further data.
             const size_t have = std::min(L.ring.size(), R.ring.size());
+            {   // [bgmstall] trace the start path itself -- the detector below never fired, so
+                // either this code is not reached each service call or `have` keeps moving.
+                static unsigned n = 0;
+                if (n < 40) { ++n; std::fprintf(stderr, "[bgmstall-t] call %u: have=%zu L=%zu R=%zu stallFrames=%zu force=%d\n",
+                                                n, have, L.ring.size(), R.ring.size(), L.stallFrames, L.forceStart ? 1 : 0); }
+            }
             const bool forced = (L.forceStart || R.forceStart) && have >= kStreamChunkFrames;
-            if (have >= kStreamChunkFrames * 4u || forced)
+            // [bgmstall] STARTUP DEADLOCK, regression from 5aa0782 ("stabilize audio streaming").
+            // That commit stopped crediting the guest for PCM the moment it was copied into
+            // raylib and started crediting only what the device reported PLAYED -- correct, it
+            // stopped BT3 sending STOP while the first call-out was still in the device. But the
+            // guest now waits for that credit before queueing more, and the credit cannot move
+            // until playback starts, and playback waits for 4 chunks. The guest sends ONE buffer
+            // (~2432 frames), we need 4096, and both sides wait forever: BGM silent for the whole
+            // run while SFX (a different path) is fine. Intermittent because it depends on how
+            // many buffers the guest gets out before it first checks.
+            // requestStreamStart does not rescue it -- that fires on the guest's ring being FULL
+            // for 500 ms, and here the ring is nearly EMPTY; the guest is blocked on us, not full.
+            // So: if we hold a playable chunk and the rings have stopped growing, the guest is
+            // waiting on us. Start. Below the intended cushion, but a smaller cushion beats
+            // silence, and it only triggers in the stalled case.
+            if (!L.started && have >= kStreamChunkFrames && have < kStreamChunkFrames * 4u)
+            {
+                const auto nowS = std::chrono::steady_clock::now();
+                if (have != L.stallFrames) { L.stallFrames = have; L.stallSince = nowS; }
+                else if (std::chrono::duration<double>(nowS - L.stallSince).count() >= 0.25)
+                {
+                    std::fprintf(stderr, "[bgmstall] pair stalled at %zu frames for 250 ms (need %zu) -- guest is waiting on us; starting\n",
+                                 have, kStreamChunkFrames * 4u);
+                    L.forceStart = true;
+                }
+            }
+            const bool stalled = L.forceStart && have >= kStreamChunkFrames;
+            if (have >= kStreamChunkFrames * 4u || forced || stalled)
             {
                 PlayAudioStream(s);
                 L.started = R.started = true;

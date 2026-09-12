@@ -792,6 +792,46 @@ namespace ps2_stubs
                     // IOP addresses the bank uploads fell inside that window and got played as raw
                     // PCM (35 KB of ADPCM straight to the device). Gate on the heap boundary so the
                     // split stays correct wherever the heap lives.
+                    {   // [sndflow] Where does streamed PCM stop? Rings get registered on a bad
+                        // boot but no stream ever appears, so the transfer either never arrives,
+                        // is routed away by the heap gate, or is dropped for being too small.
+                        static const bool s_fl = [](){ const char *v = std::getenv("PS2X_SNDFLOW"); return v && v[0] && v[0] != '0'; }();
+                        if (s_fl)
+                        {
+                            static unsigned long nTot = 0, nBelow = 0, nSmall = 0;
+                            static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+                            ++nTot;
+                            if (xfer.dest < kIopHeapBase) { ++nBelow; if (xfer.size < 256) ++nSmall; }
+                            const auto now = std::chrono::steady_clock::now();
+                            if (std::chrono::duration<double>(now - t0).count() >= 5.0)
+                            {
+                                std::fprintf(stderr, "[sndflow] 5s: %lu transfers, %lu below heap (audio), %lu of those too small; last dest=0x%x size=%u heapBase=0x%x play=%d\n",
+                                             nTot, nBelow, nSmall, (unsigned)xfer.dest, (unsigned)xfer.size,
+                                             (unsigned)kIopHeapBase, s_play ? 1 : 0);
+                                nTot = nBelow = nSmall = 0; t0 = now;
+                            }
+                        }
+                    }
+                    {   // [sndflow] Where does streamed PCM stop? On a bad boot the rings get
+                        // registered but no stream ever appears, so the transfer either never
+                        // arrives, is routed away by the heap gate, or is dropped for being small.
+                        static const bool s_fl = [](){ const char *v = std::getenv("PS2X_SNDFLOW"); return v && v[0] && v[0] != '0'; }();
+                        if (s_fl)
+                        {
+                            static unsigned long nTot = 0, nBelow = 0, nSmall = 0;
+                            static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+                            ++nTot;
+                            if (xfer.dest < kIopHeapBase) { ++nBelow; if (xfer.size < 256) ++nSmall; }
+                            const auto now = std::chrono::steady_clock::now();
+                            if (std::chrono::duration<double>(now - t0).count() >= 5.0)
+                            {
+                                std::fprintf(stderr, "[sndflow] 5s: %lu transfers, %lu below heap (audio), %lu too small; last dest=0x%x size=%u heapBase=0x%x play=%d\n",
+                                             nTot, nBelow, nSmall, (unsigned)xfer.dest, (unsigned)xfer.size,
+                                             (unsigned)kIopHeapBase, s_play ? 1 : 0);
+                                nTot = nBelow = nSmall = 0; t0 = now;
+                            }
+                        }
+                    }
                     if (s_play && runtime && xfer.dest < kIopHeapBase)
                     {
                         // [adxrate] Prefer what the stream's own ADX header declared (see

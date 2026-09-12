@@ -1,6 +1,7 @@
 #ifndef PS2_AUDIO_H
 #define PS2_AUDIO_H
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -115,6 +116,11 @@ private:
         uint64_t fed = 0;
         uint64_t dropped = 0;
         uint64_t gap = 0; // samples the guest queued that never reached the device
+        // [bgmstall] startup deadlock detection: the guest is blocked waiting for playback
+        // credit while we wait for a cushion it will never send. Track whether the ring is
+        // still growing; if it has stopped below the cushion, the guest is waiting on us.
+        size_t stallFrames = 0;
+        std::chrono::steady_clock::time_point stallSince{};
     };
     std::unordered_map<uint32_t, StreamState> m_streams;
     // base -> {size, streamId}, ordered so an address lookup is one upper_bound.

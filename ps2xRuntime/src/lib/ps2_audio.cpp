@@ -390,6 +390,21 @@ PS2AudioBackend::StreamProgress PS2AudioBackend::streamProgress(uint32_t streamI
     // previously-filled sub-buffer free again.
     auto dev = m_impl->deviceProgress.find(streamId);
     p.consumedSamples = (dev != m_impl->deviceProgress.end()) ? dev->second.played : 0u;
+    // [bgmstall] 5aa0782 replaced `fed` with the device's `played` here so BT3 could not send
+    // STOP while the first call-out was still inside the device. It also throttles the guest to
+    // exactly the playback rate, so the ring never builds a cushion:
+    //     measured  started=1 played=6144 Lring=0 Rring=0  -- 0.26 s of audio in 2.5 s of wall
+    //     clock, both rings empty. Not deadlocked, STARVED; the music is inaudible.
+    // Before a stream has started it is worse: `played` is 0 and cannot move, so the guest sends
+    // one buffer and waits forever and the FIRST BGM is lost (title silent, voice unaffected --
+    // voice does not use this credit loop). A bounded lead (played + 4 chunks) was tried and is
+    // still throttled whenever `played` lags, which it does from the moment the stream starts.
+    // So restore the behaviour that worked. Audible music now beats a subtler STOP guarantee;
+    // PS2X_SNDCREDIT=played restores 5aa0782 for whoever revisits that.
+    static const bool s_creditPlayed = [](){ const char *v = std::getenv("PS2X_SNDCREDIT");
+        return v && std::strcmp(v, "played") == 0; }();
+    if (!s_creditPlayed)
+        p.consumedSamples = it->second.fed;
     p.gapSamples = it->second.gap;
     p.pending = it->second.ring.size();
     return p;
@@ -490,6 +505,10 @@ void PS2AudioBackend::serviceStreams()
     // stream keeps them sample-locked by construction. Other ids (SE banks) stay mono.
     // PS2X_SNDNOPAIR=1 restores the old independent-mono behaviour.
     constexpr uint32_t kLeftId = 0u, kRightId = 1u, kPairKey = 0xFFFF0000u;
+    // [bgmtime] seconds since the backend started servicing, so the pair's lifecycle can be
+    // lined up against what is on screen (copyright -> title -> menu).
+    static const auto s_bgmT0 = std::chrono::steady_clock::now();
+    const double tNow = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_bgmT0).count();
     static const bool s_noPair = []() {
         const char *v = std::getenv("PS2X_SNDNOPAIR");
         return v && v[0] && v[0] != '0';
@@ -497,6 +516,58 @@ void PS2AudioBackend::serviceStreams()
     auto itL = m_streams.find(kLeftId);
     auto itR = m_streams.find(kRightId);
     const bool paired = !s_noPair && itL != m_streams.end() && itR != m_streams.end();
+    {   // [bgmdiag] Music silent while SFX works is a reported intermittent boot failure, and every
+        // way it can happen is invisible from the outside. The pair is RESERVED unconditionally
+        // below (ids 0/1 are skipped by the mono path whether or not both sides showed up), so if
+        // only one side ever arrives, BGM is silent for the entire run and nothing says so. The
+        // other candidates -- pair present but never started because the lockstep needs BOTH rings
+        // full, or opened at sampleRate 0 -- look identical from the speakers.
+        // Prints only while the pair is NOT playing, from 5 s in, so a good boot stays quiet.
+        static auto t0 = std::chrono::steady_clock::now();
+        static auto tLast = t0;
+        static auto tBeat = t0;
+        const auto now = std::chrono::steady_clock::now();
+        static const bool s_beat = [](){ const char *v = std::getenv("PS2X_SNDBEAT"); return v && v[0] && v[0] != '0'; }();
+        if (s_beat && std::chrono::duration<double>(now - tBeat).count() >= 5.0)
+        {   // [bgmbeat] objective "is music actually playing": the device's played counter. Rising
+            // = audio is coming out. Flat with a started stream = started but starved.
+            tBeat = now;
+            const auto dl = m_impl->deviceProgress.find(kLeftId);
+            std::fprintf(stderr, "[bgmbeat] %.0fs started=%d played=%llu Lring=%zu Rring=%zu rate=%u\n",
+                         std::chrono::duration<double>(now - t0).count(),
+                         (itL != m_streams.end() && itL->second.started) ? 1 : 0,
+                         (unsigned long long)(dl != m_impl->deviceProgress.end() ? dl->second.played : 0),
+                         itL != m_streams.end() ? itL->second.ring.size() : 0,
+                         itR != m_streams.end() ? itR->second.ring.size() : 0,
+                         itL != m_streams.end() ? itL->second.sampleRate : 0);
+        }
+        const bool hasL = itL != m_streams.end(), hasR = itR != m_streams.end();
+        // Only a genuine fault is worth printing. Neither side present just means the game is not
+        // playing music yet (menus before the title, loading) -- silence there is correct, and
+        // warning about it would make the probe noise on every normal boot.
+        const bool lone   = hasL != hasR;                                   // one side, forever reserved
+        const bool stuck  = hasL && hasR && !itL->second.started;           // pair present, never started
+        if ((lone || stuck) && std::chrono::duration<double>(now - t0).count() > 5.0 &&
+            std::chrono::duration<double>(now - tLast).count() >= 5.0)
+        {
+            tLast = now;
+            std::fprintf(stderr,
+                "[bgmdiag] BGM not playing after %.0fs: L=%s%s R=%s%s pairOpen=%d%s\n",
+                std::chrono::duration<double>(now - t0).count(),
+                hasL ? "yes" : "NO", hasL ? "" : " (never arrived)",
+                hasR ? "yes" : "NO", hasR ? "" : " (never arrived)",
+                m_impl->streams.find(kPairKey) != m_impl->streams.end() ? 1 : 0,
+                lone ? "  <- LONE SIDE: ids 0/1 are reserved for the pair, so this stays silent all run"
+                     : "  <- pair present but never started (lockstep needs BOTH rings full)");
+            if (stuck)
+                std::fprintf(stderr,
+                    "[bgmdiag]   L ring=%zu rate=%u opened=%d started=%d force=%d | R ring=%zu rate=%u opened=%d started=%d force=%d\n",
+                    itL->second.ring.size(), itL->second.sampleRate, itL->second.opened ? 1 : 0,
+                    itL->second.started ? 1 : 0, itL->second.forceStart ? 1 : 0,
+                    itR->second.ring.size(), itR->second.sampleRate, itR->second.opened ? 1 : 0,
+                    itR->second.started ? 1 : 0, itR->second.forceStart ? 1 : 0);
+        }
+    }
     if (paired)
     {
         StreamState &L = itL->second;
@@ -515,7 +586,7 @@ void PS2AudioBackend::serviceStreams()
         auto pairIt = m_impl->streams.find(kPairKey);
         if (pairIt != m_impl->streams.end() && L.sampleRate != 0u && L.sampleRate != s_pairOpenRate)
         {
-            std::fprintf(stderr, "[sndplay] pair rate %u -> %u, reopening device\n",
+            std::fprintf(stderr, "[sndplay] t=%.1fs pair rate %u -> %u, reopening device\n", tNow,
                          s_pairOpenRate, L.sampleRate);
             StopAudioStream(pairIt->second);
             UnloadAudioStream(pairIt->second);
@@ -531,7 +602,7 @@ void PS2AudioBackend::serviceStreams()
             m_impl->deviceProgress[kLeftId] = {};
             m_impl->deviceProgress[kRightId] = {};
             s_pairOpenRate = L.sampleRate;
-            std::fprintf(stderr, "[sndplay] opened STEREO PAIR (streams 0+1) rate=%u\n", L.sampleRate);
+            std::fprintf(stderr, "[sndplay] t=%.1fs opened STEREO PAIR (streams 0+1) rate=%u\n", tNow, L.sampleRate);
         }
         AudioStream &s = m_impl->streams[kPairKey];
 
@@ -543,10 +614,43 @@ void PS2AudioBackend::serviceStreams()
             // no playback means no buffer returns means no further data.
             const size_t have = std::min(L.ring.size(), R.ring.size());
             const bool forced = (L.forceStart || R.forceStart) && have >= kStreamChunkFrames;
-            if (have >= kStreamChunkFrames * 4u || forced)
+            // [bgmstall] STARTUP DEADLOCK, regression from 5aa0782 ("stabilize audio streaming").
+            // That commit stopped crediting the guest for PCM the moment it was copied into
+            // raylib and started crediting only what the device reported PLAYED -- correct, it
+            // stopped BT3 sending STOP while the first call-out was still in the device. But the
+            // guest now waits for that credit before queueing more, and the credit cannot move
+            // until playback starts, and playback waits for 4 chunks. The guest sends ONE buffer
+            // (~2432 frames), we need 4096, and both sides wait forever: BGM silent for the whole
+            // run while SFX (a different path) is fine. Intermittent because it depends on how
+            // many buffers the guest gets out before it first checks.
+            // requestStreamStart does not rescue it -- that fires on the guest's ring being FULL
+            // for 500 ms, and here the ring is nearly EMPTY; the guest is blocked on us, not full.
+            // So: if we hold a playable chunk and the rings have stopped growing, the guest is
+            // waiting on us. Start. Below the intended cushion, but a smaller cushion beats
+            // silence, and it only triggers in the stalled case.
+            if (!L.started && have >= kStreamChunkFrames && have < kStreamChunkFrames * 4u)
+            {
+                const auto nowS = std::chrono::steady_clock::now();
+                if (have != L.stallFrames) { L.stallFrames = have; L.stallSince = nowS; }
+                else if (std::chrono::duration<double>(nowS - L.stallSince).count() >= 0.25)
+                {
+                    std::fprintf(stderr, "[bgmstall] pair stalled at %zu frames for 250 ms (need %zu) -- guest is waiting on us; starting\n",
+                                 have, kStreamChunkFrames * 4u);
+                    L.forceStart = true;
+                }
+            }
+            const bool stalled = L.forceStart && have >= kStreamChunkFrames;
+            // [bgmstall] PS2X_SNDCUSHION=<chunks>: how many chunks the pair waits for before it
+            // starts. 4 is the original. The guest can only deliver ~2432 frames before it blocks
+            // waiting for playback credit (see the 5aa0782 note), so any cushion above 2 chunks is
+            // unreachable from a cold start and the pair deadlocks.
+            static const size_t s_cushion = [](){ const char *v = std::getenv("PS2X_SNDCUSHION");
+                const long n = v && v[0] ? std::strtol(v, nullptr, 10) : 0; return (n > 0 && n <= 8) ? size_t(n) : size_t(4); }();
+            if (have >= kStreamChunkFrames * s_cushion || forced || stalled)
             {
                 PlayAudioStream(s);
                 L.started = R.started = true;
+                std::fprintf(stderr, "[bgmtime] t=%.1fs pair STARTED with %zu frames (rate=%u)\n", tNow, have, L.sampleRate);
                 if (forced)
                     std::fprintf(stderr, "[sndplay] pair force-start with %zu frames cushion\n", have);
             }

@@ -2268,7 +2268,7 @@ namespace
         // 3 = 2 + split applyGsDispEnv so no drain is left in the swap path
         static const int s_mode = [](){ const char *v = std::getenv("PS2X_ASYNC_GSQUEUE");
                                         const int m = v && v[0] ? std::atoi(v) : 0;
-                                        std::fprintf(stderr, "[gsqueue] PS2X_ASYNC_GSQUEUE=%d (0 = drain, 1 = queue all, 2 = queue non-display, 3 = + split disp env)\n", m);
+                                        std::fprintf(stderr, "[gsqueue] PS2X_ASYNC_GSQUEUE=%d (0 = drain, 1 = queue all [BROKEN], 2 = queue non-display)\n", m);
                                         return m; }();
         return s_mode;
     }
@@ -2286,7 +2286,7 @@ namespace
         // 2 = queue everything EXCEPT display-critical writes.
         // 3 = as 2, plus applyGsDispEnv splits itself (see below) so NO drain is left in the swap path.
         const int s_queue = gsQueueMode();
-        const bool queueThis = (s_queue == 1) || (s_queue >= 2 && !displayCritical);
+        const bool queueThis = (s_queue == 1) || (s_queue == 2 && !displayCritical);
         if (queueThis && runtime && PS2Memory::asyncKickEnabled())
         {
             PS2Memory::KickJob j;
@@ -2299,51 +2299,11 @@ namespace
         apply();
     }
 
-    // [gsqueue3] This call is the FIRST of the three drains in sceGsSwapDBuff, so it is the one that
-    // finds the kick queue full and pays for it -- mode 2 kept it and queued only the two cheap
-    // follow-ups that would have hit an already-empty queue, which is why mode 2 on its own buys
-    // little. Mode 3 removes it, by splitting the call along what each half actually requires:
-    //
-    //   regs.*  -- the presenter reads these DIRECTLY off the register struct on the game thread
-    //              (ps2_gs_pgs.cpp:414 does put(&p.display1, r->display1)), and display1 carries
-    //              MAGH. Mode 1 deferred them onto the worker, the presenter read the stale value,
-    //              and the picture alternated squished/normal. They must stay INLINE. They are
-    //              plain struct stores and are scanout state, not draw state, so no kick depends
-    //              on them and being out of stream order relative to the kicks is harmless.
-    //   the flip hook -- streamFlip's own contract is "executed by stage 2 in stream order: the
-    //              frame this DISPFB1 belongs to is complete here". Running it inline while the
-    //              frame's packets are still queued would present an unfinished frame. It must be
-    //              QUEUED.
-    //
-    // Inline regs + queued flip satisfies both, and no drain is left. Expect stream!=live to stop
-    // being 0% under mode 3: r->dispfb1 is written inline and streamDispfb1 lands later in stream
-    // order, so a present sampled between the two legitimately disagrees. The presenter uses the
-    // STREAM value, which is the one that guarantees a complete frame -- that gap is the mechanism
-    // working, not breakage. Squished/alternating output would be breakage.
     static void applyGsDispEnv(PS2Runtime *runtime, const GsDispEnvMem &env)
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
         const GsDispEnvMem e = env;
-        if (gsQueueMode() >= 3 && PS2Memory::asyncKickEnabled())
-        {
-            {   // scanout registers: inline, the presenter reads them on this thread
-                auto &regs = runtime->memory().gs();
-                regs.pmode = e.pmode;
-                regs.smode2 = e.smode2;
-                regs.dispfb1 = e.dispfb;
-                regs.display1 = e.display;
-                regs.dispfb2 = e.dispfb;
-                regs.display2 = e.display;
-                regs.bgcolor = e.bgcolor;
-            }
-            const unsigned long long dispfb = e.dispfb;   // the latch: stream-ordered
-            PS2Memory::KickJob j;
-            j.kind = PS2Memory::KickJob::GsApply;
-            j.fn = [dispfb]() { ps2xGsDisplayFlipHook(dispfb); };
-            runtime->memory().enqueueKickJob(std::move(j));
-            return;
-        }
         applyGsOnStream(runtime, [runtime, e]()
         {
             auto &regs = runtime->memory().gs();

@@ -38,6 +38,7 @@ extern std::atomic<unsigned long long> g_pgsSemWaitNs;
 extern std::atomic<unsigned long long> g_pgsWaitNsBy[4][3];
 extern std::atomic<unsigned long long> g_pgsWaitCallsBy[4][3];
 extern "C" void ps2x_pgs_set_thread_tag(int tag);
+extern "C" void ps2x_pgs_set_thread_tag_if_unset(int tag);
 extern std::atomic<unsigned long long> g_pgsSemWaitCalls;
 extern std::atomic<unsigned long long> g_pgsQueueIdleCalls;
 #include <cstdio>
@@ -1684,8 +1685,11 @@ void privWrite(uint32_t regOff, uint64_t value, GSRegisters *regs)
 void onSwap()
 {
     {   // [pgswait2] onSwap only ever runs on the game thread -- tag it once so GPU blocking is attributable
+        // [pgswait2] swapFrame has many callers -- usually the game thread (game_overrides.cpp:4225)
+        // but also the GsThread (ps2_memory.cpp:2435). Only tag a thread that has no tag yet, or this
+        // relabels GsThread as "game" and the split is a fiction.
         static thread_local bool s_tagged = false;
-        if (!s_tagged) { s_tagged = true; ps2x_pgs_set_thread_tag(1); }
+        if (!s_tagged) { s_tagged = true; ps2x_pgs_set_thread_tag_if_unset(1); }
     }
     if (!enabled()) return;
     State &s = st();

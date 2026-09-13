@@ -1293,13 +1293,20 @@ void bt3NoteSeBankHeader(uint32_t dst, const uint8_t *data, uint32_t size)
         default:
             // Anything else is a per-character bank (56 in every bank seen, but a character with
             // a different count must still land in 4 then 5 rather than be dropped).
-            slot = g_sePerChar;
             why = "per-character";
-            if (g_sePerChar < kSeSlots - 1u)
-                g_sePerChar++;
+            if (g_sePerChar < kSeSlots)
+            {
+                slot = g_sePerChar++;   // 4, then 5
+            }
             else
+            {
+                // A THIRD per-character bank in one group. The cursor is one PAST slot 5 by then,
+                // so this is the real over-run -- comparing against kSeSlots-1 instead made the
+                // legitimate SECOND bank warn on every single fight.
+                slot = kSeSlots - 1u;
                 std::fprintf(stderr, "[se] WARNING a third per-character bank (%u samples) in one "
                                      "group -- slot 5 overwritten, mapping may be off\n", vagiCount);
+            }
             break;
     }
     const bool reload = !g_seSlot[slot].hdr.empty();

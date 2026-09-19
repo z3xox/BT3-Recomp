@@ -9,7 +9,7 @@ Tenkaichi 3* (PS2, USA, SLUS-21678), built on
 | Dev | Role | Areas |
 | --- | --- | --- |
 | **z3xox** | Owner / Lead developer | Recompiler (`ps2xRecomp`), runtime EE/GS/VU1/scheduler, OpenGL + paraLLEl-GS renderer, game overrides, game generators, docs |
-| **RexxColder** | **Support** / Collaborator | **Optimization** (perf/async, batching), Qt6 launcher + install wizard + ISO9660, input & gamepads, build/release (Docker CI, floor gate, packaging), deploy layout, game data (AFS/AFL), docs |
+| **RexxColder** | **Support** / Collaborator | **Optimization** (perf/async, batching), Qt6 launcher + install wizard + ISO9660, input & gamepads, build/release (floor gate, packaging), deploy layout, game data (AFS/AFL), docs |
 | **valenvivaldi** | Collaborator | macOS arm64 port, packaging, audio |
 
 ## Third-party

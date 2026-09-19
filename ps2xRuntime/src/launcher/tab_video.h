@@ -20,6 +20,7 @@ public slots:
 private:
     void openDisplayDialog();
     void openVisualEffectsDialog();
+    void openTexPackDialog();
 
     QComboBox *m_renderer = nullptr;
     QLabel *m_dot[4] = {};

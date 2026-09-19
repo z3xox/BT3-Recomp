@@ -51,7 +51,7 @@ AboutTab::AboutTab(QWidget *parent)
     creditsLay->addWidget(richLabel(QStringLiteral(
         "<b>RexxColder</b> — support / collaborator<br>"
         "&nbsp;&nbsp;&nbsp;optimization (perf/async, batching), launcher + install wizard + ISO9660, "
-        "input &amp; gamepads, build/release (Docker CI, floor gate, packaging), deploy, "
+        "input &amp; gamepads, build/release (floor gate, packaging), deploy, "
         "game-data (AFS/AFL), docs")));
     creditsLay->addWidget(richLabel(QStringLiteral(
         "<b>valenvivaldi</b> — collaborator<br>"

@@ -22,7 +22,7 @@ if ($Iso) { $argv += $Iso }
 if ($Jobs -gt 0) { $argv += @('--jobs', "$Jobs") }
 if ($Output) { $argv += @('--output', $Output) }
 if ($SkipSetup) { $argv += '--skip-setup' }
-if (-not $NoPackage) { $argv += '--package' }
+if ($NoPackage) { $argv += '--no-package' }
 if ($Extra) { $argv += $Extra }
 
 Write-Host "== scripts/build-windows.ps1 -> python $($argv -join ' ')"

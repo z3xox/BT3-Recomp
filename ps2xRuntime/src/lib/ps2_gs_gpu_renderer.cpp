@@ -4976,6 +4976,8 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
             if (v[i] > 32 && v[i] < 224) { binA = false; break; }
         g_texAlphaBinary[key] = binA;
     }
+    // [texcache] Write-back lives in GSRasterizer::applyTexReplacement (it knows whether the pack
+    // replacement is final vs still pending). See the comment there.
 }
 
 // PS2X_SRCDIAG: once per second, print how textured draws resolved their source

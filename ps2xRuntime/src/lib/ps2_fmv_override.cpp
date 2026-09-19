@@ -96,17 +96,22 @@ namespace
         return std::filesystem::is_regular_file(p, ec);
     }
 
-    // [exeDir]/savedata/settings.toml -> [video] texture_pack. Cached (the launcher writes it
-    // before launch). This is the "yes": Texture Replacement on means the pack is installed.
-    bool tomlTexPack()
+    // [exeDir]/savedata/settings.toml -> the two [video] pack toggles. Cached (the launcher writes
+    // them before launch). texture_pack = the pack is installed; intro_video = show the 4K opening
+    // override. The intro toggle applies on restart (the native PSS/ADX swap happens at loadELF).
+    struct PackToggles { bool texPack = false; bool introVideo = true; };
+    const PackToggles &tomlPackToggles()
     {
-        static const bool s = []() {
+        static const PackToggles s = []() {
+            PackToggles t;
             std::ifstream f(exeDir() + "/savedata/settings.toml");
             if (!f.is_open())
-                return false;
+                return t;
             ps2x_toml::Document doc;
             doc.parse(f);
-            return doc.getB("video.texture_pack", false);
+            t.texPack = doc.getB("video.texture_pack", false);
+            t.introVideo = doc.getB("video.intro_video", true);
+            return t;
         }();
         return s;
     }
@@ -310,7 +315,9 @@ namespace
 bool enabled()
 {
     if (!envOverridePath().empty()) return true;                 // PS2X_FMV_OVERRIDE wins
-    if (!tomlTexPack()) return false;                            // [video] texture_pack must be on
+    const PackToggles &t = tomlPackToggles();
+    if (!t.texPack) return false;                                // [video] texture_pack must be on
+    if (!t.introVideo) return false;                             // [video] intro_video off = no override
     return fileExists(packVideoDir() + "/ZS3USOP_4k.mp4");       // ...and the pack ships the video
 }
 

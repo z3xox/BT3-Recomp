@@ -193,11 +193,6 @@ else()
         else()
             set(PS2X_SDL2_TARGET SDL2::SDL2)
         endif()
-        # ps2xStudio (same tree) links SDL2::SDL2 and expects the shared build; give it the
-        # static one when this declaration won the FetchContent name.
-        if(NOT TARGET SDL2::SDL2 AND TARGET SDL2-static)
-            add_library(SDL2::SDL2 ALIAS SDL2-static)
-        endif()
         message(STATUS "[hostio] SDL2 gamepad/audio backend: ON (${PS2X_SDL2_TARGET})")
     else()
         message(STATUS "[hostio] SDL2 gamepad/audio backend: OFF (raylib only)")
@@ -508,6 +503,7 @@ src/lib/ui_sdl.cpp          # [C] ImGui platform glue on SDL2 (replaces rlImGui)
     src/lib/ps2_gs_memory.cpp
     src/lib/ps2_gs_rasterizer.cpp
     src/lib/ps2_texreplace.cpp   # [texreplace] PCSX2-compatible texture identity
+    src/lib/ps2_texcache.cpp     # [texcache] persistent write-back texture cache
     src/lib/ps2_fmv_override.cpp # [fmvoverride] inject a user 4K video as the opening FMV
     src/lib/ps2_netplay.cpp      # [netplay] deterministic lockstep transport
     src/lib/ps2_iop.cpp

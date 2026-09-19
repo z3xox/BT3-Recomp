@@ -60,8 +60,6 @@ endif()
 option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)
 option(PS2X_BUILD_RUNTIME "Build ps2xRuntime" ON)
 option(PS2X_BUILD_ANALYZER "Build ps2xAnalyzer" ON)
-option(PS2X_BUILD_TEST "Build ps2xTest" ON)
-option(PS2X_BUILD_STUDIO "Build ps2xStudio" ON)
 
 set(PS2X_IS_ARM_TARGET OFF)
 set(PS2X_IS_AARCH64_TARGET OFF)
@@ -135,12 +133,4 @@ endif()
 
 if(PS2X_BUILD_ANALYZER)
     add_subdirectory("ps2xAnalyzer")
-endif()
-
-if(PS2X_BUILD_TEST)
-    add_subdirectory("ps2xTest")
-endif()
-
-if(PS2X_BUILD_STUDIO)
-    add_subdirectory("ps2xStudio")
 endif()

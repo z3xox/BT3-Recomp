@@ -1,6 +1,7 @@
 static thread_local int g_subDx0 = 0, g_subDxW = 0;   // [subdecode] decode window of the texture being recorded (0 = whole)
 #include "runtime/ps2_guestprof.h"
 #include "runtime/ps2_texreplace.h"   // [texreplace]
+#include "runtime/ps2_texcache.h"     // [texcache]
 #include <map>
 #include <array>
 #include <set>
@@ -3626,15 +3627,18 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
         // pairs, mean alpha identical and opaque art at exactly 128 in both. That is
         // what upAlpha/uAlphaRep below corrects for the NORMAL path, which expands to
         // 0..255 on the CPU and would otherwise draw every replacement half-transparent.)
+        ps2tex::TexIdent id; bool haveId = false;   // [texcache] id is needed after the block to decide caching
         if (GsGpuRenderer::texPackEnabled() && ps2tex::replacementsEnabled()
             && allowed)
         {
-            ps2tex::TexIdent id;
             const bool pal = (tex0.psm == 19 || tex0.psm == 20);
             if (ps2tex::identify(vram, tex0.tbp0, tex0.tbw, tex0.psm,
                                  tex0.tw, tex0.th, pal ? clut : nullptr,
-                                 texa.ta0, texa.aem, texa.ta1, id))
+                                 texa.ta0, texa.aem, texa.ta1, id,
+                                 tex0.cbp, tex0.csa, tex0.csm, tex0.cpsm))
             {
+                haveId = true;
+                ps2tex::maybeDumpResolved(id, rgba.data(), subW, texH);   // [texraw]
                 std::vector<uint8_t> rep; int rw = 0, rh = 0, rfmt = 0;
                 const bool found = ps2tex::loadReplacement(id, texKey, rep, rw, rh, rfmt);   // [texpackasync]
                 {   // [texrepdiag] PS2X_TEXREPDIAG=1: log the MISSES only (bounded). A character
@@ -3767,6 +3771,11 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                 }
             }
         }
+        // [texcache] Store the FINAL payload (decode + replacement already applied) for the next run.
+        // NEVER while the async replacement is still pending: the first decode uploads the ORIGINAL,
+        // and caching it would both bake the original and (via the read hook) cancel the swap re-decode.
+        if (!haveId || !ps2tex::replacementPending(id))
+            ps2texcache::add(texKey, rgba.data(), rgba.size(), upW, upH, upFmt, upScale, upAlpha, ps2texcache::Meta{});
     }
 }
 void GSRasterizer::decodeSnapshot(const DecPoolJob &job, uint8_t *scratch, size_t vramSize, int &subW, std::vector<uint8_t> &rgba)
@@ -4589,9 +4598,28 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
         // the ready-swap flag was never consumed, so any texture that had already been resolved before
         // its replacement finished decoding kept drawing the ORIGINAL forever -- the pack looked
         // half-applied (183 lookups, 182 of them "in the pack" and none applied, per [texrepdiag]).
+        bool swapPending = false;
         if (!texNeedDecode && GsGpuRenderer::texPackEnabled() && ps2tex::takeReadySwap(texKey))
+        {
             texNeedDecode = true;
+            swapPending = true;   // [texcache] a finished async replacement: must re-decode, NOT serve the cache
+        }
         if (deferTex || deferClut) texNeedDecode = true;   // [deferdec] GL-dirty source: the record-time hash saw stale VRAM
+        // [texcache] Persistent write-back hit: the FINAL payload (original decode + pack replacement)
+        // was cached in a previous run. Upload it directly and skip the PSMT decode, the pack
+        // file scan/lookup and the file decode. NEVER when a swap is pending: the cached entry could
+        // still be the ORIGINAL (the async replacement had not decoded when it was stored).
+        if (texNeedDecode && !gaServedRead && !swapPending)
+        {
+            const uint8_t *cdata = nullptr; size_t clen = 0;
+            int cw = 0, chh = 0, cfmt = 0, cscale = 1; float calpha = 1.0f;
+            if (ps2texcache::get(texKey, cdata, clen, cw, chh, cfmt, cscale, calpha))
+            {
+                std::vector<uint8_t> cached(cdata, cdata + clen);
+                r.putTexture(texKey, std::move(cached), cw, chh, texPageLo, texPageHi, cfmt, cscale, calpha);
+                texNeedDecode = false;
+            }
+        }
         // [deferpend] a page whose deferred flush is still queued is stale in VRAM: a read that needs a decode
         // (a different view / key of the same page) must queue behind that flush, never decode synchronously.
         // [defercover] PS2X_DEFERCOVER (default on, =0 old): the pending flush that covers the page is what the post must

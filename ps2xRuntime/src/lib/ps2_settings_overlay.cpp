@@ -441,6 +441,8 @@ bool PS2SettingsOverlay::Settings::operator==(const Settings &o) const
            widescreen == o.widescreen &&
            outline == o.outline &&
            texPack == o.texPack &&
+           introVideo == o.introVideo &&
+           buttonLayout == o.buttonLayout &&
            fps60 == o.fps60 &&
            inkStrength == o.inkStrength &&
            shadows == o.shadows &&
@@ -544,6 +546,8 @@ void PS2SettingsOverlay::loadSettings()
     }
     if (!envUserSet("PS2X_OUTLINE")) m_settings.outline = doc.getB("video.outline", m_settings.outline);
     if (!envUserSet("PS2X_TEXPACK")) m_settings.texPack = doc.getB("video.texture_pack", m_settings.texPack);
+    if (!envUserSet("PS2X_FMV_OVERRIDE")) m_settings.introVideo = doc.getB("video.intro_video", m_settings.introVideo);
+    if (!envUserSet("PS2X_BUTTONS")) m_settings.buttonLayout = doc.getI("video.button_layout", m_settings.buttonLayout);
     if (!envUserSet("PS2X_SHADOWS")) m_settings.shadows = doc.getB("video.shadows", m_settings.shadows);
     if (!envUserSet("PS2X_DOFMASK")) m_settings.dofBlur = doc.getB("video.dof_blur", m_settings.dofBlur);
     if (!envUserSet("PS2X_DOFZFAR")) m_settings.dofZFar = std::clamp(doc.getI("video.dof_zfar", m_settings.dofZFar), 20000, 800000);
@@ -728,6 +732,8 @@ void PS2SettingsOverlay::saveSettings() const
     os << "render_scale = " << fmtInt(m_settings.renderScale) << "\n";
     os << "outline = " << fmtBool(m_settings.outline) << "\n";
     os << "texture_pack = " << fmtBool(m_settings.texPack) << "\n";
+    os << "intro_video = " << fmtBool(m_settings.introVideo) << "\n";
+    os << "button_layout = " << fmtInt(m_settings.buttonLayout) << "\n";
     os << "shadows = " << fmtBool(m_settings.shadows) << "\n";
     os << "dof_blur = " << fmtBool(m_settings.dofBlur) << "\n";
     os << "dof_zfar = " << fmtInt(m_settings.dofZFar) << "\n";
@@ -1358,6 +1364,9 @@ void PS2SettingsOverlay::drawVideoTab()
         // discard.
         ImGui::SameLine();
         if (ImGui::Button("Visual Effects...", ImVec2(200.0f, 0.0f))) ImGui::OpenPopup("Visual Effects");
+        // [texui] Pack status + options live in their own popup (same pattern as the two above).
+        ImGui::SameLine();
+        if (ImGui::Button("Texture Replacement...", ImVec2(200.0f, 0.0f))) ImGui::OpenPopup("Texture Replacement");
         static bool *const kAdvB[] = {
             &m_settings.bilinear, &m_settings.forceBilinear, &m_settings.halfTexel,
             &m_settings.skipPost, &m_settings.skipStaleVram,
@@ -1423,22 +1432,7 @@ void PS2SettingsOverlay::drawVideoTab()
             }
             ImGui::Unindent(12.0f);
         }
-        {   // [texreplace] Only offer the switch when a pack is actually indexed -- PS2X_TEXREPLACE
-            // points at the directory, and with no pack the toggle would do nothing and read as broken.
-            const bool havePack = ps2tex::replacementsEnabled();
-            if (!havePack) ImGui::BeginDisabled();
-            if (toggleSwitch("Texture Replacement", &m_settings.texPack))
-            {   // Applies LIVE: setTexPack flushes the texture cache so everything re-decodes.
-                GsGpuRenderer::setTexPack(m_settings.texPack);
-                ps2x_pgs::setPackEnabled(m_settings.texPack);   // [pgslive] backend: hook gated + cached textures dropped
-                m_dirty = true;
-            }
-            if (!havePack)
-            {
-                ImGui::EndDisabled();
-                ImGui::TextDisabled("Set PS2X_TEXREPLACE=<dir> to enable.");
-            }
-        }
+        // [texui] The Texture Replacement toggle moved into its own popup (see below).
         if (toggleSwitch("60 FPS (experimental)", &m_settings.fps60))
         {   // [fps60] step 1 + the pacing table; the runtime applies it between fights, never mid-fight
             ps2Set60Fps(m_settings.fps60, nullptr);
@@ -1482,6 +1476,50 @@ void PS2SettingsOverlay::drawVideoTab()
             if (ImGui::Button("Apply")) { applyLive(); m_dirty = true; }
             ImGui::SameLine();
             if (ImGui::Button("Save")) { applyLive(); m_dirty = true; sAdvOpen = false; ImGui::CloseCurrentPopup(); }
+            ImGui::EndPopup();
+        }
+
+        // [texui] Texture Replacement popup: pack status + the pack options. Opened by the
+        // "Texture Replacement..." button above (same ID scope). Video overlay applies on restart
+        // (the native PSS/ADX swap happens at loadELF -- see ps2_fmv_override.cpp).
+        if (ImGui::BeginPopupModal("Texture Replacement", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            const bool havePack = ps2tex::replacementsEnabled();
+            if (havePack)
+            {
+                const size_t n = ps2tex::replacementsCount();
+                const bool full = ps2tex::replacementsHave3D();
+                char buf[256];
+                std::snprintf(buf, sizeof buf, "Installed - %zu replacements (%s)",
+                              n, full ? "Full: 3D + 2D" : "Lite: 2D only");
+                ImGui::TextColored(ImVec4(0.25f, 0.73f, 0.31f, 1.0f), "*");
+                ImGui::SameLine(0.0f, 8.0f);
+                ImGui::TextUnformatted(buf);
+                ImGui::TextDisabled("%s", ps2tex::replacementsRoot());
+            }
+            else
+            {
+                ImGui::TextColored(ImVec4(0.97f, 0.32f, 0.29f, 1.0f), "*");
+                ImGui::SameLine(0.0f, 8.0f);
+                ImGui::TextUnformatted("No texture pack indexed");
+                ImGui::TextDisabled("Install one from the launcher (Misc tab) or set PS2X_TEXREPLACE=<dir>.");
+            }
+            ImGui::Separator();
+            if (!havePack) ImGui::BeginDisabled();
+            if (toggleSwitch("Video overlay (4K intro)", &m_settings.introVideo))
+                m_dirty = true;
+            ImGui::TextDisabled("Video overlay replaces the opening movie; applies on restart.");
+            ImGui::Spacing();
+            // [texui] Button style: picks which variant folder the texture index prefers.
+            ImGui::TextUnformatted("Buttons style");
+            ImGui::SameLine(120);
+            if (ImGui::RadioButton("PS2", &m_settings.buttonLayout, 0)) m_dirty = true;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Xbox", &m_settings.buttonLayout, 1)) m_dirty = true;
+            ImGui::TextDisabled("Applies on restart.");
+            if (!havePack) ImGui::EndDisabled();
+            ImGui::Spacing();
+            if (ImGui::Button("Close", ImVec2(96.0f, 0.0f))) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
 

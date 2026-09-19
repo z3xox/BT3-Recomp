@@ -129,14 +129,14 @@ to Apple hard.
 | `ps2xRecomp` | The recompiler: ELF → C++ | Pure C++, portable. No findings. |
 | `ps2xRuntime` | Runtime + renderer + game runner | Where the 4 blockers are. |
 | `ps2xRuntime/src/launcher` | Qt6 launcher (settings, wizard) | No platform guards. Blocker. |
-| `ps2xAnalyzer` / `ps2xTest` | Analysis tools and tests | No platform findings. |
-| `ps2xStudio` | Editor; 4 git fetches at configure time | `OFF` by default in setup.py. Ignore. |
+| `ps2xAnalyzer` | ELF analysis tool | No platform findings. |
 | `games/bt3/setup.py` | Pipeline: ISO → generation → build | Only two branches: Windows and "the rest". |
 | `scripts/build-linux.sh` | Assembles the self-extracting ELF | Useless on macOS. Rewrite. |
-| `tools/release/` | Reproducible release in Docker | No macOS equivalent. See phase 4. |
+| `scripts/check_floor.sh` | Linux glibc floor gate | No macOS equivalent; `-mmacosx-version-min` + `MACOSX_DEPLOYMENT_TARGET` cover it. |
 
-> The generation pipeline takes a few minutes at `--jobs 16`; the conservative default
-> is `-j3`. It asks for ~16 GB of RAM and ~10 GB of disk.
+> The generation pipeline takes a few minutes at `--jobs 16`; by default the job count
+> is auto-sized from CPU/RAM (conservative fallback `-j3`). It asks for ~16 GB of RAM
+> and ~10 GB of disk.
 
 ---
 
@@ -277,7 +277,7 @@ equivalent.
 | Hard-coded Qt6 path | `scripts/build-linux.sh:148` | `/usr/lib/cmake/Qt6/Qt6Config.cmake` will never exist; use `CMAKE_PREFIX_PATH` with `brew --prefix qt6`. |
 | Concatenate ELF + footer | `scripts/build-linux.sh:128-135` | `.app` bundle, or DMG. Mach-O does not support this trick as-is. |
 | Runner copy | `setup.py:212-217` | The `else` branch assumes Linux; on macOS it lands here through `os.name == "posix"` (`setup.py:36`). |
-| Docker release | `tools/release/` | Ubuntu 22.04 sets the glibc 2.35 floor, with `check_floor.sh` as the gate. On macOS the equivalent is `-mmacosx-version-min` + `MACOSX_DEPLOYMENT_TARGET`, and there is no container: a Mac is needed. |
+| Linux glibc floor | `scripts/check_floor.sh` | A portable Linux artifact targets glibc 2.35 (Ubuntu 22.04) via `BT3_GLIBC_MAX`; a native build defaults to the host glibc. On macOS the equivalent is `-mmacosx-version-min` + `MACOSX_DEPLOYMENT_TARGET`, and a Mac is needed to produce it. |
 
 ### The shape it should take
 
@@ -443,9 +443,6 @@ Things that will cost time to anyone who does not know them in advance.
   shows up right when you publish.
 - **The region is fixed.** The committed function maps are for the USA executable
   (SLUS-21678). The port does not change that and no other regions should be promised.
-- **`ps2xStudio` does four git fetches at configure time** and has already aborted user
-  builds on a network failure. `setup.py` sets it `OFF` unless `PS2X_SETUP_STUDIO=1`; a
-  manual `cmake` on the root does enable it. Keep it off during the port.
 - **The default build is `-j3`.** With 7,800 translation units that is an eternity. Pass
   `--jobs` with the core count, watching RAM (~16 GB recommended).
 
@@ -464,10 +461,9 @@ grep -rn "x86intrin\|__rdtsc" ps2xRuntime/include ps2xRuntime/src
 grep -rn "linux/input.h" ps2xRuntime/src/launcher
 sed -n '20,35p;150p;250,260p' ps2xRuntime/src/lib/ps2_eeprof.cpp
 
-# 3. Configure only the runtime; Studio off, Qt6 located by brew
+# 3. Configure only the runtime; Qt6 located by brew
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DPS2X_BUILD_STUDIO=OFF \
   -DCMAKE_PREFIX_PATH="$(brew --prefix qt6)"
 
 # 4. Full pipeline from the ISO (adjust --jobs to the real cores)
@@ -499,9 +495,9 @@ Honesty about the scope of this report, so nobody takes it for more than it is.
 - **The ~7,800 generated files have not been reviewed** one by one; the conclusion that
   `ps2_runtime_macros.h` is enough comes from the codegen emitting only that include
   (`ps2_recompiler.cpp:105`, `function_emitter.cpp:45`).
-- **No CI.** The repository has no GitHub workflows; the only automated release artifact
-  is `tools/release/Dockerfile`, which is Linux. macOS in CI would need macOS runners,
-  which is a cost and a decision apart.
+- **No CI.** The repository has no GitHub workflows; the release artifact is produced
+  natively per OS (Linux, Windows, macOS). macOS in CI would need macOS runners, which
+  is a cost and a decision apart.
 
 ---
 

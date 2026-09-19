@@ -413,8 +413,8 @@ bool LauncherWindow::openInstallWizard()
     checkGameData();
     if (installed && dlg.wantTexturePack())
     {
-        // The wizard's final page recommended the pack and the user chose Next.
-        TexInstallDialog tex(this);
+        // The wizard's final page recommended the pack and the user chose a variant.
+        TexInstallDialog tex(this, dlg.texturePackChoice());
         tex.exec();
     }
     return installed && m_gameDataValid;

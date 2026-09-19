@@ -48,10 +48,10 @@ This is an assessment only; no behavior was changed while writing it.
 
 1. **AV1 decode depends on the FFmpeg build.** The reference opening MP4 is AV1
    (2880x2156). Decoding it needs libdav1d (or a native AV1 decoder). The system
-   FFmpeg on the dev machine and the Windows prebuilt (n7.1) include it; the Linux
-   release Docker uses **FFmpeg 4.4** (`tools/release/Dockerfile:30-32`) whose
-   libavcodec must include an AV1 decoder for the override to work. If a target's
-   FFmpeg lacks AV1, `avcodec_find_decoder()` returns null and the override fails
+   FFmpeg on the dev machine and the Windows prebuilt (n7.1) include it; a native
+   Linux build bundles the build host's FFmpeg, whose libavcodec must include an
+   AV1 decoder for the override to work. If a target's FFmpeg lacks AV1,
+   `avcodec_find_decoder()` returns null and the override fails
    (the current message is generic: `[fmvoverride] decoder init failed`).
    **Action:** verify AV1 per target, or ship an H.264 variant of the opening.
 
@@ -74,11 +74,11 @@ This is an assessment only; no behavior was changed while writing it.
    older installs that lack it, a `.7z` download cannot be extracted. Consider
    bundling `7zr` or linking libarchive in the launcher.
 
-5. **Windows packaging is now a real flow.** `tools/release-windows/` provides a
-   Docker-based Windows release (clang-cl + xwin + lld-link, Qt MSVC kit,
-   FFmpeg prebuilt, VC++ runtime DLLs, PE dependency gate) at 1/1 parity with the
-   Linux `tools/release/` flow; see its README. `games/bt3/setup.py` has a
-   Windows branch. The new code adds nothing Windows-specific.
+5. **Windows packaging is a real flow.** `scripts/build-windows.ps1` (with
+   `scripts/package-windows.ps1`) drives `games/bt3/setup.py` natively: ClangCL +
+   Ninja, the Qt MSVC kit via aqtinstall, the FFmpeg prebuilt, the VC++ runtime
+   DLLs and the PE dependency gate. The Windows branch lives in `setup.py`; the
+   new code adds nothing Windows-specific.
 
 ## References
 
@@ -90,5 +90,4 @@ This is an assessment only; no behavior was changed while writing it.
 - `ps2xRuntime/src/launcher/CMakeLists.txt:14-16,68` — Qt Network.
 - `ps2xRuntime/src/launcher/launcher_window.cpp:227` — `PS2X_EXEDIR` export.
 - `ps2xRuntime/src/lib/ps2_texreplace.cpp` — `data/Textures` default (via `ps2xExeDirC`).
-- `tools/release/Dockerfile:30-32` — release FFmpeg 4.4.
 - `docs/MACOS-PORT.md` — macOS status and blockers.

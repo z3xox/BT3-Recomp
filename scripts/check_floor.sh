@@ -2,13 +2,16 @@
 # Cross-distro floor gate. Inspects every ELF under $1 (executables and
 # bundled .so) and gates on the versioned glibc symbols they NEED.
 #
-#   tools/release/check_floor.sh <stage-dir>
+#   scripts/check_floor.sh <stage-dir>
 #
-# Exit 0 if max GLIBC_ <= $GLIBC_MAX and max GLIBCXX_ <= $GLIBCXX_MAX.
+# Exit 0 if max GLIBC_ <= the floor and max GLIBCXX_ <= $GLIBCXX_MAX. The floor is
+# BT3_GLIBC_MAX when set, else the build host's glibc with a 2.35 (Ubuntu 22.04) minimum.
 set -euo pipefail
 
 STAGE="$1"
-GLIBC_MAX="${BT3_GLIBC_MAX:-2.35}"
+# Oldest supported Linux target: Ubuntu 22.04 (glibc 2.35). A portable release pins it explicitly
+# (BT3_GLIBC_MAX=2.35); a native build defaults to the build host's glibc, never below this floor.
+RELEASE_GLIBC_MAX=2.35
 GLIBCXX_MAX="${BT3_GLIBCXX_MAX:-3.4.30}"
 
 ver_ge() { # $1 >= $2  (dot/numeric aware)
@@ -22,6 +25,19 @@ ver_ge() { # $1 >= $2  (dot/numeric aware)
     done
     return 0
 }
+
+# Resolve the floor. An explicit BT3_GLIBC_MAX always wins (a portable release sets
+# it to 2.35); otherwise compare against the build host, never below 2.35.
+if [[ -n "${BT3_GLIBC_MAX:-}" ]]; then
+    GLIBC_MAX="$BT3_GLIBC_MAX"
+else
+    HOST_GLIBC="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)"
+    if [[ -n "$HOST_GLIBC" ]] && ver_ge "$HOST_GLIBC" "$RELEASE_GLIBC_MAX"; then
+        GLIBC_MAX="$HOST_GLIBC"
+    else
+        GLIBC_MAX="$RELEASE_GLIBC_MAX"
+    fi
+fi
 
 worst=(0 0 0 0)   # maxG, maxGXX, pathG, pathGXX
 maxglibc="0" maxglibcxx="0"

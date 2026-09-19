@@ -1,20 +1,20 @@
 #pragma once
-// [texreplace] Shared texture-pack constants/helpers for the launcher (Misc tab +
-// install dialog). The pack lives in <deploy>/data/Textures and is delivered as
-// a single archive whose sha256 is pinned below.
+// [texui] Shared texture-pack constants/helpers for the launcher. The pack lives in
+// <deploy>/data/Textures. The launcher no longer downloads the archive: it opens the
+// pixeldrain page (with a clipboard fallback if the browser won't open) and installs a
+// locally downloaded file via Browse.
 
 #include <QString>
 
 namespace texpack
 {
-    // Direct download (pixeldrain API file endpoint).
-    extern const char *const kUrl;        // https://pixeldrain.com/api/file/5UzM4yox
-    // Browser page for the same file. pixeldrain only allows direct API
-    // downloads for paid accounts, so on 403 we send the user here instead.
-    extern const char *const kPageUrl;    // https://pixeldrain.com/u/5UzM4yox
-    extern const char *const kFileName;   // Texture-4k.7z
-    // Only this exact archive is accepted (same as pixeldrain's hash_sha256).
-    extern const char *const kSha256;
+    // Pack variants. kPackLite = 2D textures only; kPackFull = 3D + 2D.
+    enum PackKind { kPackLite = 0, kPackFull = 1 };
+
+    // User-facing name, download page and suggested archive name for each variant.
+    const char *packName(int kind);      // "4K 2D Textures Lite" / "4k Texture Pack"
+    const char *packUrl(int kind);       // https://pixeldrain.com/u/...
+    const char *packFileName(int kind);  // suggested archive file name
 
     // <deploy>/data/Textures
     QString dir();
@@ -24,4 +24,7 @@ namespace texpack
 
     // Count replacement files (.png/.dds) under dir(), recursively.
     quint64 countReplacements();
-}
+
+    // True when the installed pack looks like the full one (3D characters present).
+    bool installedIsFull();
+} // namespace texpack

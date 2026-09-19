@@ -249,9 +249,13 @@ void InstallWizardDialog::buildUi()
         l->addSpacing(12);
 
         auto *body = new QLabel(
-            QStringLiteral("We strongly recommend installing the 4K texture pack. It replaces the "
-                           "game's textures with high-resolution ones and greatly improves the visuals.\n\n"
-                           "You can do it now, or later from Settings -> Misc -> Install texture pack."),
+            QStringLiteral(
+                "We strongly recommend installing a 4K texture pack. Two variants are available:\n\n"
+                "  •  Pack Lite — 2D textures only (HUD, menus, icons, posters, buttons). Lighter.\n"
+                "  •  Pack Full — all textures: 3D characters and stages plus the full 2D set.\n\n"
+                "The launcher no longer downloads the pack: the next window shows the download page "
+                "(with a Copy-link fallback). Download the archive, then use Browse… to install it.\n\n"
+                "You can also do this later from Settings -> Misc -> Install texture pack."),
             pageD);
         body->setWordWrap(true);
         body->setStyleSheet(QStringLiteral("font-size: 13px; color: #c9ccd4;"));
@@ -271,14 +275,25 @@ void InstallWizardDialog::buildUi()
         });
         rowD->addWidget(recClose);
         rowD->addSpacing(8);
-        m_recNext = new QPushButton(QStringLiteral("Next"), pageD);
-        m_recNext->setObjectName(QStringLiteral("wizardButton"));
-        m_recNext->setCursor(Qt::PointingHandCursor);
-        connect(m_recNext, &QPushButton::clicked, this, [this] {
+        m_recLite = new QPushButton(QStringLiteral("Pack Lite"), pageD);
+        m_recLite->setObjectName(QStringLiteral("wizardButton"));
+        m_recLite->setCursor(Qt::PointingHandCursor);
+        connect(m_recLite, &QPushButton::clicked, this, [this] {
             m_wantTexPack = true;
+            m_packChoice = texpack::kPackLite;
             accept();
         });
-        rowD->addWidget(m_recNext);
+        rowD->addWidget(m_recLite);
+        rowD->addSpacing(8);
+        m_recFull = new QPushButton(QStringLiteral("Pack Full"), pageD);
+        m_recFull->setObjectName(QStringLiteral("wizardButton"));
+        m_recFull->setCursor(Qt::PointingHandCursor);
+        connect(m_recFull, &QPushButton::clicked, this, [this] {
+            m_wantTexPack = true;
+            m_packChoice = texpack::kPackFull;
+            accept();
+        });
+        rowD->addWidget(m_recFull);
         l->addLayout(rowD);
     }
     m_stack->addWidget(pageD);

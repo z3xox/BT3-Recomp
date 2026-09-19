@@ -17,7 +17,7 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core Gui Widgets Network)
 
 # Cross-platform joystick backend for the controller test + bind capture.
 # GLFW's own dependency guarantees the same mapping DB on Linux/Windows/macOS.
-# X11-only on Linux (the baseline container lacks wayland-scanner); Windows and
+# X11-only on Linux (minimal build environments lack wayland-scanner); Windows and
 # macOS pick their native backend automatically regardless of these flags.
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)

@@ -2,6 +2,8 @@
 
 #include <QDialog>
 
+#include "tex_pack.h"
+
 class QLabel;
 class QProgressBar;
 class QPushButton;
@@ -23,9 +25,11 @@ public:
     ~InstallWizardDialog() override;
 
     bool installed() const { return m_installed; }
-    // True when the user chose to install the texture pack on the final
-    // recommendation page (Next). The caller opens the texture installer.
+    // True when the user chose to install a texture pack on the final
+    // recommendation page. The caller opens the texture installer.
     bool wantTexturePack() const { return m_wantTexPack; }
+    // Which variant was chosen: texpack::kPackLite (2D only) or texpack::kPackFull (3D + 2D).
+    int texturePackChoice() const { return m_packChoice; }
 
 private slots:
     void onNextMissing();
@@ -71,7 +75,9 @@ private:
     QPushButton *m_retryInstall = nullptr;
 
     // Page D: post-install texture-pack recommendation (first install only).
-    QPushButton *m_recNext = nullptr;
+    QPushButton *m_recLite = nullptr;
+    QPushButton *m_recFull = nullptr;
+    int m_packChoice = texpack::kPackFull;
 
     QTemporaryDir *m_tmp = nullptr;
     QString m_dumpPath;

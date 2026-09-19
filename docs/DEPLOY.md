@@ -45,10 +45,9 @@ Python script that hosts the build pipeline (and is the base for Windows).
 | Script | Platform | Role |
 |---|---|---|
 | `scripts/build-linux.sh` | Linux | Thin wrapper: `setup.py <iso> --package`. The script itself detects the platform, installs missing dependencies (stage 2), builds (stage 3) and assembles the portable tree + `tar.gz` (stage 4): `ldd` closure minus the glibc/C++ core, Qt platform plugins, `bt3-runner` rename, assets, `install game.sh`, glibc floor gate. |
-| `games/bt3/setup.py` | All | The single entry point. Four stages: **1 detect** (platform/toolchain/deps, `--report json`), **2 deps** (interactive install of what is missing), **3 build** (extract/verify ISO, VU1, recompiler, ~7,800 sources, patches, overlay, runner), **4 package** (Qt launcher, portable tree, PE/glibc gate, zip/tar.gz/`.app` + sha256). The release containers call it with `--gen-only` and package the stage themselves. |
+| `games/bt3/setup.py` | All | The single entry point. Four stages: **1 detect** (platform/toolchain/deps, `--report json`), **2 deps** (interactive install of what is missing), **3 build** (extract/verify ISO, VU1, recompiler, ~7,800 sources, patches, overlay, runner), **4 package** (Qt launcher, portable tree, PE/glibc gate, zip/tar.gz/`.app` + sha256), then asks where to send the artifact. |
 | `scripts/build-macos.sh` | macOS (experimental) | Thin wrapper: `setup.py <iso> --package`. Stage 4 hands the bundle over to `tools/macos/deploy.py --skip-build` (relocated dylibs, `Info.plist`, icudata, ad-hoc signing). |
-| `tools/release/package.sh` | Linux | Wrap a finished deploy tree into `BT3-Recomp-x86_64.tar.gz` + `.sha256`. This is the only artifact that leaves the machine. |
-| `tools/release-windows/build-windows.sh` (+ `.bat`) | Windows (Docker) | Host driver: builds the Windows cross-build image, prompts for the ISO, cross-compiles the runner + Qt launcher (clang-cl/xwin/lld-link), bundles `stage/` and runs the PE gate. `.bat` = double-click entry point (auto-starts Docker Desktop). |
+| `scripts/build-windows.ps1` / `package-windows.ps1` | Windows | Native build + package wrappers: `setup.py <iso> --package` with VS Build Tools + ClangCL + Ninja and Qt 6 fetched via aqtinstall. |
 
 ## Build + deploy (Linux)
 
@@ -60,17 +59,18 @@ Python script that hosts the build pipeline (and is the base for Windows).
 
 `--skip-setup` skips ISO extraction and source generation, rebuilding only the
 runner from the already-generated sources (fast; needs ccache/sccache warm).
-`--jobs N` (env `BT3_JOBS`) sets the runner build parallelism
-(default: `nproc`).
+`--jobs N` forces the runner build parallelism; by default it is auto-sized from
+the machine's cores and RAM (see `plan_build` in `setup.py`), with `-j3` as the
+conservative fallback.
 
-`package.sh` then produces the single release artifact (the tarball). Its
-integrity is verified by the `.sha256` sibling; release users can also re-verify
-forwards with `sha256sum -c`.
+Stage 4 then produces the single release artifact (the tarball) and asks where to
+send it. Its integrity is verified by the `.sha256` sibling; release users can
+also re-verify with `sha256sum -c`.
 
 ## Install (Linux desktop integration)
 
 Inside the unpacked folder, `install game.sh` (copy made from
-`tools/release/install-game.sh.in`) does three things:
+`scripts/install-game.sh.in`) does three things:
 
 1. copies the launcher, runner, bundled libs and assets to `~/.local/share/bt3-recomp/`,
 2. writes a `~/.local/share/bt3-launcher.sh` wrapper,
@@ -83,34 +83,26 @@ and settings survive reinstallation. The folder itself remains fully portable:
 you can skip the install script and run `Launcher` straight from the unpacked
 tree.
 
-## Build + deploy (Windows, Docker)
+## Build + deploy (Windows, native)
 
-No Windows toolchain is required: the build runs inside a Docker container that
-cross-compiles for Windows (clang-cl + xwin + lld-link — no Visual Studio
-anywhere). You need Docker Desktop and Git for Windows (for `bash`).
+The Windows build runs natively with Visual Studio Build Tools 2022 (ClangCL +
+Win11 SDK), Ninja, Python 3 and Qt 6 (fetched via aqtinstall); no WSL required.
 
-The double-click entry point is `tools\release-windows\build-windows.bat`: it
-starts Docker Desktop if it is not running (waits up to 120 s), prompts for your
-ISO path (or accepts a `.iso` dragged on top of the file), runs the build and the
-PE gate, and offers to package the zip when the gate passes. The identical driver
-from Git Bash / WSL:
-
-```sh
-tools/release-windows/build-windows.sh --iso /path/to/bt3-usa.iso --jobs 16
-tools/release-windows/package.sh
+```powershell
+.\scripts\build-windows.ps1 -Iso "C:\path\to\bt3-usa.iso"
+.\scripts\package-windows.ps1
 ```
 
-The container generates the generated sources natively (`setup.py --gen-only` —
-the codegen is target-agnostic), cross-compiles the runner and the Qt 6
-launcher, bundles Qt, FFmpeg and the VC++ runtime DLLs into `assets/lib/`, writes the
-portable tree to `build/release-windows/out/stage/` (`Launcher.exe`,
-`bt3-runner.exe`, `qt.conf`, `assets/`, `savedata/`, licences,
-`settings.toml`) and runs a PE gate — `check_windows_deps.py` (pefile) verifies
-that every PE import resolves either from `assets/lib/` or to a Windows OS component,
-and that the layout is complete. `package.sh` then zips the tree into
-`BT3-Recomp-x86_64.zip` + `.sha256`. Windows resolves the bundled DLLs from the
-executable's own directory, so no `LD_LIBRARY_PATH` games are needed. The full
-parity notes live in `tools/release-windows/README.md`.
+The pipeline generates the sources (`setup.py --gen-only` is target-agnostic),
+builds the runner and the Qt 6 launcher, bundles Qt, FFmpeg and the VC++ runtime
+DLLs into `assets/lib/`, writes the portable tree to
+`build/release-windows/out/stage/` (`Launcher.exe`, `bt3-runner.exe`, `qt.conf`,
+`assets/`, `savedata/`, licences, `settings.toml`) and runs a PE gate —
+`check_windows_deps.py` (pefile) verifies that every PE import resolves either
+from `assets/lib/` or to a Windows OS component, and that the layout is complete.
+`scripts/package-windows.ps1` then zips the tree into `BT3-Recomp-x86_64.zip` +
+`.sha256`. Windows resolves the bundled DLLs from the executable's own directory,
+so no `LD_LIBRARY_PATH` games are needed.
 
 ## macOS .app (experimental)
 
@@ -159,7 +151,7 @@ existing fallbacks for unsupported persistent-buffer and texture-barrier extensi
 ## `setup.py` stages and flags
 
 ```
-python3 games/bt3/setup.py <iso|elf> [--stage N] [--jobs N] [-y] [--deploy OUT] [--package]
+python3 games/bt3/setup.py <iso|elf> [--stage N] [--jobs N] [-y] [--deploy OUT] [--no-package]
 ```
 
 | Stage | What it does |
@@ -176,12 +168,12 @@ python3 games/bt3/setup.py <iso|elf> [--stage N] [--jobs N] [-y] [--deploy OUT] 
 | `-y`, `--non-interactive` | answer yes to every prompt / never prompt (no TTY implies non-interactive) |
 | `--jobs N` | runner build parallelism (default 3 — generated TUs are RAM-hungry) |
 | `--deploy OUT` | assemble the playable tree in `OUT` (no archive) |
-| `--package` | also write the release artifact for this OS + `.sha256` |
+| `--package` / `--no-package` | write the release artifact for this OS + `.sha256` (on by default); `--no-package` assembles the deploy tree only |
 | `--output DIR` | where the stage tree and the artifact go (default `build/release-<os>/out`) |
 | `--skip-launcher`, `--no-gate`, `--no-desktop-copy` | developer escapes |
 | `--skip-setup` | reuse `games/bt3/work/` + generated sources; rebuild the runner only |
-| `--gen-only` | stop after generation/patches (used by the release containers) |
-| `--log PATH`, `--no-log` | full execution log (default `build/setup-<timestamp>.log`); it always keeps every line and the failing command |
+| `--gen-only` | stop after generation/patches (no runner build) |
+| `--log PATH`, `--no-log` | full execution log (default `build/setup.log`, overwritten on each run); it always keeps every line and the failing command |
 | `--log-level N`, `-q`, `-v` | console detail: 0 silent, 1 errors, 2 errors+warnings, 3 info (default), 4 verbose. Subprocess output is classified per line, so `--log-level 2` still shows build warnings/errors on screen while the log gets everything |
 
 Failures print `FAILED at stage N ... Full log: <path>` instead of a Python traceback.

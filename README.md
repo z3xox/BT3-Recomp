@@ -13,10 +13,9 @@ image** — this repository contains no game code, assets, or media.
 
 - **Your own legally obtained BT3 USA ISO** (SLUS-21678). Other regions are not
   supported — the committed function maps are for the USA executable.
-- Linux, Windows or macOS, x86-64 CPU with SSE4.1 (Windows can build with the
-  Docker flow or natively via `scripts\build-windows.ps1`; macOS experimental). On macOS
-  the build is native arm64 (Apple Silicon) or x86-64, one at a time; see
-  [the port notes](docs/MACOS-PORT.md).
+- Linux, Windows or macOS, x86-64 CPU with SSE4.1 (Windows builds natively via
+  `scripts\build-windows.ps1`; macOS experimental). On macOS the build is native
+  arm64 (Apple Silicon) or x86-64, one at a time; see [the port notes](docs/MACOS-PORT.md).
 - ~16 GB RAM and ~10 GB free disk for the build.
 - Linux packages: `cmake`, GCC or Clang with C++20, `python3`, `rsync`,
   `bsdtar` (libarchive) or `7z`, pkg-config, the FFmpeg development libraries,
@@ -55,38 +54,16 @@ The script asks for the ISO and output directory if they are not given, runs the
 full `setup.py` pipeline, bundles the runner + its shared libraries into the
 deploy tree, builds a Qt 6 launcher (GLFW gamepad support), and drops
 `install game.sh` for the desktop-integration step. Pass `--skip-setup` to
-reuse an existing `games/bt3/work/` tree and only rebuild the runner.
-`tools/release/package.sh` then wraps everything into the single release
-artifact. See `docs/DEPLOY.md` for the full picture.
-
-**Windows (Docker):** no toolchain to install — the build runs inside a
-[Docker](https://www.docker.com/products/docker-desktop/) container that
-cross-compiles for Windows (clang-cl + xwin + lld-link; no Visual Studio).
-Prefer the native `scripts\build-windows.ps1` flow (below) if Docker is not available.
-You need **Docker Desktop** and **Git for Windows** (for `bash`). The simplest
-route is to double-click `tools\release-windows\build-windows.bat`: it starts
-Docker Desktop if needed, prompts for your ISO (or accepts a `.iso` dragged on
-top of it), runs the whole build + PE gate, and offers to package the zip. The
-same driver from Git Bash / WSL:
-
-```sh
-tools/release-windows/build-windows.sh --iso /path/to/bt3-usa.iso --jobs 16
-tools/release-windows/package.sh
-```
-
-The container generates the ~7,800 runner sources natively (`setup.py
---gen-only`), cross-compiles the runner and the Qt launcher, and gates the
-output — every PE import must resolve and the bundle layout must be complete.
-Result: `build/release-windows/out/stage/` plus `BT3-Recomp-x86_64.zip` +
-`.sha256`. The game data is never shipped; the launcher's install wizard reads
-your ISO. 12 GB+ RAM recommended. See `tools/release-windows/README.md` for
-the full parity notes.
+reuse an existing `games/bt3/work/` tree and only rebuild the runner. The same
+pipeline produces the release artifact (`BT3-Recomp-x86_64.tar.gz` + `.sha256`)
+and asks where to send it (`--no-package` assembles the deploy tree only).
+See `docs/DEPLOY.md` for the full picture.
 
 The pipeline extracts and sha256-verifies the game files from your ISO, builds the
 recompiler, generates ~7,800 C++ sources from the game's executable and overlay,
 applies the committed patches, and builds the final binary. The compile is quick
-on a modern machine (a few minutes at `-j16`); the conservative default is `-j3` —
-pass your core count with `--jobs N` if you have 8 GB+ of free RAM.
+on a modern machine: the job count is auto-sized from CPU/RAM (the conservative
+fallback is `-j3`); pass `--jobs N` to force it.
 
 **macOS (experimental):** install the Xcode Command Line Tools and Homebrew dependencies:
 
@@ -121,7 +98,7 @@ automatically.
 
 **Windows (native, PowerShell):** the native build runs locally with Visual
 Studio Build Tools 2022 (ClangCL + Win11 SDK), Ninja, Python 3 and Qt 6 (fetched
-via aqtinstall). No Docker or WSL. Double-click `scripts\build-windows.ps1` in PowerShell
+via aqtinstall). Double-click `scripts\build-windows.ps1` in PowerShell
 or run it from a terminal; the first run installs all missing prerequisites via
 winget and pip. To install only the dependencies, run the standalone script:
 
@@ -174,6 +151,26 @@ Known issues:
 - occasional arm-pose flip during ki charge
 - FMVs are skipped
 
+## Texture replacement & cache
+
+Textures are identified exactly like PCSX2 (`<TEX0Hash>-<CLUTHash>-<bits>`), so its
+existing packs work unchanged. Drop a pack in `<deploy>/data/Textures/` (see
+[textures/README.md](textures/README.md)) or set `PS2X_TEXREPLACE=<dir>`.
+
+In the launcher/overlay Video tab, **Texture Replacement…** shows the pack status plus
+**Video overlay (4K intro)** and **Buttons style (PS2/Xbox)**. Enabling and installing
+live in the launcher's **Misc** tab (**Pack Lite** = 2D only, **Pack Full** = 3D + 2D);
+the launcher opens the pack's download page (Open in browser / Copy link) and installs
+a locally downloaded archive with **Browse…**.
+
+The **texture cache** (`<deploy>/data/texcache.bin`) stores each texture once it is
+fully resolved (PSMT decode + pack replacement applied) so later runs skip the VRAM
+hash match, the pack lookup and the PNG/DDS decode — measured ~6x fewer texture
+decodes, a CPU/I-O saving (the GPU path is unchanged). It fills as you play and is
+rebuilt automatically when the pack, the Texture Replacement toggle or the button
+layout changes. Toggle it in **Misc → Texture Cache** (`[video] texcache`); delete it
+there (or set `PS2X_TEXCACHE_REGEN=1`) to force a rebuild.
+
 ## Repository layout
 
 | Path | What it is |
@@ -182,7 +179,6 @@ Known issues:
 | `scripts/build-windows.ps1` | Windows native build + package wrapper (installs missing deps, builds runner + Qt launcher, PE gate, zip) |
 | `scripts/install-deps-windows.ps1` | Windows dependency installer (VS Build Tools + ClangCL, CMake, Ninja, Python, Qt, Mesa lavapipe) |
 | `scripts/package-windows.ps1` | Windows release packaging from the native stage (`BT3-Recomp-x86_64.zip` + `.sha256`) |
-| `tools/release/package.sh` | wraps the deploy tree into the release tarball (`BT3-Recomp-x86_64.tar.gz` + `.sha256`) |
 | `games/bt3/setup.py` | the single four-stage script: detect / deps / build / package (see `docs/DEPLOY.md`) |
 | `docs/DEPLOY.md` | the deploy structure and cross-platform packaging documentation |
 | `games/bt3/functions.csv`, `dbzp_*.csv` | function address maps (symbols only) |

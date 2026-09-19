@@ -1,9 +1,9 @@
 #pragma once
 // Minimal TOML (subset) reader/writer for savedata/settings.toml.
 //
-// Hand-written on purpose: toml11 v4 needs std::source_location, which the
-// clang-14 baseline container cannot compile (GCC-11's <source_location> is
-// present but std::source_location is not declared under clang-14), and pulling
+// Hand-written on purpose: toml11 v4 needs std::source_location, which older
+// clang (14) cannot compile (GCC-11's <source_location> is present but
+// std::source_location is not declared under clang-14), and pulling
 // a full TOML library into the clang-built runtime/launcher is not worth it for
 // a fixed, flat schema. This covers exactly what settings.toml uses:
 //   - '#' comments (quote-aware), [table] and [table.sub] headers

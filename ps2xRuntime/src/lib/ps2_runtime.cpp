@@ -18,6 +18,8 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
 #endif
 #include "ps2_host_window.h"   // [B] native window handle (SDL returns SDL_Window*, not the HWND)
 #include "runtime/ps2_texreplace.h"   // [texreplace]
+#include "runtime/ps2_texcache.h"     // [texcache]
+#include "runtime/ps2_toml.h"         // [texcache] settings.toml
 #include "runtime/ps2_video_status.h"   // [video] the Video-tab status the overlay polls
 #include "runtime/ps2_toml.h"   // [winmode] startup read of [video] window_mode / monitor
 #include "runtime/ps2_fmv_override.h"  // [fmvoverride]
@@ -1638,6 +1640,39 @@ bool PS2Runtime::initialize(const char *title)
             // (The pack lives in <exeDir>/data/Textures -- the deploy's data/ dir next to the
             // extracted ISO tree; the folder is created if absent.)
             ps2tex::replacementsEnabled();
+        }
+        {   // [texcache] Persistent write-back texture cache: configure + load at startup. Filled by
+            // the write-back hook in putTexture (the FINAL payload: decode + pack replacement).
+            const char *xd = ps2xExeDirC();
+            const std::string base = (xd && xd[0]) ? xd : ".";
+            // Read the toggles that change WHAT the cache contains: texture_pack (originals vs
+            // replaced) and button_layout. They go into packHash so a change invalidates the file,
+            // otherwise a cache built with the pack OFF would keep serving originals after enabling.
+            bool tcEnabled = true, packOn = false;
+            int btnLayout = 1;
+            {
+                std::ifstream f(base + "/savedata/settings.toml");
+                if (f.is_open())
+                {
+                    ps2x_toml::Document doc; doc.parse(f);
+                    tcEnabled = doc.getB("video.texcache", true);
+                    packOn = doc.getB("video.texture_pack", false);
+                    btnLayout = doc.getI("video.button_layout", 1);
+                }
+            }
+            if (const char *v = std::getenv("PS2X_TEXCACHE_ON"); v && v[0] == '0') tcEnabled = false;
+            uint64_t packHash = 1469598103934665603ull;
+            for (const char *p = ps2tex::replacementsRoot(); p && *p; ++p)
+                packHash = (packHash ^ (uint8_t)*p) * 1099511628211ull;
+            packHash ^= (uint64_t)ps2tex::replacementsCount();
+            packHash ^= packOn ? 0x9E3779B97F4A7C15ull : 0ull;
+            packHash ^= (uint64_t)(uint32_t)btnLayout * 0xC2B2AE3D27D4EB4Full;
+            uint64_t dataHash = 1469598103934665603ull;
+            for (const char *p = base.c_str(); p && *p; ++p)
+                dataHash = (dataHash ^ (uint8_t)*p) * 1099511628211ull;
+            const std::string tcPath = base + "/data/texcache.bin";
+            ps2texcache::setConfig(tcEnabled, packHash, dataHash, tcPath.c_str());
+            ps2texcache::load();
         }
         {   // [fps60] PS2X_FPS60=1: enable the 60-fps fight mode from the env (loads fps60_sites.txt,
             // staged next to the runner). Lets the perf A/B be run without touching settings.toml.
@@ -6238,7 +6273,7 @@ void PS2Runtime::run()
                           << std::dec << std::endl;
                 // ===================== [hstate] Readable state hierarchy =====================
                 // Translates bt3State (raw) to a human phase + sub-phase. BOOT and MENU are mapped
-                // with offsets already documented in tasks/main_menu_state_machine.md and tasks/ESTATUS.md.
+                // with the offsets already reverse-engineered for the menu state machine.
                 // FIGHT/IN_FIGHT do not yet have the "match type" offsets (player vs CPU / 2 players)
                 // identified -> see the [fightprobe] block below, which gathers the evidence to
                 // complete this switch.
@@ -6292,7 +6327,7 @@ void PS2Runtime::run()
                             const uint32_t menuState = (subStruct && subStruct != 0xffffffffu)
                                 ? r32safe(subStruct + 0x40u) : 0xffffffffu;
                             // Cursor/selection/state of the active item: *(0x3B38E8)+0x12C/0x138/0x13C
-                            // (offsets documented in tasks/ESTATUS.md and main_menu_state_machine.md).
+                            // (see the menu state-machine offsets above).
                             const uint32_t itemBase = r32safe(0x3B38E8u);
                             int32_t cursor = -1, selection = -1; uint32_t itemState = 0xffffffffu;
                             if (itemBase != 0u && itemBase != 0xffffffffu)

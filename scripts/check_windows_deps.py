@@ -12,10 +12,10 @@ contract the flat layout enforces (qt.conf + DLLs next to the executables):
 
 Exit codes: 0 = release-ready, 1 = problems found, 2 = usage error.
 
-This is the Windows counterpart of tools/release/check_floor.sh (the Linux gate
+This is the Windows counterpart of scripts/check_floor.sh (the Linux gate
 is a glibc ABI check since its libs come from ldd; here the closure is explicit
-in the PE imports). Run inside the build container (has pefile):
-    docker run --entrypoint python3 --rm -v "$OUT:/out" ... img /src/tools/release-windows/check_windows_deps.py /out/stage
+in the PE imports). Requires pefile (`pip install pefile`); setup.py runs it
+directly in stage 4 on Windows.
 """
 
 from __future__ import annotations

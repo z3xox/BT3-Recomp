@@ -10,10 +10,19 @@
 
 namespace texpack
 {
-const char *const kUrl = "https://pixeldrain.com/api/file/5UzM4yox";
-const char *const kPageUrl = "https://pixeldrain.com/u/5UzM4yox";
-const char *const kFileName = "Texture-4k.7z";
-const char *const kSha256 = "9d2d225d281545b08b3a8f4f02f2ebf79c8a6d61d62b84fea7db0fb5b569ed6f";
+namespace
+{
+const char *const kLiteUrl  = "https://pixeldrain.com/u/sobTVFCk";
+const char *const kFullUrl  = "https://pixeldrain.com/u/PYJZe4Jd";
+const char *const kLiteName = "4K 2D Textures Lite";
+const char *const kFullName = "4k Texture Pack";
+const char *const kLiteFile = "4K 2D Textures Lite.7z";
+const char *const kFullFile = "4k Texture Pack.7z";
+} // namespace
+
+const char *packName(int kind)     { return kind == kPackLite ? kLiteName : kFullName; }
+const char *packUrl(int kind)      { return kind == kPackLite ? kLiteUrl : kFullUrl; }
+const char *packFileName(int kind) { return kind == kPackLite ? kLiteFile : kFullFile; }
 
 QString dir()
 {
@@ -45,5 +54,10 @@ quint64 countReplacements()
             ++n;
     }
     return n;
+}
+
+bool installedIsFull()
+{
+    return QDir(dir() + QStringLiteral("/replacements/Characters/Body")).exists();
 }
 } // namespace texpack

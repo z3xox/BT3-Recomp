@@ -11,8 +11,11 @@
 #include <QCheckBox>
 #include <QDesktopServices>
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMenu>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
@@ -180,6 +183,58 @@ MiscTab::MiscTab(QWidget *parent)
     m_texInstall->setCursor(Qt::PointingHandCursor);
     root->addWidget(m_texInstall);
 
+    // [texcache] Explanation + the one-shot "delete the cache file" action.
+    root->addSpacing(8);
+    root->addWidget(section(QStringLiteral("TEXTURE CACHE")));
+    {
+        auto *row = new QWidget;
+        auto *lay = new QHBoxLayout(row);
+        lay->setContentsMargins(8, 2, 8, 2);
+        auto *lbl = new QLabel(QStringLiteral("Enable Texture Cache"));
+        lbl->setObjectName(QStringLiteral("valueLabel"));
+        m_tcCheck = new QCheckBox;
+        m_tcCheck->setObjectName(QStringLiteral("reinstallModeCheck"));
+        lay->addWidget(lbl, 1);
+        lay->addWidget(m_tcCheck);
+        root->addWidget(row);
+    }
+    {
+        auto *body = new QLabel(QStringLiteral(
+            "The texture cache stores each texture once it is fully resolved (PSMT decode plus "
+            "texture-pack replacement applied) in a single file. Later runs upload it directly: "
+            "no VRAM hash match, no pack lookup and no PNG/DDS decode, which cuts texture CPU "
+            "work. It fills progressively while you play and covers what you actually visit. It "
+            "is rebuilt automatically when the pack or the Texture Replacement toggle changes."));
+        body->setObjectName(QStringLiteral("hintLabel"));
+        body->setWordWrap(true);
+        root->addWidget(body);
+    }
+    {
+        auto *row = new QWidget;
+        auto *lay = new QHBoxLayout(row);
+        lay->setContentsMargins(8, 2, 8, 2);
+        auto *lbl = new QLabel(QStringLiteral("Status"));
+        lbl->setObjectName(QStringLiteral("valueLabel"));
+        lbl->setMinimumWidth(110);
+        m_tcStatus = new QLabel;
+        m_tcStatus->setObjectName(QStringLiteral("hintLabel"));
+        m_tcStatus->setWordWrap(true);
+        lay->addWidget(lbl);
+        lay->addWidget(m_tcStatus, 1);
+        root->addWidget(row);
+    }
+    m_tcDelete = new QPushButton(QStringLiteral("Delete texture cache"), content);
+    m_tcDelete->setObjectName(QStringLiteral("wizardButton"));
+    m_tcDelete->setCursor(Qt::PointingHandCursor);
+    root->addWidget(m_tcDelete);
+    {
+        auto *hint = new QLabel(QStringLiteral(
+            "Deleting it only forces a rebuild on the next run; it does not touch the texture pack."));
+        hint->setObjectName(QStringLiteral("hintLabel"));
+        hint->setWordWrap(true);
+        root->addWidget(hint);
+    }
+
     root->addStretch(1);
     scroll->setWidget(content);
 
@@ -193,6 +248,8 @@ MiscTab::MiscTab(QWidget *parent)
     connect(m_texCheck, &QCheckBox::toggled, this, &MiscTab::onTexPackToggled);
     connect(m_texInstall, &QPushButton::clicked, this, &MiscTab::onInstallPack);
     connect(m_texFolder, &QPushButton::clicked, this, &MiscTab::onTexPackFolder);
+    connect(m_tcDelete, &QPushButton::clicked, this, &MiscTab::onDeleteTexCache);
+    connect(m_tcCheck, &QCheckBox::toggled, this, &MiscTab::onTexCacheToggled);
 
     refresh();
 }
@@ -232,6 +289,22 @@ void MiscTab::refresh()
     {
         QSignalBlocker block(m_texCheck);   // sync only; do not write the setting back
         m_texCheck->setChecked(SettingsManager::instance().texPack());
+    }
+
+    // [texcache] enable checkbox + file status (built size, or not built yet).
+    if (m_tcCheck)
+    {
+        QSignalBlocker block(m_tcCheck);
+        m_tcCheck->setChecked(SettingsManager::instance().texcache());
+    }
+    if (m_tcStatus)
+    {
+        const QFileInfo fi(apppaths::userRoot() + QStringLiteral("/data/texcache.bin"));
+        if (fi.exists())
+            m_tcStatus->setText(QStringLiteral("Built - %1 MB").arg(fi.size() / (1024 * 1024)));
+        else
+            m_tcStatus->setText(QStringLiteral("Not built yet (fills on the next run)"));
+        m_tcDelete->setEnabled(fi.exists());
     }
 
     m_reinstall->setChecked(m_reinstall->isChecked());
@@ -278,9 +351,31 @@ void MiscTab::onTexPackFolder()
     QDesktopServices::openUrl(QUrl::fromLocalFile(d));
 }
 
+void MiscTab::onTexCacheToggled(bool on)
+{
+    SettingsManager::instance().setTexcache(on);
+}
+
+void MiscTab::onDeleteTexCache()
+{
+    // [texcache] Delete the cache file: the runner rebuilds it on the next launch.
+    const QString tc = apppaths::userRoot() + QStringLiteral("/data/texcache.bin");
+    QFile::remove(tc);
+    QFile::remove(tc + QStringLiteral(".tmp"));
+    refresh();
+}
+
 void MiscTab::onInstallPack()
 {
-    TexInstallDialog dlg(this);
+    // [texui] Pick the variant first; the dialog is per-pack (download page + Browse install).
+    QMenu menu(this);
+    QAction *lite = menu.addAction(QStringLiteral("Pack Lite (2D only)"));
+    menu.addAction(QStringLiteral("Pack Full (3D + 2D)"));
+    QAction *chosen = menu.exec(m_texInstall->mapToGlobal(QPoint(0, m_texInstall->height())));
+    if (!chosen)
+        return;
+    const int kind = (chosen == lite) ? texpack::kPackLite : texpack::kPackFull;
+    TexInstallDialog dlg(this, kind);
     connect(&dlg, &TexInstallDialog::installed, this, &MiscTab::refresh);
     dlg.exec();
     refresh();

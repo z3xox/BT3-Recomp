@@ -11,9 +11,10 @@ One script, four stages:
 The game's code is generated locally from YOUR copy of the game -- this repository ships no game
 code or assets.
 
-    python3 games/bt3/setup.py <iso|elf> [--stage N] [-y] [--deploy OUT] [--package]
+    python3 games/bt3/setup.py <iso|elf> [--stage N] [-y] [--deploy OUT] [--no-package]
 
-Backwards-compatible flags kept for the release containers and scripts: --jobs, --skip-setup,
+The release artifact is produced by default (stage 4); pass --no-package to assemble only the
+deploy tree. Backwards-compatible flags kept for the build/release scripts: --jobs, --skip-setup,
 --gen-only, --deploy. See --help and --list-stages.
 """
 from __future__ import annotations
@@ -34,15 +35,16 @@ from typing import Callable, Optional
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-# Overridable so a container can generate into a build-local dir (PS2X_BUILD_DIR)
-# instead of the host source tree. Defaults to <repo>/build.
+# Overridable so a build can generate into a build-local dir (PS2X_BUILD_DIR)
+# instead of the source tree. Defaults to <repo>/build.
 BUILD = Path(os.environ.get("PS2X_BUILD_DIR") or str(ROOT / "build"))
 WORK = HERE / "work"
 ELF_SHA256 = "811188ba9b416500d921cd4d9514df0cbf42f3a41a99cf5aac5a3da37171bf99"
-# Generated TUs are huge; high job counts can exhaust RAM (16 GB: keep <= 3).
+# Generated TUs are huge; high job counts can exhaust RAM. This is only the fallback: by default the
+# job count is auto-sized from CPU/RAM (see plan_build), and 16 GB lands back on this value.
 DEFAULT_JOBS = "3"
 
-# Pinned tool versions (stage 2 installs exactly these; keep in sync with the release containers).
+# Pinned tool versions (stage 2 installs exactly these; keep in sync with the release builds).
 CMAKE_MIN = (3, 21)
 QT_VERSION = "6.5.3"
 # Preferred Windows kit. 6.5.x only ships win64_msvc2019_64 (no msvc2022 kit), so that is the pin;
@@ -159,8 +161,9 @@ class Logger:
         self._fh = None
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._fh = open(path, "a", encoding="utf-8", errors="replace")
-            self._fh.write(f"\n===== setup.py run {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            # "w": every run overwrites the previous log (the default path is a fixed setup.log).
+            self._fh = open(path, "w", encoding="utf-8", errors="replace")
+            self._fh.write(f"===== setup.py run {time.strftime('%Y-%m-%d %H:%M:%S')} "
                            f"=====\n")
 
     def _write_file(self, text: str) -> None:
@@ -312,6 +315,33 @@ def ask_path(ctx: "Context", prompt: str, what: str) -> Optional[Path]:
         print(f"  {what} not found: {p}")
         return None
     return p.resolve()
+
+
+def ask_destination(ctx: "Context", default_dir: Path) -> Optional[Path]:
+    """Ask where to send the finished release artifact (created if missing).
+    Enter accepts the default; 'skip' (or an empty answer for the empty default) copies nothing.
+    Non-interactive returns None; -y accepts the default."""
+    if not ctx.interactive:
+        return None
+    if ctx.args.yes:
+        return default_dir
+    try:
+        raw = input(
+            f"Where should I send the final package? "
+            f"(Enter = {default_dir}, 'skip' = leave it in {default_dir.parent}) "
+        ).strip()
+    except EOFError:
+        return None
+    raw = raw.strip().strip('"').strip("'")
+    if raw.lower() in ("skip", "no", "n", "-"):
+        return None
+    dest = Path(raw).expanduser() if raw else default_dir
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        warn(f"cannot use destination {dest}: {e}")
+        return None
+    return dest.resolve()
 
 
 # ------------------------------------------------------------------------------------------------
@@ -500,6 +530,119 @@ def _msvc_toolset_present() -> bool:
 
 
 
+# --- hardware auto-tune ---------------------------------------------------------------------------
+# The runner's generated translation units are huge: the historical -j3 default assumes ~16 GB of
+# RAM (see DEFAULT_JOBS). Auto-tune picks the largest job count that stays inside a safe memory
+# budget and only enables optional accelerators that are actually installed. Everything is a
+# suggestion: --no-autotune, an explicit --jobs N, or a failed probe fall back to the safe defaults.
+MEM_PER_JOB_GB = 4.0    # budget per parallel compile; a 16 GB machine lands on the historical -j3
+RAM_RESERVE_GB = 3.0    # leave room for the OS, the recompiler and the final link
+
+
+@dataclass
+class Hardware:
+    logical_cores: int
+    physical_cores: int
+    ram_gb: Optional[float]     # None when it cannot be probed -> stay conservative
+
+    @property
+    def ram_known(self) -> bool:
+        return self.ram_gb is not None
+
+
+def _cpu_cores() -> tuple:
+    """(logical, physical) CPU cores. physical degrades to logical when it cannot be read."""
+    logical = os.cpu_count() or 1
+    physical = logical
+    try:
+        if sys.platform.startswith("linux"):
+            seen = set()
+            cur: dict = {}
+            for line in Path("/proc/cpuinfo").read_text(errors="replace").splitlines() + [""]:
+                if not line.strip():
+                    if cur:
+                        seen.add((cur.get("physical id", "0"),
+                                  cur.get("core id", cur.get("processor", "0"))))
+                        cur = {}
+                    continue
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    cur[k.strip()] = v.strip()
+            if seen:
+                physical = len(seen)
+        elif sys.platform == "darwin":
+            out = run_capture(["sysctl", "-n", "hw.physicalcpu"]).strip()
+            if out.isdigit():
+                physical = int(out)
+    except Exception:   # noqa: BLE001 - a failed probe must never break the build
+        physical = logical
+    return logical, max(1, min(physical, logical))
+
+
+def _ram_gb() -> Optional[float]:
+    """Total usable RAM in GB, capped by the cgroup limit inside a container. None when unknown."""
+    total = None
+    try:
+        if sys.platform.startswith("linux"):
+            for line in Path("/proc/meminfo").read_text(errors="replace").splitlines():
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1]) / (1024 * 1024)
+                    break
+            for cg in ("/sys/fs/cgroup/memory.max",
+                       "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+                try:
+                    raw = Path(cg).read_text().strip()
+                except OSError:
+                    continue
+                if raw and raw != "max" and raw.isdigit():
+                    limit = int(raw) / (1024 ** 3)
+                    total = min(total, limit) if total else limit
+                    break
+        elif sys.platform == "darwin":
+            out = run_capture(["sysctl", "-n", "hw.memsize"]).strip()
+            if out.isdigit():
+                total = int(out) / (1024 ** 3)
+        elif os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = _MemStatus()
+            st.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                total = st.ullTotalPhys / (1024 ** 3)
+    except Exception:   # noqa: BLE001
+        return None
+    return total if total and total > 0 else None
+
+
+def _ccache_available() -> bool:
+    """ccache as a launcher only when sccache is absent (the runtime prefers sccache itself)."""
+    return bool(shutil.which("ccache")) and not shutil.which("sccache")
+
+
+def detect_hardware() -> Hardware:
+    logical, physical = _cpu_cores()
+    return Hardware(logical, physical, _ram_gb())
+
+
+def plan_build(hw: Hardware) -> tuple:
+    """(jobs, unity_batch, use_ccache): the largest values that stay within the RAM budget.
+    jobs is None when RAM could not be probed (the caller keeps DEFAULT_JOBS)."""
+    if not hw.ram_known:
+        return None, 8, _ccache_available()
+    budget = max(0.0, hw.ram_gb - RAM_RESERVE_GB)
+    by_mem = int(budget // MEM_PER_JOB_GB)
+    jobs = max(1, min(hw.physical_cores, by_mem)) if by_mem >= 1 else 1
+    # Very low RAM: smaller unity batches keep a single compile within budget.
+    batch = 4 if hw.ram_gb < 12 else 8
+    return jobs, batch, _ccache_available()
+
+
 @dataclass
 class PlatformInfo:
     os: str                 # windows | linux | macos
@@ -511,6 +654,8 @@ class PlatformInfo:
     tools: dict = field(default_factory=dict)      # name -> description/path/None
     qt_prefix: Optional[Path] = None
     lavapipe_dir: Optional[Path] = None
+    unity_batch: Optional[int] = None              # auto-tune: unity batch, None = CMake default
+    use_ccache: bool = False                       # auto-tune: ccache launcher when sccache is absent
 
     @property
     def is_windows(self) -> bool:
@@ -550,9 +695,13 @@ class PlatformInfo:
     def configure_extra(self, build_dir: Path) -> list:
         """CMake flags for this platform. Mirrors the historical setup.py behaviour."""
         extra = ["-DCMAKE_BUILD_TYPE=Release"]   # a Windows Ninja/clang-cl configure once came up Debug
-        # ps2xStudio (the editor tool) fetches four git branches at configure time; a network hiccup
-        # there aborted a user's whole game build. The game does not need it.
-        extra.append("-DPS2X_BUILD_STUDIO=" + ("ON" if os.environ.get("PS2X_SETUP_STUDIO") == "1" else "OFF"))
+        # Performance auto-tune (see plan_build). Only non-default values are emitted so the cache
+        # stays clean and a rebuild only reconfigures when something actually changed.
+        if self.unity_batch and self.unity_batch != 8:
+            extra.append(f"-DPS2X_RUNNER_UNITY_BUILD_BATCH_SIZE={self.unity_batch}")
+        if self.use_ccache:
+            extra += ["-DCMAKE_C_COMPILER_LAUNCHER=ccache",
+                      "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"]
         if self.is_macos:
             extra += ["-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"]
             # paraLLEl-GS does not build on macOS (Granite's sleep_until_nsecs has no Darwin path).
@@ -1025,6 +1174,14 @@ def configured(build_dir: Path, info: PlatformInfo) -> bool:
         if not any(line.startswith("PS2X_SHOW_WINDOWS_CONSOLE:") and line.endswith("=" + desired_console)
                    for line in cache_text.splitlines()):
             return False
+    if info.unity_batch is not None and info.unity_batch != 8:
+        if not any(line.startswith("PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE:")
+                   and line.endswith("=" + str(info.unity_batch)) for line in cache_text.splitlines()):
+            return False
+    if info.use_ccache:
+        if not any(line.startswith("CMAKE_CXX_COMPILER_LAUNCHER:") and "ccache" in line
+                   for line in cache_text.splitlines()):
+            return False
     if any((build_dir / f).exists() for f in ("build.ninja", "Makefile", "ALL_BUILD.vcxproj")):
         return True
     return any(build_dir.glob("*.sln"))
@@ -1380,8 +1537,8 @@ def bundle_windows(ctx: "Context", stage: Path, runner: Path, launcher: Path) ->
 
 
 LINUX_LIB_BLACKLIST = (
-    "libc.so", "libm.so", "libpthread.so", "libdl.so", "librt.so", "libutil.so", "libresolv.so",
-    "libnsl.so", "libstdc++.so", "libgcc_s.so", "ld-linux",
+    "libc.so", "libm.so", "libmvec.so", "libpthread.so", "libdl.so", "librt.so", "libutil.so",
+    "libresolv.so", "libnsl.so", "libstdc++.so", "libgcc_s.so", "ld-linux",
 )
 
 
@@ -1477,7 +1634,7 @@ def bundle_linux(ctx: "Context", stage: Path, runner: Path, launcher: Optional[P
 
     (stage / "logs").mkdir(exist_ok=True)
     (stage / "savedata" / "BASLUS-21678DBZT3").mkdir(parents=True, exist_ok=True)
-    installer = ROOT / "tools" / "release" / "install-game.sh.in"
+    installer = ROOT / "scripts" / "install-game.sh.in"
     if installer.exists():
         dst = stage / "install game.sh"
         shutil.copy2(installer, dst)
@@ -1488,7 +1645,7 @@ def seed_savedata(ctx: "Context", stage: Path) -> None:
     """settings.toml (only when absent), fps60 pacing table and the memory-card slot."""
     savedata = stage / "savedata"
     savedata.mkdir(parents=True, exist_ok=True)
-    default = ROOT / "tools" / "release" / "settings.toml.default"
+    default = ROOT / "scripts" / "settings.toml.default"
     cfg = savedata / "settings.toml"
     if default.exists() and not cfg.exists():
         shutil.copy2(default, cfg)
@@ -1500,14 +1657,14 @@ def seed_savedata(ctx: "Context", stage: Path) -> None:
 
 def run_gate(ctx: "Context", stage: Path) -> None:
     if ctx.platform.is_windows:
-        gate = ROOT / "tools" / "release-windows" / "check_windows_deps.py"
+        gate = ROOT / "scripts" / "check_windows_deps.py"
         if gate.exists():
             step("running the PE dependency gate")
             run([sys.executable, str(gate), str(stage)])
         else:
             warn("PE gate script not found; skipping")
     elif ctx.platform.os == "linux":
-        gate = ROOT / "tools" / "release" / "check_floor.sh"
+        gate = ROOT / "scripts" / "check_floor.sh"
         if gate.exists() and shutil.which("bash"):
             step("running the glibc floor gate")
             run(["bash", str(gate), str(stage)])
@@ -1546,14 +1703,45 @@ def package_artifact(ctx: "Context", out_root: Path, stage: Path) -> None:
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
-    (out_root / (base + ".sha256")).write_text(f"{digest}  {archive.name}\n")
+    checksum = out_root / (base + ".sha256")
+    checksum.write_text(f"{digest}  {archive.name}\n")
     LOG.info(f"  {archive}  ({archive.stat().st_size / (1 << 20):.1f} MB)")
     LOG.info(f"  sha256: {digest}")
 
-    if not ctx.args.no_desktop_copy:
+    dest: Optional[Path] = None
+    if ctx.args.dest:
+        dest = Path(ctx.args.dest).expanduser()
+    elif not ctx.args.no_desktop_copy:
         desktop = Path.home() / "Desktop"
-        if desktop.is_dir() and ask_yes_no(ctx, f"Copy the artifact to {desktop}?", default=False):
-            shutil.copy2(archive, desktop / archive.name)
+        dest = ask_destination(ctx, desktop if desktop.is_dir() else out_root)
+    if dest is not None:
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            for art in (archive, checksum):
+                shutil.copy2(art, dest / art.name)
+            # The run log is written until the very end, so remember the destination and let main()
+            # drop the complete log there after LOG.close() (see _copy_log_next_to_artifact).
+            ctx.log_dest = dest
+            LOG.info(f"  copied to {dest}")
+        except OSError as e:
+            warn(f"could not copy the artifact to {dest}: {e}")
+
+
+def _copy_log_next_to_artifact(ctx: "Context") -> None:
+    """Place the completed run log beside the artifact the user asked for. No-op unless
+    package_artifact chose a destination, or when the run had no log file."""
+    if ctx.log_dest is None or LOG.path is None:
+        return
+    src = Path(LOG.path)
+    if not src.is_file():
+        return
+    dst = ctx.log_dest / src.name
+    try:
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
+        LOG.info(f"  log -> {dst}")
+    except OSError as e:
+        print(f"WARNING: could not copy the log to {ctx.log_dest}: {e}", file=sys.stderr)
 
 
 def stage_package(ctx: "Context") -> None:
@@ -1610,6 +1798,7 @@ class Context:
     runner: Optional[Path] = None
     run_mode: int = 1   # highest stage number requested
     stage_name: str = ""   # for FAILED messages ("3 build" ...)
+    log_dest: Optional[Path] = None   # where the artifact was sent, to drop the log next to it
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -1617,8 +1806,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Build (deploy and package) Dragon Ball Z: Budokai Tenkaichi 3.")
     ap.add_argument("src", nargs="?", metavar="<iso|elf>",
                     help="BT3 USA ISO or bare SLUS_216.78 ELF (not needed with --skip-setup)")
-    ap.add_argument("--jobs", default=DEFAULT_JOBS, metavar="N",
-                    help=f"parallel jobs for the ps2EntryRunner build (default {DEFAULT_JOBS})")
+    ap.add_argument("--jobs", default="auto", metavar="N",
+                    help=f"parallel jobs for the build; 'auto' (default) sizes it from CPU/RAM, "
+                         f"N forces it, and the conservative fallback is {DEFAULT_JOBS}")
+    ap.add_argument("--no-autotune", dest="no_autotune", action="store_true",
+                    help="disable hardware auto-tuning (keep the conservative build defaults)")
     ap.add_argument("--stage", metavar="N", help="run only this stage (1-4)")
     ap.add_argument("--stages", metavar="A-B", help="run a stage range, e.g. 3-4")
     ap.add_argument("--list-stages", action="store_true", help="print the stages and exit")
@@ -1633,22 +1825,26 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--deps-only", action="store_true", help="stop after stage 2")
     ap.add_argument("--deploy", metavar="OUT",
                     help="after the build, assemble the playable tree into OUT")
-    ap.add_argument("--package", action="store_true",
-                    help="also produce the release artifact for this OS (+ checksum)")
+    ap.add_argument("--package", dest="package", action="store_true", default=True,
+                    help="produce the release artifact for this OS (+ checksum); on by default")
+    ap.add_argument("--no-package", dest="package", action="store_false",
+                    help="do not produce the release artifact (stage 4 assembles the deploy tree only)")
     ap.add_argument("--output", metavar="DIR",
                     help="where the stage tree and the artifact go (default build/release-<os>/out)")
     ap.add_argument("--skip-launcher", action="store_true",
                     help="do not build the Qt launcher (developer tree without the UI)")
     ap.add_argument("--no-gate", dest="no_gate", action="store_true",
                     help="skip the release gate (PE imports / glibc floor)")
+    ap.add_argument("--dest", metavar="DIR",
+                    help="copy the release artifact (+ checksum) into DIR (skips the prompt)")
     ap.add_argument("--no-desktop-copy", dest="no_desktop_copy", action="store_true",
-                    help="never offer to copy the artifact to the Desktop")
+                    help="never offer to copy the release artifact anywhere")
     ap.add_argument("--skip-setup", action="store_true",
                     help="skip ISO/recompile/patches; only rebuild the runner (+deploy)")
     ap.add_argument("--gen-only", action="store_true",
                     help="stop after recompile/generation/patches; do not build the runner")
     ap.add_argument("--log", metavar="PATH",
-                    help="full execution log (default build/setup-<timestamp>.log)")
+                    help="execution log (default build/setup.log; overwritten on each run)")
     ap.add_argument("--no-log", dest="no_log", action="store_true", help="no log file")
     ap.add_argument("--log-level", dest="log_level", type=int, default=3, choices=(0, 1, 2, 3, 4),
                     help="0 silent, 1 errors, 2 errors+warnings, 3 info (default), 4 verbose")
@@ -1712,8 +1908,7 @@ def main(argv=None) -> None:
     level = 4 if args.verbose else (1 if args.quiet else args.log_level)
     log_path = None
     if not args.no_log:
-        log_path = Path(args.log).expanduser() if args.log else \
-            BUILD / f"setup-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        log_path = Path(args.log).expanduser() if args.log else BUILD / "setup.log"
     LOG = Logger(log_path, level)
     LOG.banner(f"[setup] console={LOG_LEVELS.get(level, level)}"
                + (f" | log: {LOG.path}" if LOG.path else " | no log file"))
@@ -1721,6 +1916,25 @@ def main(argv=None) -> None:
     info = detect_platform()
     interactive = info.interactive and not args.non_interactive
     ctx = Context(args=args, platform=info, interactive=interactive, jobs=str(args.jobs))
+
+    # Hardware auto-tune: pick the largest safe -j and optional build accelerators. An explicit
+    # numeric --jobs or --no-autotune wins; a failed RAM probe keeps DEFAULT_JOBS (conservative).
+    raw_jobs = str(args.jobs).strip()
+    if args.no_autotune or raw_jobs.isdigit():
+        ctx.jobs = raw_jobs if raw_jobs.isdigit() else DEFAULT_JOBS
+    else:
+        hw = detect_hardware()
+        jobs, batch, use_ccache = plan_build(hw)
+        if jobs is None:
+            ctx.jobs = DEFAULT_JOBS
+            LOG.info(f"[autotune] RAM not detected; keeping the safe default -j{ctx.jobs}")
+        else:
+            ram = f"{hw.ram_gb:.0f} GB" if hw.ram_known else "unknown RAM"
+            LOG.info(f"[autotune] {hw.physical_cores} cores / {ram} -> -j{jobs}, "
+                     f"unity batch {batch}" + (", ccache" if use_ccache else ""))
+            ctx.jobs = str(jobs)
+            info.unity_batch = batch
+            info.use_ccache = use_ccache
 
     # --dry-run implies --no-deps and stops before stage 3.
     if args.dry_run:
@@ -1757,7 +1971,7 @@ def main(argv=None) -> None:
                 ctx.runner = find_binary("ps2EntryRunner")
             stage_package(ctx)
 
-        if ctx.runner is not None and not args.deploy and not args.package:
+        if ctx.runner is not None and not args.deploy:
             env_line = ("set PS2X_CD_IMAGE=<path to your BT3 ISO>& " if info.is_windows else
                         'env PS2X_CD_IMAGE="<path to your BT3 ISO>" ')
             step("done")
@@ -1769,6 +1983,7 @@ def main(argv=None) -> None:
 
     LOG.banner("[setup] done" + (f" | log: {LOG.path}" if LOG.path else ""))
     LOG.close()
+    _copy_log_next_to_artifact(ctx)
 
 
 if __name__ == "__main__":

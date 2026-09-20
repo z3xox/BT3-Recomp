@@ -138,9 +138,9 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
     resultPtr = 0u;
     signalNowaitCompletion = false;
 
-    // [r3000] When the native IOPRP file service (CDVDFSV) is brought up, prefer its handler for
-    // the DVCI RPCs instead of the HLE resolver.
-    if (const char *e = std::getenv("PS2X_IOP_IOPRP"); e && e[0] && e[0] != '0')
+    // [r3000] Prefer the native IOPRP file service (CDVDFSV) for the DVCI RPCs (on by default;
+    // opt out with PS2X_IOP_IOPRP=0).
+    if (const char *e = std::getenv("PS2X_IOP_IOPRP"); !(e && e[0] == '0'))
     {
         if ((sid == 0x80000597u || sid == 0x2000004u) &&
             ps2xInvokeIopRpc(runtime, sid, rpcNum, m_rdram, sendBufAddr, sendSize, recvBufAddr, recvSize))

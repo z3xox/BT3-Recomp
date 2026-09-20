@@ -629,9 +629,9 @@ namespace ps2_stubs
 
     void sceSifResetIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // [r3000] Optionally bring up the IOPRP resident modules (CDVDMAN/CDVDFSV) natively, in
-        // place of the HLE. Gated by PS2X_IOP_IOPRP (default off: the HLE path is unchanged).
-        if (const char *e = std::getenv("PS2X_IOP_IOPRP"); e && e[0] && e[0] != '0')
+        // [r3000] Bring up the IOPRP resident modules (CDVDMAN/CDVDFSV) natively, in place of the
+        // HLE. On by default (opt out with PS2X_IOP_IOPRP=0).
+        if (const char *e = std::getenv("PS2X_IOP_IOPRP"); !(e && e[0] == '0'))
         {
             std::string dir = "data/IRX/";
             if (const char *d = std::getenv("PS2X_IOP_DIR"); d && d[0]) dir = d;

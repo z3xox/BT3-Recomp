@@ -1602,11 +1602,17 @@ def gen_vu1(ctx: "Context") -> None:
 
 
 def fetch_submodules() -> None:
-    """The paraLLEl-GS backend lives in a git submodule; CMake builds it only when present."""
+    """The paraLLEl-GS backend lives in a git submodule; CMake builds it only when present.
+
+    On Windows the recursive checkout runs past MAX_PATH (glslang's
+    reference/shaders-msl/** names are very long) and git aborts those files with "Filename too
+    long"; -c core.longpaths=true avoids it (and needs long paths enabled on the machine).
+    """
     if os.environ.get("PS2X_SETUP_NO_SUBMODULES") or not (ROOT / ".gitmodules").exists() or not shutil.which("git"):
         return
     try:
-        run(["git", "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+        run(["git", "-c", "core.longpaths=true", "-C", ROOT,
+             "submodule", "update", "--init", "--recursive"])
     except Exception as e:   # noqa: BLE001
         print(f"== submodule fetch failed ({e}); building without the paraLLEl-GS backend")
 

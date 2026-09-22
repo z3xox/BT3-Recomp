@@ -59,7 +59,8 @@ _Screenshots are on the way._
 
 ### Download & run
 
-1. Grab the release for your OS (`BT3-Recomp-x86_64.zip` or `.tar.gz`).
+1. Grab the release for your OS (`BT3-Recomp-win-x86_64.zip` on Windows,
+   `BT3-Recomp-linux-x86_64.tar.gz` / `BT3-Recomp-macos-x86_64.tar.gz` elsewhere).
 2. Extract it.
 3. Launch:
    - **Windows** — `Launcher.exe`
@@ -127,7 +128,7 @@ the full `setup.py` pipeline, bundles the runner + its shared libraries into the
 deploy tree, builds a Qt 6 launcher (GLFW gamepad support), and drops
 `install game.sh` for the desktop-integration step. Pass `--skip-setup` to reuse
 an existing `games/bt3/work/` tree and only rebuild the runner. The same pipeline
-produces the release artifact (`BT3-Recomp-x86_64.tar.gz` + `.sha256`) and asks
+produces the release artifact (`BT3-Recomp-<os>-x86_64.tar.gz` + `.sha256`) and asks
 where to send it (`--no-package` assembles the deploy tree only). See
 `docs/DEPLOY.md` for the full picture.
 
@@ -166,7 +167,7 @@ stage passes the PE gate, package the release zip with:
 ```
 
 This produces `build\release-windows\out\stage\` and
-`build\release-windows\out\BT3-Recomp-x86_64.zip` + `.sha256`.
+`build\release-windows\out\BT3-Recomp-win-x86_64.zip` + `.sha256`.
 
 **macOS (experimental):** install the Xcode Command Line Tools and Homebrew
 dependencies:
@@ -282,7 +283,7 @@ Known issues:
 | `scripts/build-linux.sh` | Linux build + package wrapper around `setup.py` (ISO prompt, portable tree, tar.gz + sha256) |
 | `scripts/build-windows.ps1` | Windows native build + package wrapper (installs missing deps, builds runner + Qt launcher, PE gate, zip) |
 | `scripts/install-deps-windows.ps1` | Windows dependency installer (VS Build Tools + ClangCL, CMake, Ninja, Python, Qt, Mesa lavapipe) |
-| `scripts/package-windows.ps1` | Windows release packaging from the native stage (`BT3-Recomp-x86_64.zip` + `.sha256`) |
+| `scripts/package-windows.ps1` | Windows release packaging from the native stage (`BT3-Recomp-win-x86_64.zip` + `.sha256`) |
 | `games/bt3/setup.py` | the single four-stage script: detect / deps / build / package (see `docs/DEPLOY.md`) |
 | `docs/DEPLOY.md` | the deploy structure and cross-platform packaging documentation |
 | `games/bt3/functions.csv`, `dbzp_*.csv` | function address maps (symbols only) |

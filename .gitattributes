@@ -1,0 +1,8 @@
+# Shell scripts must be LF everywhere: they run under bash in WSL, Docker and Linux.
+# With core.autocrlf=true (the common Windows default) a checkout would otherwise hand bash a
+# CRLF script and it dies on the first line -- `set -euo pipefail\r` is "invalid option name".
+# Windows does not run the .sh scripts (it uses the .ps1 ones), so forcing LF here is a no-op
+# for it and fixes the Linux/WSL/Docker flows.
+*.sh text eol=lf
+*.sh.in text eol=lf
+.gitattributes text eol=lf

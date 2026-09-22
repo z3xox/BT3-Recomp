@@ -5,12 +5,13 @@ self-extracting single-file runtime. The delivered tree is identical on Linux,
 Windows and macOS:
 
 ```
-BT3-Recomp-x86_64.tar.gz          # Linux release payload
-BT3-Recomp-x86_64.sha256
+BT3-Recomp-linux-x86_64.tar.gz    # Linux release payload
+BT3-Recomp-linux-x86_64.sha256
 ```
 
-or the equivalent Windows/macOS ZIP. There is no SELFX stub any more: unzip the
-archive and run the launcher, which installs the game from your ISO on first run.
+or `BT3-Recomp-win-x86_64.zip` on Windows, `BT3-Recomp-macos-x86_64.tar.gz` on
+macOS. There is no SELFX stub any more: unzip the archive and run the launcher,
+which installs the game from your ISO on first run.
 
 ## Deploy tree
 
@@ -117,7 +118,7 @@ DLLs into `assets/lib/`, writes the portable tree to
 `assets/`, `savedata/`, licences, `settings.toml`) and runs a PE gate —
 `check_windows_deps.py` (pefile) verifies that every PE import resolves either
 from `assets/lib/` or to a Windows OS component, and that the layout is complete.
-`scripts/package-windows.ps1` then zips the tree into `BT3-Recomp-x86_64.zip` +
+`scripts/package-windows.ps1` then zips the tree into `BT3-Recomp-win-x86_64.zip` +
 `.sha256`. Windows resolves the bundled DLLs from the executable's own directory,
 so no `LD_LIBRARY_PATH` games are needed.
 

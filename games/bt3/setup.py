@@ -34,6 +34,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 HERE = Path(__file__).resolve().parent
+try:   # console UI (TUI + plain fallback); optional so a missing file never breaks the build
+    from setup_ui import Caps, View
+except Exception:   # noqa: BLE001
+    Caps = View = None   # type: ignore
 ROOT = HERE.parent.parent
 # Overridable so a build can generate into a build-local dir (PS2X_BUILD_DIR)
 # instead of the source tree. Defaults to <repo>/build.
@@ -211,10 +215,19 @@ class Logger:
 
 LOG = Logger(None, 3)
 
+# The console view (setup_ui.View) when the UI module is present and stdout is a terminal; every
+# consumer guards on it, so a plain run still works exactly as before.
+VIEW = None
+
 
 def die(msg: str, code: int = 1, stage: str = "") -> "None":
     where = f" at stage {stage}" if stage else ""
     LOG.error(f"{msg}{where}")
+    if VIEW is not None:
+        try:
+            VIEW.close()
+        except Exception:   # noqa: BLE001
+            pass
     if LOG.path:
         print(f"FAILED{where}. Full log: {LOG.path}", file=sys.stderr)
     LOG.close()
@@ -259,6 +272,8 @@ def run(cmd, quiet: bool = False, **kw) -> None:
             LOG.raw(line)
         else:
             LOG.process_line(line)
+            if VIEW is not None:
+                VIEW.feed(line)   # drives the progress bar from ninja's [n/m]
     p.wait()
     if p.returncode != 0:
         raise CommandError(cmdline, p.returncode)
@@ -282,6 +297,13 @@ def has_tty() -> bool:
         return False
 
 
+def _ask(prompt: str) -> str:
+    """Read a line; when the TUI owns the screen it suspends/resumes around the prompt."""
+    if VIEW is not None and getattr(VIEW, "tui", False):
+        return VIEW.prompt(prompt)
+    return input(prompt)
+
+
 def ask_yes_no(ctx: "Context", question: str, default: bool = True) -> bool:
     """Interactive yes/no. -y answers yes, --non-interactive (or no TTY) answers the default."""
     if ctx.args.yes:
@@ -292,7 +314,7 @@ def ask_yes_no(ctx: "Context", question: str, default: bool = True) -> bool:
         return default
     suffix = "[Y/n]" if default else "[y/N]"
     try:
-        ans = input(f"{question} {suffix} ").strip().lower()
+        ans = _ask(f"{question} {suffix} ").strip().lower()
     except EOFError:
         return default
     if not ans:
@@ -305,7 +327,7 @@ def ask_path(ctx: "Context", prompt: str, what: str) -> Optional[Path]:
     if not ctx.interactive or ctx.args.yes:
         return None
     try:
-        raw = input(f"{prompt} ").strip().strip('"').strip("'")
+        raw = _ask(f"{prompt} ").strip().strip('"').strip("'")
     except EOFError:
         return None
     if not raw:
@@ -326,8 +348,8 @@ def ask_destination(ctx: "Context", default_dir: Path) -> Optional[Path]:
     if ctx.args.yes:
         return default_dir
     try:
-        raw = input(
-            f"Where should I send the final package? "
+        raw = _ask(
+            f"Where should the compressed release go? "
             f"(Enter = {default_dir}, 'skip' = leave it in {default_dir.parent}) "
         ).strip()
     except EOFError:
@@ -782,6 +804,14 @@ def print_platform_report(info: PlatformInfo) -> None:
 
 def stage_detect(ctx: "Context") -> None:
     step("stage 1: platform detection")
+    if VIEW is not None:
+        p = ctx.platform
+        t = p.tools
+        have = [k for k, v in t.items() if v]
+        VIEW.stage(1, 4, "detect")
+        VIEW.item(1, 3, "Platform", "ok", f"{p.os} {p.arch}")
+        VIEW.item(2, 3, "Package manager", "ok" if p.pkg_mgr else "skip", p.pkg_mgr or "none")
+        VIEW.item(3, 3, "Toolchain probe", "ok" if have else "miss", ", ".join(have[:6]) or "none")
     print_platform_report(ctx.platform)
     if ctx.args.report == "json":
         LOG.info(json.dumps({
@@ -801,6 +831,8 @@ class Dep:
     hint: str            # what to install (shown to the user)
     install: Optional[Callable[["Context"], None]] = None   # filled in stage 2 execution
     optional: bool = False   # a failure warns instead of stopping the build
+    droppable: Optional["Droppable"] = None   # [deps-ui] a release archive the user can drop on us
+    needs_admin: bool = False                 # [deps-ui] the only one: VS Build Tools
 
 
 def _have(name: str) -> Callable[[PlatformInfo], bool]:
@@ -868,6 +900,106 @@ def _inst_mesa(ctx: "Context") -> None:
               f"{MESA_LAVAPIPE_VERSION}/mesa3d-{MESA_LAVAPIPE_VERSION}-release-msvc.7z", archive)
     run([seven, "x", archive, f"-o{mesa_dir}", "-y"])
     archive.unlink(missing_ok=True)
+
+
+# --- Windows: portable / droppable dependency installs ------------------------------------------
+# CMake, Ninja and Mesa ship PORTABLE archives, so a dependency that winget cannot deliver can be
+# installed by simply extracting the release the user downloads: no admin, no PATH/registry edit,
+# no winget. The archive is unpacked under build/tools (or build/mesa) and the tool is used by
+# absolute path for the rest of the run.
+@dataclass
+class Droppable:
+    url_page: str      # releases page to send the user to
+    filename: str      # the concrete file to grab there (shown to the user)
+    glob: str          # accepted dropped file names (fnmatch, lowercase)
+    dest: Path         # where to extract
+    artifact: str      # glob that must exist afterwards (the exe / dll)
+    run_installer: bool = False   # .exe/.msi that must be RUN (interactive) instead of extracted
+
+
+def _module_ok(module: str) -> bool:
+    """Honest check: import it in THIS interpreter. `pip show` lies -- a broken/partial dist-info
+    (or a Microsoft Store Python) passes it while `python -m <mod>` fails."""
+    try:
+        r = subprocess.run([sys.executable, "-c", f"import {module}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def _is_store_python() -> bool:
+    """True for the Microsoft Store Python (App Execution Alias under WindowsApps). Seen on a user
+    box: `pip show aqtinstall` was OK but `python -m aqt` -> 'No module named aqt'."""
+    exe = (sys.executable or "").lower()
+    return "windowsapps" in exe or "pythonsoftwarefoundation" in exe
+
+
+def _extract_archive(archive: Path, dest: Path) -> None:
+    import zipfile
+    name = archive.name.lower()
+    dest.mkdir(parents=True, exist_ok=True)
+    if name.endswith(".zip"):
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(dest)
+    elif name.endswith(".7z"):
+        seven = BUILD / "mesa" / "7zr.exe"
+        if not seven.exists():
+            _download(DEPS_7ZR_URL, seven)
+        run([seven, "x", archive, f"-o{dest}", "-y"])
+    elif name.endswith(".whl"):
+        run([sys.executable, "-m", "pip", "install", str(archive)])
+    else:
+        raise RuntimeError(f"unsupported archive type: {archive.name}")
+
+
+def _install_dropped(d: "Dep", archive: Path) -> None:
+    """Install a dependency from a user-dropped archive. Raises on anything unexpected; the caller
+    turns that into a message, never an abort."""
+    import fnmatch
+    spec = d.droppable
+    if spec is None:
+        raise RuntimeError(f"{d.name} has no drop-in archive; {d.hint}")
+    name = archive.name.lower()
+    if name.endswith((".exe", ".msi")):
+        # An official installer (Qt): run it interactively, then the caller re-checks the dep.
+        run([str(archive)] if name.endswith(".exe") else ["msiexec", "/i", str(archive)])
+        return
+    if not fnmatch.fnmatch(name, spec.glob.lower()):
+        warn(f"{archive.name} does not look like {spec.glob}; trying anyway")
+    _extract_archive(archive, spec.dest)
+    hits = list(spec.dest.glob(spec.artifact))
+    if not hits:
+        raise RuntimeError(f"{d.name}: '{spec.artifact}' not found after extracting {archive.name}")
+    hit = hits[0]
+    if hit.suffix.lower() == ".exe":
+        os.environ["PATH"] = str(hit.parent) + os.pathsep + os.environ.get("PATH", "")
+    LOG.info(f"  {d.name}: installed from {archive.name} -> {hit.parent}")
+
+
+def _ask_dep_action(name: str) -> str:
+    """The action bar for a failed dependency: retry / abort / dump log / continue."""
+    try:
+        raw = _ask(f"  [{name}] [R]etry  [A]bort  [D]ump log  [C]ontinue : ").strip().lower()
+    except EOFError:
+        return "c"
+    if raw in ("r", "retry"):
+        return "r"
+    if raw in ("a", "abort", "q", "quit"):
+        return "a"
+    if raw in ("d", "dump"):
+        return "d"
+    return "c"
+
+
+def _dump_log_tail(n: int = 20) -> None:
+    if not LOG.path or not Path(LOG.path).exists():
+        print("  (no log file)")
+        return
+    lines = Path(LOG.path).read_text(errors="replace").splitlines()
+    print(f"  ---- last {min(n, len(lines))} lines of {LOG.path} ----")
+    for ln in lines[-n:]:
+        print("  " + ln)
 
 
 _PACMAN_READY = False
@@ -944,7 +1076,7 @@ def _inst_xcode(ctx: "Context") -> None:
     run(["xcode-select", "--install"])
 
 
-def deps_for(info: PlatformInfo) -> list[Dep]:
+def _deps_for_platform(info: PlatformInfo) -> list[Dep]:
     """The dependency list for this platform. Checks are real (versions/kits), not just PATH probes."""
     if info.is_windows:
         cmv = _cmake_version()
@@ -958,31 +1090,44 @@ def deps_for(info: PlatformInfo) -> list[Dep]:
                 lambda i: i.tools.get("msvc") == "yes" or bool(i.tools.get("vswhere")),
                 f"winget install Microsoft.VisualStudio.2022.BuildTools --override \"{vs_components}\"",
                 lambda ctx: _inst_winget(ctx, "Microsoft.VisualStudio.2022.BuildTools",
-                                         override=vs_components)),
+                                         override=vs_components),
+                needs_admin=True),
             Dep(f"CMake >= {CMAKE_MIN[0]}.{CMAKE_MIN[1]}",
                 lambda i: bool(cmv and cmv >= CMAKE_MIN),
                 "winget install Kitware.CMake",
-                lambda ctx: _inst_winget(ctx, "Kitware.CMake")),
+                lambda ctx: _inst_winget(ctx, "Kitware.CMake"),
+                droppable=Droppable("https://github.com/Kitware/CMake/releases",
+                                    "cmake-<ver>-windows-x86_64.zip", "cmake-*windows*.zip",
+                                    BUILD / "tools" / "cmake", "**/bin/cmake.exe")),
             Dep("Ninja", _have("ninja"), "winget install Ninja-build.Ninja",
-                lambda ctx: _inst_winget(ctx, "Ninja-build.Ninja")),
+                lambda ctx: _inst_winget(ctx, "Ninja-build.Ninja"),
+                droppable=Droppable("https://github.com/ninja-build/ninja/releases",
+                                    "ninja-win.zip", "ninja-win*.zip",
+                                    BUILD / "tools" / "ninja", "**/ninja.exe")),
             Dep("Python 3", _have("python"), "winget install Python.Python.3.12",
                 lambda ctx: _inst_winget(ctx, "Python.Python.3.12")),
             Dep("aqtinstall (pip)",
-                lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "aqtinstall"])),
+                lambda i: _module_ok("aqt"),   # honest: `pip show` passes on a broken/Store Python
                 "python -m pip install aqtinstall",
                 lambda ctx: _inst_pip(ctx, "aqtinstall")),
             Dep("pefile (pip)",
-                lambda i: bool(run_capture([sys.executable, "-m", "pip", "show", "pefile"])),
+                lambda i: _module_ok("pefile"),
                 "python -m pip install pefile",
                 lambda ctx: _inst_pip(ctx, "pefile")),
             Dep(f"Qt {QT_VERSION} ({QT_KIT_WINDOWS})",
                 lambda i: bool(i.qt_prefix) or _qt_prefix() is not None,
                 f"aqt install-qt windows desktop {QT_VERSION} {QT_KIT_WINDOWS} --outputdir build/qt",
-                _inst_aqt),
+                _inst_aqt,
+                droppable=Droppable("https://www.qt.io/download-qt-installer",
+                                    "qt-unified-windows-x64-*-online.exe", "qt-unified-windows*.exe",
+                                    BUILD / "qt", "**/bin/qmake.exe")),
             Dep("Mesa lavapipe (Vulkan fallback)",
                 lambda i: bool(i.lavapipe_dir) or _mesa_dir_present(ROOT / "build" / "mesa" / "x64"),
                 f"download mesa-dist-win {MESA_LAVAPIPE_VERSION} and extract to build/mesa",
-                _inst_mesa),
+                _inst_mesa,
+                droppable=Droppable("https://github.com/pal1000/mesa-dist-win/releases",
+                                    f"mesa3d-{MESA_LAVAPIPE_VERSION}-release-msvc.7z", "mesa3d-*.7z",
+                                    BUILD / "mesa", "**/vulkan_lvp.dll")),
         ]
     if info.is_macos:
         return [
@@ -1025,56 +1170,164 @@ def deps_for(info: PlatformInfo) -> list[Dep]:
                         pkg_hint("extras"), lambda ctx: _inst_pkg(ctx, "extras"), optional=True))
     return deps
 
+
+def deps_for(info: PlatformInfo) -> list[Dep]:
+    """The platform dependencies."""
+    return _deps_for_platform(info)
+
+def _is_admin() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:   # noqa: BLE001  (not Windows / no shell32)
+        return True
+
+
+def _dep_manual(d: "Dep") -> None:
+    """Print where to get the dependency and where to put it (the last rung)."""
+    LOG.info(f"    use: {d.hint}")
+    if d.droppable is not None:
+        LOG.info(f"    or download : {d.droppable.url_page}   ({d.droppable.filename})")
+        LOG.info(f"       and drop : drag the file here, or copy it into {BUILD / 'deps-inbox'}")
+
+
+def _try_drop(ctx: "Context", d: "Dep") -> bool:
+    """The drop-in rung: take a release archive the user dropped (a dragged path, or the inbox)."""
+    spec = d.droppable
+    if spec is None:
+        return False
+    inbox = BUILD / "deps-inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    cands = sorted(x for x in inbox.iterdir() if x.is_file())
+    if not ctx.interactive:
+        # Non-interactive / CI: accept anything dropped into the inbox, with no prompt.
+        if not cands:
+            return False
+        p = cands[0]
+    else:
+        LOG.info(f"    download : {spec.url_page}   ({spec.filename})")
+        LOG.info(f"    drop it  : drag the file here, or copy it into {inbox}")
+        p = ask_path(ctx, "    file (Enter to skip):", "file")
+        if p is None:
+            p = cands[0] if cands else None
+        if p is None:
+            return False
+    try:
+        _install_dropped(d, p)
+    except Exception as e:   # noqa: BLE001
+        warn(f"could not install {d.name} from {p.name}: {e}")
+        return False
+    try:   # remember it so a re-run does not ask again
+        (BUILD / "deps-cache").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, BUILD / "deps-cache" / p.name)
+    except Exception:   # noqa: BLE001
+        pass
+    return bool(d.check(ctx.platform))
+
+
 def stage_deps(ctx: "Context") -> None:
-    """Report the platform dependencies, then (interactively) install what is missing."""
+    """Report the platform dependencies, then resolve what is missing -- NEVER aborting on a single
+    failure.
+
+    Windows rung per dependency: honest check -> auto (winget/aqt) -> a dropped release archive
+    (portable, no admin) -> manual instructions. A failure is accumulated and reported in the final
+    RESULT; only the user's explicit Abort stops the run.
+    """
     step("stage 2: dependencies")
+    if VIEW is not None:
+        VIEW.stage(2, 4, "dependencies" + (" (Windows)" if ctx.platform.is_windows else ""))
     deps = deps_for(ctx.platform)
     missing = [d for d in deps if not d.check(ctx.platform)]
-    for d in deps:
-        LOG.info(f"  {'OK ' if d not in missing else '-- '}{d.name}")
+    resolved, failed = [], []
+    for idx, d in enumerate(deps, 1):
+        done = d not in missing
+        if done:
+            resolved.append(d.name)
+        if VIEW is not None:
+            VIEW.item(idx, len(deps), d.name, "ok" if done else "miss")
+        else:
+            LOG.info(f"  {'OK ' if done else '-- '}{d.name}")
+    ctx.deps_resolved, ctx.deps_failed = resolved, failed
     if not missing:
         LOG.info("All dependencies present.")
+        if VIEW is not None:
+            VIEW.summary_row("resolved", f"{len(resolved)}/{len(deps)}")
         return
-    LOG.info(f"\n{len(missing)} dependency(ies) missing:")
-    for d in missing:
-        LOG.info(f"  - {d.name}\n      install: {d.hint}")
-    if ctx.args.dry_run or ctx.args.no_deps:
-        LOG.info("(not installing: --dry-run/--no-deps)")
-        return
-    # Non-interactive means "never guess": without -y/--install-deps, stop and print the exact commands
-    # instead of silently mutating the machine (a container/WSL run once apt-installed Qt on its own).
-    if not ctx.interactive and not ctx.args.yes and not ctx.args.install_deps:
-        die("missing dependencies and no interactive prompt available.\n"
-            "  install them and re-run, or pass -y / --install-deps:\n"
-            + "\n".join(f"    {d.name}: {d.hint}" for d in missing), 2)
-    for d in missing:
-        if d.install is None:
-            die(f"cannot install automatically: {d.name}\n  install manually: {d.hint}", 2)
-        if not ask_yes_no(ctx, f"Install {d.name} now?", default=True):
-            if d.optional:
-                warn(f"skipping optional dependency: {d.name}")
-                continue
-            die(f"missing dependency: {d.name}\n  install manually: {d.hint}", 2)
-        try:
-            d.install(ctx)
-        except Exception as e:   # noqa: BLE001
-            if d.optional:
-                warn(f"could not install optional {d.name}: {e}\n  install manually: {d.hint}")
-                continue
-            die(f"failed to install {d.name}: {e}\n  install manually: {d.hint}", 2)
-        if not d.check(ctx.platform):
-            # winget/brew installs land outside this process' PATH; the tool is usually fine from a new
-            # shell, so warn with the exact command instead of pretending it worked.
-            if d.optional:
-                warn(f"optional {d.name} not visible in this shell; continuing without it")
-            else:
-                warn(f"{d.name} is still not visible in this shell; open a new one if the build cannot find it."
-                     f"\n  expected: {d.hint}")
-        else:
-            LOG.info(f"  installed: {d.name}")
 
-    # detect_platform() cached qt_prefix before deps ran; aqt may have just fetched Qt into
-    # build/qt, so refresh it for the rest of this run (launcher config / Windows bundle).
+    if ctx.args.dry_run or ctx.args.no_deps or ctx.args.check:
+        LOG.info(f"{len(missing)} dependency(ies) missing (not installing):")
+        for d in missing:
+            LOG.info(f"  - {d.name}\n      {d.hint}")
+        if VIEW is not None:
+            for i, d in enumerate(missing, 1):
+                VIEW.item(i, len(missing), d.name, "skip" if d.optional else "miss")
+                if not d.optional:
+                    VIEW.failed(d.name,
+                                d.droppable.url_page if d.droppable else "",
+                                d.droppable.filename if d.droppable else "",
+                                f"drag the file here, or copy it into {BUILD / 'deps-inbox'}")
+        return
+
+    if _is_store_python():
+        warn("this is the Microsoft Store Python: `pip show` can say a module is installed while "
+             "`python -m <mod>` cannot import it. If that happens, install Python from python.org "
+             "(or `winget install Python.Python.3.12`).")
+
+    total = len(missing)
+    for n, d in enumerate(missing, 1):
+        if VIEW is not None:
+            VIEW.item(n, total, d.name, "running")
+            VIEW.summary_row("resolved", str(len(resolved)))
+            VIEW.summary_row("failed", str(len(failed)))
+        if d.needs_admin and not _is_admin():
+            warn(f"{d.name} needs administrator rights; run the terminal as administrator for it.")
+        if not ctx.interactive and not ctx.args.yes and not ctx.args.install_deps:
+            failed.append(d)
+            if VIEW is not None:
+                VIEW.item(n, total, d.name, "fail")
+            LOG.info(f"  cannot install {d.name} non-interactively; {d.hint}")
+            continue
+        while True:
+            if not ask_yes_no(ctx, f"Install {d.name} now?", default=True):
+                break
+            ok = False
+            if d.install is not None:
+                try:
+                    d.install(ctx)
+                    ok = d.check(ctx.platform)
+                except Exception as e:   # noqa: BLE001
+                    warn(f"automatic install of {d.name} failed: {e}")
+            if not ok:
+                ok = _try_drop(ctx, d)
+            if ok:
+                resolved.append(d.name)
+                if VIEW is not None:
+                    VIEW.item(n, total, d.name, "ok")
+                LOG.info(f"  installed: {d.name}")
+                break
+            _dep_manual(d)
+            if VIEW is not None:
+                VIEW.failed(d.name,
+                            d.droppable.url_page if d.droppable else "",
+                            d.droppable.filename if d.droppable else "",
+                            f"drag the file here, or copy it into {BUILD / 'deps-inbox'}")
+            # [deps-ui] -y / non-interactive means "never ask": keep going and report in the RESULT
+            # (aborting would contradict the whole point of not stopping on a single dependency).
+            action = "c" if (not ctx.interactive or ctx.args.yes) else _ask_dep_action(d.name)
+            if action == "r":
+                continue
+            if action == "d":
+                _dump_log_tail()
+                continue
+            if action == "a":
+                die(f"aborted at dependency: {d.name}\n  {d.hint}", 2, stage="2 deps")
+            failed.append(d)
+            if VIEW is not None:
+                VIEW.item(n, total, d.name, "fail")
+            break
+
+    # detect_platform() cached qt_prefix before deps ran; aqt or a dropped Qt installer may have made
+    # Qt available since, so refresh it for the rest of this run (launcher config / Windows bundle).
     ctx.platform.qt_prefix = _qt_prefix() or ctx.platform.qt_prefix
     if ctx.platform.qt_prefix:
         ctx.platform.tools["qt"] = str(ctx.platform.qt_prefix)
@@ -1157,12 +1410,102 @@ def ensure_msvc_env(ctx: "Context") -> None:
                  "(install the 'C++ Clang Compiler for Windows' component)")
 
 
+_CACHE_TOOL_KEYS = ("CMAKE_MAKE_PROGRAM", "CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_LINKER",
+                    "CMAKE_AR", "CMAKE_RANLIB", "CMAKE_NM", "CMAKE_OBJDUMP", "CMAKE_OBJCOPY",
+                    "CMAKE_STRIP", "CMAKE_RC_COMPILER")
+
+
+def _cache_tool_paths(build_dir: Path) -> list:
+    """Cached TOOL paths (key, value) that no longer exist on disk.
+
+    CMake bakes absolute tool paths into the cache. When a dependency moves -- a dropped portable
+    toolchain replacing a winget one, a compiler update -- `cmake --build` dies with an opaque "no
+    such file or directory" (the build tool) or MSB8020 (the toolset). The cache has to be treated
+    as stale so the configure re-detects everything.
+    """
+    out = []
+    try:
+        text = (build_dir / "CMakeCache.txt").read_text(errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        for k in _CACHE_TOOL_KEYS:
+            if line.startswith(k + ":"):
+                v = line.split("=", 1)[1].strip()
+                if v and (Path(v).is_absolute() or os.sep in v) and not Path(v).exists():
+                    out.append((k, v))
+                break
+    return out
+
+
+def _cached_make_program(build_dir: Path) -> Optional[str]:
+    """The build tool recorded in the CMake cache (CMAKE_MAKE_PROGRAM), or None."""
+    try:
+        for line in (build_dir / "CMakeCache.txt").read_text(errors="replace").splitlines():
+            if line.startswith("CMAKE_MAKE_PROGRAM:"):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def _cached_generator(build_dir: Path) -> str:
+    """The generator recorded in the CMake cache (CMAKE_GENERATOR), or ""."""
+    try:
+        for line in (build_dir / "CMakeCache.txt").read_text(errors="replace").splitlines():
+            if line.startswith("CMAKE_GENERATOR:"):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _wipe_cache(build_dir: Path) -> None:
+    """Drop the CMake cache. CMakeFiles goes too: CMake refuses to switch generator otherwise."""
+    (build_dir / "CMakeCache.txt").unlink(missing_ok=True)
+    shutil.rmtree(build_dir / "CMakeFiles", ignore_errors=True)
+
+
+def _prepare_configure(info: PlatformInfo, build_dir: Path) -> list:
+    """Deal with a cache whose recorded tools or generator no longer match reality.
+
+    A dependency that moved (a dropped portable toolchain replacing a winget one, a compiler
+    update) leaves CMake caching an absolute tool path that no longer exists: the build then dies
+    with an opaque "no such file or directory" (build tool) or MSB8020/toolset error. Returns extra
+    CMake flags to append (a repointed CMAKE_MAKE_PROGRAM) or [].
+    """
+    stale = _cache_tool_paths(build_dir)
+    if stale:
+        only_make = all(k == "CMAKE_MAKE_PROGRAM" for k, _ in stale)
+        newmk = shutil.which("ninja") or shutil.which("make")
+        if only_make and newmk:
+            # Just the build tool moved: keep the cache (same generator/compilers) and repoint it.
+            print(f"== stale build cache: the build tool is gone ({stale[0][1]})")
+            print(f"== repointing the build at {newmk}")
+            return [f"-DCMAKE_MAKE_PROGRAM={newmk}"]
+        for k, v in stale:
+            print(f"== stale build cache: {k} is gone ({v})")
+        print("== discarding the cache and configuring from scratch")
+        _wipe_cache(build_dir)
+    if info.is_windows:
+        cached = _cached_generator(build_dir)
+        # What we would pick for a fresh tree, computed against a path with no cache.
+        fresh = info.windows_generator_flags(build_dir.parent / "__no_cache__")
+        if cached and ("-G" in fresh) and "Visual Studio" in cached:
+            print(f"== stale build cache: generator is '{cached}' but Ninja is available")
+            print("== discarding the cache and configuring from scratch")
+            _wipe_cache(build_dir)
+    return []
+
+
 def configured(build_dir: Path, info: PlatformInfo) -> bool:
     """True when the build dir holds a COMPLETED configure. CMakeCache.txt alone is not enough:
     a half-failed configure leaves the cache behind and `cmake --build` then dies."""
     if not (build_dir / "CMakeCache.txt").exists():
         return False
     cache_text = (build_dir / "CMakeCache.txt").read_text(errors="replace")
+    if _cache_tool_paths(build_dir):
+        return False   # a cached tool path vanished; the configure has to run again
     if info.is_macos and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
         desired = os.environ["MACOSX_DEPLOYMENT_TARGET"]
         if not any(line.startswith("CMAKE_OSX_DEPLOYMENT_TARGET:") and line.endswith("=" + desired)
@@ -1194,7 +1537,8 @@ def configured(build_dir: Path, info: PlatformInfo) -> bool:
 
 
 def cmake_configure(info: PlatformInfo, build_dir: Path) -> None:
-    run(["cmake", "-S", ROOT, "-B", build_dir] + info.configure_extra(build_dir))
+    extra = _prepare_configure(info, build_dir)
+    run(["cmake", "-S", ROOT, "-B", build_dir] + info.configure_extra(build_dir) + extra)
 
 
 def cmake_build(info: PlatformInfo, build_dir: Path, target: str, jobs: str) -> None:
@@ -1258,11 +1602,17 @@ def gen_vu1(ctx: "Context") -> None:
 
 
 def fetch_submodules() -> None:
-    """The paraLLEl-GS backend lives in a git submodule; CMake builds it only when present."""
+    """The paraLLEl-GS backend lives in a git submodule; CMake builds it only when present.
+
+    On Windows the recursive checkout runs past MAX_PATH (glslang's
+    reference/shaders-msl/** names are very long) and git aborts those files with "Filename too
+    long"; -c core.longpaths=true avoids it (and needs long paths enabled on the machine).
+    """
     if os.environ.get("PS2X_SETUP_NO_SUBMODULES") or not (ROOT / ".gitmodules").exists() or not shutil.which("git"):
         return
     try:
-        run(["git", "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+        run(["git", "-c", "core.longpaths=true", "-C", ROOT,
+             "submodule", "update", "--init", "--recursive"])
     except Exception as e:   # noqa: BLE001
         print(f"== submodule fetch failed ({e}); building without the paraLLEl-GS backend")
 
@@ -1330,23 +1680,44 @@ def build_runner(ctx: "Context", jobs: str) -> Path:
 
 def stage_build(ctx: "Context") -> None:
     step("stage 3: build")
+    if VIEW is not None:
+        VIEW.stage(3, 4, "build")
+
+    def item(n: int, name: str, status: str = "running") -> None:
+        if VIEW is not None:
+            VIEW.item(n, 7, name, status)
+
     ensure_msvc_env(ctx)
     if ctx.args.skip_setup:
         if not (WORK / "SLUS_216.78").is_file():
             die("--skip-setup requires an existing games/bt3/work/ (no SLUS_216.78 found)")
-    if not ctx.args.skip_setup:
+        item(1, "Extract game data", "skip")
+        item(2, "Verify ELF", "skip")
+    else:
+        item(1, "Extract game data")
         extract_inputs(ctx)
+        item(2, "Verify ELF")
         verify_elf(ctx)
+    item(3, "Generate VU1")
     gen_vu1(ctx)
-    if not ctx.args.skip_setup:
+    if ctx.args.skip_setup:
+        item(4, "Fetch submodules", "skip")
+        item(5, "Build recompiler", "skip")
+        item(6, "Generate runner", "skip")
+    else:
+        item(4, "Fetch submodules")
         fetch_submodules()
+        item(5, "Build recompiler")
         recomp = build_recompiler(ctx)
+        item(6, "Generate runner")
         generate_runner(ctx, recomp)
     if ctx.args.gen_only:
         LOG.info("--gen-only: runner + overlay sources generated (skipping runner build)")
         ctx.runner = None
         return
+    item(7, "Build runner")
     ctx.runner = build_runner(ctx, ctx.jobs)
+    item(7, "Build runner", "ok")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1404,6 +1775,7 @@ def build_launcher(ctx: "Context") -> Optional[Path]:
     step("building the Qt launcher")
     src = ROOT / "ps2xRuntime" / "src" / "launcher"
     bdir = BUILD / ("launcher_qt" if ctx.platform.is_windows else "launcher")
+    prepare = _prepare_configure(ctx.platform, bdir)   # stale cache: a moved tool or generator
     extra = ["-DCMAKE_BUILD_TYPE=Release"]
     if ctx.platform.qt_prefix:
         extra.append("-DCMAKE_PREFIX_PATH=" + str(ctx.platform.qt_prefix))
@@ -1416,7 +1788,7 @@ def build_launcher(ctx: "Context") -> Optional[Path]:
             extra += ["-G", "Ninja"]
         if ctx.platform.is_macos and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
             extra.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=" + os.environ["MACOSX_DEPLOYMENT_TARGET"])
-    run(["cmake", "-S", src, "-B", bdir] + extra)
+    run(["cmake", "-S", src, "-B", bdir] + extra + prepare)
     cmake_build(ctx.platform, bdir, "Launcher", ctx.jobs)
     exe = bdir / ctx.platform.exe("Launcher")
     if not exe.exists():
@@ -1690,14 +2062,16 @@ def package_artifact(ctx: "Context", out_root: Path, stage: Path) -> None:
     copytree_overlay(stage, tree)
 
     if ctx.platform.is_windows:
-        archive = out_root / "BT3-Recomp-x86_64.zip"
+        archive = out_root / "BT3-Recomp-win-x86_64.zip"
         step(f"packaging {archive.name}")
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
             for p in sorted(tree.rglob("*")):
                 if p.is_file():
                     z.write(p, p.relative_to(out_root).as_posix())
     else:
-        archive = out_root / "BT3-Recomp-x86_64.tar.gz"
+        # The artifact name carries the OS it was built for (win / linux / macos).
+        tag = "macos" if ctx.platform.is_macos else "linux"
+        archive = out_root / f"BT3-Recomp-{tag}-x86_64.tar.gz"
         step(f"packaging {archive.name}")
         with tarfile.open(archive, "w:gz") as t:
             t.add(tree, arcname=tree_name)
@@ -1752,6 +2126,8 @@ def _copy_log_next_to_artifact(ctx: "Context") -> None:
 
 def stage_package(ctx: "Context") -> None:
     step("stage 4: deploy/package")
+    if VIEW is not None:
+        VIEW.stage(4, 4, "package")
     # detect_platform() cached qt_prefix before deps ran; a stage 2 (or an external aqt/brew install)
     # may have made Qt available since, so re-detect before the launcher/bundle steps use it.
     ctx.platform.qt_prefix = _qt_prefix() or ctx.platform.qt_prefix
@@ -1768,7 +2144,14 @@ def stage_package(ctx: "Context") -> None:
     if stage.exists():
         shutil.rmtree(stage)
     stage.mkdir(parents=True, exist_ok=True)
+
+    def item(n: int, name: str, status: str = "running") -> None:
+        if VIEW is not None:
+            VIEW.item(n, 6, name, status)
+
+    item(1, "Assemble deploy tree")
     deploy_tree(ctx.runner, stage)
+    item(2, "Seed savedata")
     seed_savedata(ctx, stage)
     if ctx.args.deploy:
         deploy_tree(ctx.runner, Path(ctx.args.deploy).resolve())
@@ -1782,16 +2165,20 @@ def stage_package(ctx: "Context") -> None:
         LOG.info(f"App bundle ready: {app}")
         return
 
+    item(3, "Build launcher (Qt)")
     launcher = build_launcher(ctx)
+    item(4, "Bundle runtime")
     if ctx.platform.is_windows:
         bundle_windows(ctx, stage, ctx.runner, launcher)
     else:
         bundle_linux(ctx, stage, ctx.runner, launcher)
 
     if not ctx.args.no_gate:
+        item(5, "Dependency gate")
         run_gate(ctx, stage)
 
     if ctx.args.package:
+        item(6, "Package artifact")
         package_artifact(ctx, out_root, stage)
 # ------------------------------------------------------------------------------------------------
 # CLI + stage runner
@@ -1859,6 +2246,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="0 silent, 1 errors, 2 errors+warnings, 3 info (default), 4 verbose")
     ap.add_argument("-q", "--quiet", action="store_true", help="console: errors only (= --log-level 1)")
     ap.add_argument("-v", "--verbose", action="store_true", help="console: every command (= level 4)")
+    ap.add_argument("--plain", action="store_true",
+                    help="no full-screen UI: print the steps as plain lines (automatic when stdout is "
+                         "not a terminal, e.g. redirected to a log)")
+    ap.add_argument("--no-color", dest="no_color", action="store_true", help="disable ANSI colors")
+    ap.add_argument("--check", action="store_true",
+                    help="report the dependencies and exit; never installs or mutates anything")
     args = ap.parse_args(argv)
     if args.skip_setup and args.gen_only:
         die("--skip-setup and --gen-only are mutually exclusive")
@@ -1906,6 +2299,57 @@ def resolve_source(ctx: "Context") -> None:
         die(f"{ctx.src} does not exist")
 
 
+WELCOME_TITLE = "BT3-Recomp   -   DEVELOPER SETUP"
+WELCOME = [
+    "This builds the emulator FROM SOURCE. It is NOT the end-user installer.",
+    "",
+    "  * Just want to PLAY? Download a release build instead of running this.",
+    "  * This flow needs an ISO/dump of Budokai Tenkaichi 3 (USA), several GB",
+    "    of disk, and it installs a C++ toolchain + Qt on this machine.",
+    "  * It builds the runner and the launcher, packages a release artifact",
+    "    and then asks where to put it.",
+]
+
+
+def stage_welcome(ctx: "Context") -> None:
+    """Pre-stage: make it unmistakable that this is the developer build flow, not the player one."""
+    try:
+        from setup_ui import splash_box   # boxed panel, same look as the TUI frame
+        splash_box(WELCOME_TITLE, WELCOME)
+    except Exception:   # noqa: BLE001
+        for ln in WELCOME:
+            print(ln)
+    if ctx.interactive and not ctx.args.yes and not ctx.args.dry_run and not ctx.args.check:
+        try:
+            _ask("  Press Enter to continue (Ctrl-C to cancel): ")
+        except EOFError:
+            pass
+
+
+def _finish(ctx: "Context", mode: str) -> None:
+    """Print the final RESULT block (plain lines -- they stay in the scrollback) and leave the TUI."""
+    if VIEW is None:
+        return
+    lines = ["", "=" * 70, "  RESULT"]
+    res = getattr(ctx, "deps_resolved", [])
+    fail = getattr(ctx, "deps_failed", [])
+    if res:
+        lines.append("    OK      " + ", ".join(res))
+    for d in fail:
+        lines.append(f"    FAIL    {d.name}")
+        if getattr(d, "droppable", None) is not None:
+            lines.append(f"            {d.droppable.url_page}   ({d.droppable.filename})")
+            lines.append(f"            drop it: drag the file here, or copy it into "
+                         f"{BUILD / 'deps-inbox'}")
+    if fail:
+        lines.append("")
+        lines.append("    Fix the item(s) above and re-run setup.")
+    if LOG.path:
+        lines.append(f"  Full log : {LOG.path}")
+    lines.append("=" * 70)
+    VIEW.finish(lines)
+
+
 def main(argv=None) -> None:
     global LOG
     args = parse_args(argv)
@@ -1926,6 +2370,26 @@ def main(argv=None) -> None:
     interactive = info.interactive and not args.non_interactive
     ctx = Context(args=args, platform=info, interactive=interactive, jobs=str(args.jobs))
 
+    global VIEW
+    if args.check:
+        args.no_deps = True
+
+    # The welcome runs BEFORE the TUI owns the screen: a plain message + Enter is far more reliable
+    # than a splash inside a frame we are about to clear.
+    if level >= 3:
+        stage_welcome(ctx)
+
+    # [ui] Console view: full-screen TUI on a terminal, plain lines otherwise (auto). --plain /
+    # --no-color force the fallbacks; a missing setup_ui module leaves VIEW None (old behaviour).
+    if View is not None and level >= 3:
+        VIEW = View(log=LOG, caps=Caps(force_plain=args.plain,
+                                       color=(False if args.no_color else None)), level=level)
+        VIEW.start()   # own the screen BEFORE the first header/summary draw
+        VIEW.header("BT3-Recomp", "build setup")
+        VIEW.summary_row("source", str(ROOT))
+        if LOG.path:
+            VIEW.summary_row("log", Path(LOG.path).name)
+
     # Hardware auto-tune: pick the largest safe -j and optional build accelerators. An explicit
     # numeric --jobs or --no-autotune wins; a failed RAM probe keeps DEFAULT_JOBS (conservative).
     raw_jobs = str(args.jobs).strip()
@@ -1944,6 +2408,10 @@ def main(argv=None) -> None:
             ctx.jobs = str(jobs)
             info.unity_batch = batch
             info.use_ccache = use_ccache
+            if VIEW is not None:
+                VIEW.summary_row("core", f"{hw.physical_cores}")
+                VIEW.summary_row("RAM", ram)
+                VIEW.summary_row("jobs", f"-j{ctx.jobs}")
 
     # --dry-run implies --no-deps and stops before stage 3.
     if args.dry_run:
@@ -1959,6 +2427,12 @@ def main(argv=None) -> None:
         if "2" in stages:
             ctx.stage_name = "2 deps"
             stage_deps(ctx)
+
+        if args.check:
+            _finish(ctx, "check")
+            LOG.banner("[setup] check done" + (f" | log: {LOG.path}" if LOG.path else ""))
+            LOG.close()
+            return
 
         if args.dry_run:
             if "3" in stages:
@@ -1989,8 +2463,15 @@ def main(argv=None) -> None:
         die(str(e), 2, stage=ctx.stage_name)
     except KeyboardInterrupt:
         die("interrupted by the user", 130, stage=ctx.stage_name)
+    finally:
+        if VIEW is not None:
+            try:
+                VIEW.close()   # never leave the terminal with a hidden cursor / colors on
+            except Exception:   # noqa: BLE001
+                pass
 
     LOG.banner("[setup] done" + (f" | log: {LOG.path}" if LOG.path else ""))
+    _finish(ctx, "done")
     LOG.close()
     _copy_log_next_to_artifact(ctx)
 

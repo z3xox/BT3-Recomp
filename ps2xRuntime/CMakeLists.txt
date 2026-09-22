@@ -795,6 +795,21 @@ if (NOT EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS
     endif()
 endif()
 
+# [pgs complete] A half-initialised checkout -- the top-level parallel-gs and Granite dirs exist but
+# Granite's own nested third_party submodules did not initialise (the recursive fetch failed, e.g.
+# rapidjson/thirdparty/gtest was unreachable) -- still satisfies the guard below and then HARD-FAILS
+# configure inside Granite's CMakeLists with "Cannot find source file: volk/volk.c". Treat an
+# incomplete checkout as absent: warn, skip the backend, and leave the fix in the message.
+if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
+    if (NOT EXISTS "${PS2X_PGS_DIR}/Granite/third_party/volk/volk.c")
+        message(WARNING "[pgs] paraLLEl-GS checkout is INCOMPLETE (Granite/third_party is empty, the "
+                        "nested submodules did not initialise) -- building without the Vulkan backend.\n"
+                        "    Fix: git -C \"${CMAKE_SOURCE_DIR}\" submodule update --init --recursive")
+        set(PS2X_DISABLE_PGS ON)
+        set(PS2X_PGS_SKIP_REASON "incomplete checkout (Granite/third_party empty)")
+    endif()
+endif()
+
 if (EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND NOT PS2X_DISABLE_PGS)
     # [pgs patches] Two upstream fixes that live in the paraLLEl-GS / Granite submodules. Both
     # point at repos we cannot commit to (Granite is upstream Themaister/Granite), so they are

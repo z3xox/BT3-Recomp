@@ -21,9 +21,13 @@
 | **Storage** | ~6 GB | ~8 GB (with texture pack) |
 | **Target** | **30 fps @ 1x** | **60 fps @ 2x–3x** |
 
-**Minimum notes:** 4 cores **with** SMT/threads (2c/4t performs badly: contention between the
-guest / GS / VU1-pipe / kick / audio / decode-pool threads). At 1x the bottleneck is the **CPU**
-(emulation), not the GPU.
+**Minimum notes:** 4 cores **with** SMT/threads, i.e. **4c/8t or better** is the practical minimum.
+At 1x the bottleneck is the **CPU** (emulation), not the GPU.
+
+> **FLOOR (NOT recommended) — 2 cores / 4 threads** (e.g. Ryzen 3 3250U / Vega 3): it does run, but
+> only at about **15-18 fps** with visible stutter, so it is the hard floor rather than a supported
+> minimum. See `docs/LOWCORE-2C-TESTS.md` for the measurements and why the low-core ("2-core mode")
+> configuration was **discarded**.
 
 **Recommended notes:** the dedicated GPU allows a higher `render_scale`; 16 GB for the texture pack.
 

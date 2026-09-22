@@ -1192,20 +1192,26 @@ def _dep_manual(d: "Dep") -> None:
 
 
 def _try_drop(ctx: "Context", d: "Dep") -> bool:
-    """The drop-in rung: print the link + filename, take a dragged path (or anything in the inbox)."""
+    """The drop-in rung: take a release archive the user dropped (a dragged path, or the inbox)."""
     spec = d.droppable
-    if spec is None or not ctx.interactive:
+    if spec is None:
         return False
     inbox = BUILD / "deps-inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    LOG.info(f"    download : {spec.url_page}   ({spec.filename})")
-    LOG.info(f"    drop it  : drag the file here, or copy it into {inbox}")
-    p = ask_path(ctx, "    file (Enter to skip):", "file")
-    if p is None:
-        cands = sorted(x for x in inbox.iterdir() if x.is_file())
-        p = cands[0] if cands else None
-    if p is None:
-        return False
+    cands = sorted(x for x in inbox.iterdir() if x.is_file())
+    if not ctx.interactive:
+        # Non-interactive / CI: accept anything dropped into the inbox, with no prompt.
+        if not cands:
+            return False
+        p = cands[0]
+    else:
+        LOG.info(f"    download : {spec.url_page}   ({spec.filename})")
+        LOG.info(f"    drop it  : drag the file here, or copy it into {inbox}")
+        p = ask_path(ctx, "    file (Enter to skip):", "file")
+        if p is None:
+            p = cands[0] if cands else None
+        if p is None:
+            return False
     try:
         _install_dropped(d, p)
     except Exception as e:   # noqa: BLE001
@@ -1305,7 +1311,9 @@ def stage_deps(ctx: "Context") -> None:
                             d.droppable.url_page if d.droppable else "",
                             d.droppable.filename if d.droppable else "",
                             f"drag the file here, or copy it into {BUILD / 'deps-inbox'}")
-            action = "a" if (not ctx.interactive or ctx.args.yes) else _ask_dep_action(d.name)
+            # [deps-ui] -y / non-interactive means "never ask": keep going and report in the RESULT
+            # (aborting would contradict the whole point of not stopping on a single dependency).
+            action = "c" if (not ctx.interactive or ctx.args.yes) else _ask_dep_action(d.name)
             if action == "r":
                 continue
             if action == "d":
@@ -1402,12 +1410,102 @@ def ensure_msvc_env(ctx: "Context") -> None:
                  "(install the 'C++ Clang Compiler for Windows' component)")
 
 
+_CACHE_TOOL_KEYS = ("CMAKE_MAKE_PROGRAM", "CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER", "CMAKE_LINKER",
+                    "CMAKE_AR", "CMAKE_RANLIB", "CMAKE_NM", "CMAKE_OBJDUMP", "CMAKE_OBJCOPY",
+                    "CMAKE_STRIP", "CMAKE_RC_COMPILER")
+
+
+def _cache_tool_paths(build_dir: Path) -> list:
+    """Cached TOOL paths (key, value) that no longer exist on disk.
+
+    CMake bakes absolute tool paths into the cache. When a dependency moves -- a dropped portable
+    toolchain replacing a winget one, a compiler update -- `cmake --build` dies with an opaque "no
+    such file or directory" (the build tool) or MSB8020 (the toolset). The cache has to be treated
+    as stale so the configure re-detects everything.
+    """
+    out = []
+    try:
+        text = (build_dir / "CMakeCache.txt").read_text(errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        for k in _CACHE_TOOL_KEYS:
+            if line.startswith(k + ":"):
+                v = line.split("=", 1)[1].strip()
+                if v and (Path(v).is_absolute() or os.sep in v) and not Path(v).exists():
+                    out.append((k, v))
+                break
+    return out
+
+
+def _cached_make_program(build_dir: Path) -> Optional[str]:
+    """The build tool recorded in the CMake cache (CMAKE_MAKE_PROGRAM), or None."""
+    try:
+        for line in (build_dir / "CMakeCache.txt").read_text(errors="replace").splitlines():
+            if line.startswith("CMAKE_MAKE_PROGRAM:"):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def _cached_generator(build_dir: Path) -> str:
+    """The generator recorded in the CMake cache (CMAKE_GENERATOR), or ""."""
+    try:
+        for line in (build_dir / "CMakeCache.txt").read_text(errors="replace").splitlines():
+            if line.startswith("CMAKE_GENERATOR:"):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _wipe_cache(build_dir: Path) -> None:
+    """Drop the CMake cache. CMakeFiles goes too: CMake refuses to switch generator otherwise."""
+    (build_dir / "CMakeCache.txt").unlink(missing_ok=True)
+    shutil.rmtree(build_dir / "CMakeFiles", ignore_errors=True)
+
+
+def _prepare_configure(info: PlatformInfo, build_dir: Path) -> list:
+    """Deal with a cache whose recorded tools or generator no longer match reality.
+
+    A dependency that moved (a dropped portable toolchain replacing a winget one, a compiler
+    update) leaves CMake caching an absolute tool path that no longer exists: the build then dies
+    with an opaque "no such file or directory" (build tool) or MSB8020/toolset error. Returns extra
+    CMake flags to append (a repointed CMAKE_MAKE_PROGRAM) or [].
+    """
+    stale = _cache_tool_paths(build_dir)
+    if stale:
+        only_make = all(k == "CMAKE_MAKE_PROGRAM" for k, _ in stale)
+        newmk = shutil.which("ninja") or shutil.which("make")
+        if only_make and newmk:
+            # Just the build tool moved: keep the cache (same generator/compilers) and repoint it.
+            print(f"== stale build cache: the build tool is gone ({stale[0][1]})")
+            print(f"== repointing the build at {newmk}")
+            return [f"-DCMAKE_MAKE_PROGRAM={newmk}"]
+        for k, v in stale:
+            print(f"== stale build cache: {k} is gone ({v})")
+        print("== discarding the cache and configuring from scratch")
+        _wipe_cache(build_dir)
+    if info.is_windows:
+        cached = _cached_generator(build_dir)
+        # What we would pick for a fresh tree, computed against a path with no cache.
+        fresh = info.windows_generator_flags(build_dir.parent / "__no_cache__")
+        if cached and ("-G" in fresh) and "Visual Studio" in cached:
+            print(f"== stale build cache: generator is '{cached}' but Ninja is available")
+            print("== discarding the cache and configuring from scratch")
+            _wipe_cache(build_dir)
+    return []
+
+
 def configured(build_dir: Path, info: PlatformInfo) -> bool:
     """True when the build dir holds a COMPLETED configure. CMakeCache.txt alone is not enough:
     a half-failed configure leaves the cache behind and `cmake --build` then dies."""
     if not (build_dir / "CMakeCache.txt").exists():
         return False
     cache_text = (build_dir / "CMakeCache.txt").read_text(errors="replace")
+    if _cache_tool_paths(build_dir):
+        return False   # a cached tool path vanished; the configure has to run again
     if info.is_macos and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
         desired = os.environ["MACOSX_DEPLOYMENT_TARGET"]
         if not any(line.startswith("CMAKE_OSX_DEPLOYMENT_TARGET:") and line.endswith("=" + desired)
@@ -1439,7 +1537,8 @@ def configured(build_dir: Path, info: PlatformInfo) -> bool:
 
 
 def cmake_configure(info: PlatformInfo, build_dir: Path) -> None:
-    run(["cmake", "-S", ROOT, "-B", build_dir] + info.configure_extra(build_dir))
+    extra = _prepare_configure(info, build_dir)
+    run(["cmake", "-S", ROOT, "-B", build_dir] + info.configure_extra(build_dir) + extra)
 
 
 def cmake_build(info: PlatformInfo, build_dir: Path, target: str, jobs: str) -> None:
@@ -1670,6 +1769,7 @@ def build_launcher(ctx: "Context") -> Optional[Path]:
     step("building the Qt launcher")
     src = ROOT / "ps2xRuntime" / "src" / "launcher"
     bdir = BUILD / ("launcher_qt" if ctx.platform.is_windows else "launcher")
+    prepare = _prepare_configure(ctx.platform, bdir)   # stale cache: a moved tool or generator
     extra = ["-DCMAKE_BUILD_TYPE=Release"]
     if ctx.platform.qt_prefix:
         extra.append("-DCMAKE_PREFIX_PATH=" + str(ctx.platform.qt_prefix))
@@ -1682,7 +1782,7 @@ def build_launcher(ctx: "Context") -> Optional[Path]:
             extra += ["-G", "Ninja"]
         if ctx.platform.is_macos and os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
             extra.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=" + os.environ["MACOSX_DEPLOYMENT_TARGET"])
-    run(["cmake", "-S", src, "-B", bdir] + extra)
+    run(["cmake", "-S", src, "-B", bdir] + extra + prepare)
     cmake_build(ctx.platform, bdir, "Launcher", ctx.jobs)
     exe = bdir / ctx.platform.exe("Launcher")
     if not exe.exists():

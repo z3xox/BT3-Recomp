@@ -28,7 +28,7 @@
 #include <cstring>
 #include "gfx/bt3gl_api.h"   // [B] bt3* API bridge
 extern "C" const char *ps2xExeDirC();   // [mergefix] main.cpp
-extern "C" int ps2xNetEntryActive();    // [netmenu] gate the replacement to the NET entry
+extern "C" int ps2xNetEntryActive();    // [netmenu] gate the BLACK-SQUARE KILL to the NET entry
 
 namespace ps2tex
 {
@@ -295,15 +295,10 @@ int packButtonLayout()
 bool replacementsEnabled()
 {
     std::call_once(g_once, buildIndex);
-    // [netmenu] The black-square kill is NET-ENTRY ONLY: outside it the game's own textures draw.
-    const int on = ps2xNetEntryActive();
-    static int s_last = -1;
-    if (on != s_last)
-    {
-        s_last = on;
-        std::fprintf(stderr, "[texreplace] net-entry gate -> %s (indexed=%d)\n", on ? "ON" : "off", (int)g_on);
-    }
-    if (!on) return false;
+    // The PACK is a plain [video] texture_pack feature: an indexed pack is available everywhere,
+    // the toggle lives at the call site (texPackEnabled()). Nothing here gates it -- the
+    // [netmenu] Dragon Net entry only ever wanted the BLACK-SQUARE KILL to be net-entry-only,
+    // and gating this function instead switched texture replacement off for the whole game.
     return g_on;
 }
 
@@ -514,6 +509,27 @@ bool makeBlack(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h, i
     return true;
 }
 
+// [netmenu] The black-square kill is NET-ENTRY ONLY: outside it the game's own textures draw.
+// This is the ONLY thing the Dragon Net entry gates in this file -- the pack itself is not gated
+// (see replacementsEnabled). One helper for both loadReplacement() overloads, which used to carry
+// their own copy of the env check and drifted apart.
+bool blackAllKill()
+{
+    static const bool s_blackAll = []() {
+        const char *v = std::getenv("PS2X_TEXPACK_BLACK_ALL");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (!s_blackAll) return false;
+    const int on = ps2xNetEntryActive();
+    static int s_last = -1;
+    if (on != s_last)
+    {
+        s_last = on;
+        std::fprintf(stderr, "[texreplace] black-all kill -> %s (net entry)\n", on ? "ON" : "off");
+    }
+    return on != 0;
+}
+
 bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h, int &fmt)
 {
     if (!replacementsEnabled()) return false;
@@ -521,11 +537,7 @@ bool loadReplacement(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int
     if (it == g_index.end())
     {
         // [netmenu] Black-all kill: no per-hash entry needed -- every texture becomes a black square.
-        static const bool s_blackAll = []() {
-            const char *v = std::getenv("PS2X_TEXPACK_BLACK_ALL");
-            return v && v[0] && v[0] != '0';
-        }();
-        if (s_blackAll) return makeBlack(id, rgba, w, h, fmt);
+        if (blackAllKill()) return makeBlack(id, rgba, w, h, fmt);
         return false;
     }
     return decodeFile(it->second, rgba, w, h, fmt);
@@ -539,11 +551,7 @@ bool loadReplacement(const TexIdent &id, uint64_t texKey, std::vector<uint8_t> &
     auto it = g_index.find(key);
     if (it == g_index.end())
     {
-        static const bool s_blackAll = []() {
-            const char *v = std::getenv("PS2X_TEXPACK_BLACK_ALL");
-            return v && v[0] && v[0] != '0';
-        }();
-        if (s_blackAll) return makeBlack(id, rgba, w, h, fmt);
+        if (blackAllKill()) return makeBlack(id, rgba, w, h, fmt);
         return false;
     }
     std::call_once(g_asyncOnce, startAsync);

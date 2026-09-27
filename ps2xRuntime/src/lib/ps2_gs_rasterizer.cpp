@@ -3710,46 +3710,48 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                         }
                         gateAlpha = (!mid && clear && solid);
                     }
-                    // Snapping in the SHADER is not equivalent and does not fix it (tried:
-                    // the gate reads what lands in the framebuffer, not the post-filter
-                    // texel), so rewrite the bytes. That is only possible while they are
-                    // plain RGBA8 -- a BC3 payload would have to be decompressed first, and
-                    // there is no decoder here. For a compressed one, keep the game's own
-                    // texture: a native-resolution gauge is right, an upscaled one that
-                    // breaks the health bar is not.
-                    if (gateAlpha && rfmt != 0)
-                    {   // [texreplace] A BC payload cannot have its alpha rewritten byte by byte, so the
-                        // DATE-gate correction is impossible: keep the game's own texture (a native
-                        // gauge is right; an upscaled one that breaks the gate is not).
-                        // Decompressing these was tried and REVERTED: the art is a 16x pack upscale and
-                        // the zoomed character-select highlight then sampled garbage.
-                        static std::atomic<unsigned long> s_skip{0};
-                        if (s_skip.fetch_add(1) < 5)
-                            std::fprintf(stderr, "[texreplace] SKIP %s: alpha is a DATE gate and the "
-                                         "replacement is compressed (fmt %d) -- keeping the native decode\n",
-                                         id.name().c_str(), rfmt);
+                    // [texreplace] The DATE-gate correction. Snapping in the SHADER does not work
+                    // (the gate reads what lands in the framebuffer, not the post-filter texel), and
+                    // rewriting the bytes cannot work for a BC payload without decompressing it --
+                    // which is what this branch used to try, and it cost the character-select
+                    // highlight its art (the zoomed draw samples it differently) and left black
+                    // frames around the cells. paraLLEl-GS never had the problem because it hands
+                    // the host image to the real GS, which applies the date test on the framebuffer.
+                    //
+                    // PCSX2's answer (GS/Renderers/HW/GSTextureReplacements.cpp, GetBCAlphaMinMax)
+                    // is the same one: do NOT touch the texture. Decode ONE block, take the min and
+                    // max of its alpha, throw the pixels away, and carry that range to the alpha
+                    // test. So the compressed payload keeps its sampling and its format, and the
+                    // gate is decided from the replacement's REAL alpha range instead of a guessed
+                    // one -- which is also what the black frames were: s_packA below is a hardcoded
+                    // 255/128 that assumes a PS2-range pack, and this pack is full 0..255.
+                    float aLo = 0.0f, aHi = 255.0f;
+                    if (ps2tex::replacementAlphaMinMax(rep, rw, rh, rfmt, aLo, aHi))
+                    {
+                        static std::atomic<unsigned long> s_mm{0};
+                        if (s_mm.fetch_add(1) < 5)
+                            std::fprintf(stderr, "[texreplace] gate-alpha %s: replacement alpha range "
+                                     "%.0f..%.0f of 255 (fmt %d) -- scale %.4f, snap %d\n",
+                                     id.name().c_str(), aLo, aHi, rfmt, 255.0f / std::max(aHi, 1.0f),
+                                     gateAlpha ? 1 : 0);
                     }
-                    else {
-                    if (gateAlpha)
-                        for (size_t i = 3; i < rep.size(); i += 4)
-                            rep[i] = (uint8_t)((std::min<unsigned>(rep[i] * 255u / 128u, 255u) >= 128u) ? 255u : 0u);
                     rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = useScale;
-                    // [texreplace] Alpha range. decodeTexRGBA expanded PS2 alpha
-                    // (0x80 == opaque) to 0..255 via kAlpha128To255, but these bytes
-                    // came straight out of the pack and skipped that -- and a
-                    // PCSX2-derived pack is itself in PS2 range. Hand the shader the
-                    // rescale instead of doing it here: most of a real pack is BC3,
-                    // whose alpha cannot be rewritten without decompressing it.
-                    // PS2X_TEXPACKALPHA=1 for a pack authored in full 0..255 range.
-                    static const float s_packA = [](){ const char *v = std::getenv("PS2X_TEXPACKALPHA");
-                                                      return (v && v[0]) ? (float)std::atof(v) : 255.0f / 128.0f; }();
-                    upAlpha = s_packA;
+                    // [texreplace] Alpha range, from the replacement's MEASURED maximum instead of a
+                    // hardcoded 255/128. The old constant encoded the PS2 convention (opaque = 128 of
+                    // 255) and is simply wrong for a full-range pack: measured on this one, the block
+                    // endpoints are 1 and 255, so scaling by 255/128 pushed every mid alpha to fully
+                    // opaque and the dark cell background showed through as a black frame around the
+                    // portraits. Dividing by the pack's own maximum is right for either convention.
+                    // PS2X_TEXPACKALPHA still overrides, for a pack whose opaque is not its maximum.
+                    if (const char *v = std::getenv("PS2X_TEXPACKALPHA"); v && v[0])
+                        upAlpha = (float)std::atof(v);
+                    else
+                        upAlpha = 255.0f / std::max(aHi, 1.0f);
                     static std::atomic<unsigned long> s_hits{0};
                     const unsigned long k = s_hits.fetch_add(1) + 1ul;
                     if (k <= 5 || (k % 100ul) == 0ul)
                         std::fprintf(stderr, "[texreplace] hit #%lu %s -> %dx%d (%dx)\n",
                                      k, id.name().c_str(), rw, rh, useScale);
-                    }
                     }
                 }
             }

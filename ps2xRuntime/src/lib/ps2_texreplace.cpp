@@ -509,6 +509,79 @@ bool makeBlack(const TexIdent &id, std::vector<uint8_t> &rgba, int &w, int &h, i
     return true;
 }
 
+// [alphaminmax] The replacement's REAL alpha range, the way PCSX2 gets it
+// (GS/Renderers/HW/GSTextureReplacements.cpp, GetBCAlphaMinMax / GSGetRGBA8AlphaMinMax): decode
+// ONE block, take the min and max of its alpha, throw the pixels away. The payload itself is never
+// decompressed, so a compressed replacement keeps its format and its sampling -- which is the whole
+// point, because decompressing it is what cost the character-select highlight its art.
+//
+// This replaces a hardcoded 255/128. That constant encodes an assumption about where the pack
+// stores "opaque" (the PS2's 128 out of 255) and it is simply false for a full-range pack: measured
+// on 615e447381f0ecf3 the block's alpha endpoints are 1 and 255, so scaling by 255/128 pushed every
+// mid alpha to fully opaque and left the dark cell background showing through as a black frame.
+// Deriving the scale from the measured maximum is correct for both conventions at once.
+//
+// BC3 is the only compressed format the pack ships, so it is the only one decoded here; anything
+// else returns false and the caller keeps its previous behaviour. Returns true when it filled the
+// range, and always writes sane values.
+bool replacementAlphaMinMax(const std::vector<uint8_t> &data, int w, int h, int fmt, float &lo, float &hi)
+{
+    lo = 0.0f; hi = 255.0f;
+    if (w <= 0 || h <= 0) return false;
+
+    if (fmt == 0 || fmt == BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+    {
+        const size_t px = (size_t)w * h;
+        if (data.size() < px * 4u) return false;
+        unsigned mn = 255, mx = 0;
+        for (size_t i = 0; i < px; ++i)
+        {
+            const unsigned a = data[i * 4 + 3];
+            if (a < mn) mn = a;
+            if (a > mx) mx = a;
+        }
+        lo = (float)mn; hi = (float)mx;
+        return true;
+    }
+    if (fmt != BT3_PIXELFORMAT_COMPRESSED_DXT5_RGBA) return false;
+
+    // A 16-byte BC3 block in the pack is ALPHA-FIRST: alpha in bytes [0..7] (BC4: two 8-bit
+    // endpoints + sixteen 3-bit indices in one 48-bit little-endian bitstream) and colour in
+    // [8..15]. Same order ps2_gs_pgs.cpp's bcDecode reads, the backend that renders this pack
+    // correctly. The textbook order is colour-first; reading it that way gives colour endpoints
+    // (255,226,8)/(8,182,180) on 615e447381f0ecf3 and an alpha ramp that overflows uint8, while this
+    // order gives a clean skin tone. Do NOT normalise the halves on load: a swap there turned the
+    // whole screen into red/cyan noise, because the compressed upload path is already correct.
+    const int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    if (data.size() < (size_t)bw * bh * 16u) return false;
+    unsigned mn = 255, mx = 0;
+    for (int by = 0; by < bh; ++by)
+        for (int bx = 0; bx < bw; ++bx)
+        {
+            const uint8_t *blk = data.data() + ((size_t)by * bw + bx) * 16u;
+            const uint8_t a0 = blk[0], a1 = blk[1];
+            uint8_t ramp[8];
+            if (a0 > a1) { for (int k = 0; k < 8; ++k) ramp[k] = (uint8_t)(((8 - k) * a0 + k * a1) / 7); }
+            else
+            {
+                ramp[0] = a0; ramp[1] = a1;
+                ramp[2] = (uint8_t)((6 * a0 + 1 * a1) / 7); ramp[3] = (uint8_t)((5 * a0 + 2 * a1) / 7);
+                ramp[4] = (uint8_t)((4 * a0 + 3 * a1) / 7); ramp[5] = (uint8_t)((3 * a0 + 4 * a1) / 7);
+                ramp[6] = 0; ramp[7] = 255;
+            }
+            // Every value the indices can address is what the GPU can output, so the range is the
+            // ramp's own min and max -- no need to look at a single index.
+            for (int k = 0; k < 8; ++k)
+            {
+                const unsigned v = ramp[k];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+        }
+    lo = (float)mn; hi = (float)mx;
+    return true;
+}
+
 // [netmenu] The black-square kill is NET-ENTRY ONLY: outside it the game's own textures draw.
 // This is the ONLY thing the Dragon Net entry gates in this file -- the pack itself is not gated
 // (see replacementsEnabled). One helper for both loadReplacement() overloads, which used to carry

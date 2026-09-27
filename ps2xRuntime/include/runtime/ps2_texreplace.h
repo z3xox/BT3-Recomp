@@ -59,6 +59,14 @@ namespace ps2tex
     // with hasPair=true is not "absent from the pack": it is queued for decode or failed to decode.
     bool hasPair(uint64_t tex0Hash, uint64_t clutHash);
 
+    // [alphaminmax] The replacement's real alpha range (lo, hi, 0..255), measured WITHOUT touching
+    // the payload: one block decoded, pixels discarded. This is PCSX2's GetBCAlphaMinMax, and it is
+    // what lets a COMPRESSED replacement satisfy the DATE gate -- decompressing the texture instead
+    // works until the character-select highlight samples it differently, and it is also why the
+    // hardcoded 255/128 alpha rescale had to go. Returns false for a format it cannot read,
+    // leaving the caller on its previous behaviour.
+    bool replacementAlphaMinMax(const std::vector<uint8_t> &data, int w, int h, int fmt, float &lo, float &hi);
+
 
 
     // Look up a replacement for `id` and decode it to RGBA8. Matches on the HASH PAIR only --

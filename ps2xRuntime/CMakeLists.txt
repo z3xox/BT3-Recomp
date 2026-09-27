@@ -980,13 +980,20 @@ endif()
 # [pgs] optional paraLLEl-GS backend (Vulkan compute GS, LGPLv3+): built in when the checkout is present.
 # ps2xRuntime/third_party/parallel-gs is a git-ignored symlink/checkout of https://github.com/Arntzen-Software/parallel-gs
 set(PS2X_PGS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parallel-gs" CACHE PATH "paraLLEl-GS checkout (with its Granite submodule)")
-# [pgs] OFF by default since 2026-09-25: the AMD Vulkan ICD (amdvlk64.dll, driver 2.0.279 on an
-# RX 580) faults inside DllMain on a worker thread right after device creation, taking the whole
-# runner down at ~15 s with an access violation in vk_icdGetInstanceProcAddrSG. The backend is
-# being rewritten, so nothing selects it for now: with PS2X_HAVE_PGS undefined, applyRenderer()
-# maps a configured "parallel-gs" to the OpenGL present, so old settings files keep working. The
-# sources stay in the tree for the rewrite; -DPS2X_DISABLE_PGS=OFF brings the backend back.
-option(PS2X_DISABLE_PGS "Do not build the paraLLEl-GS backend even if the checkout is present" ON)
+# [pgs] Built in again when the checkout is present. It defaulted to OFF from 2026-09-25 to
+# 2026-09-27 because the AMD proprietary Vulkan ICD (amdvlk64.dll, driver 2.0.279 on an RX 580)
+# faults inside DllMain on a worker thread right after device creation, taking the whole runner
+# down at ~15 s with an access violation in vk_icdGetInstanceProcAddrSG. That is a Windows+Polaris
+# driver bug, not a backend bug, and it is handled where it belongs: the shipped Windows build
+# runs paraLLEl-GS on the bundled Mesa lavapipe ICD, the front-end retries once on the OpenGL
+# renderer if the runner still dies, and it records that in logs/vulkan-fallback.log. Mesa/RADV on
+# Linux never hit it -- the backend configures, builds and is selected there.
+# Having it compiled in does not select it: PS2X_PGS (set from [video] renderer= in the overlay
+# dropdown) decides, and with PS2X_HAVE_PGS undefined applyRenderer() maps a configured
+# "parallel-gs" back to the OpenGL present, so settings written against a PGS-less build keep
+# working. -DPS2X_DISABLE_PGS=ON builds without it deliberately, which is what the WARNING below
+# already told people to do.
+option(PS2X_DISABLE_PGS "Do not build the paraLLEl-GS backend even if the checkout is present" OFF)
 # paraLLEl-GS does not compile on macOS: Granite's sleep_until_nsecs() uses
 # clock_nanosleep/TIMER_ABSTIME for everything that is not _WIN32, and macOS has
 # neither. Gate it on the platform rather than on a cache variable alone, so a

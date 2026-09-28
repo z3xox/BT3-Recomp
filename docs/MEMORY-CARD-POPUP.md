@@ -357,7 +357,80 @@ Recorded so they are not re-tread.
   firmware's; the game draws it.
 - **`PS2X_GSMASK=1`.** Broke the whole game and did not fix the Evolution Z menu. Unrelated to this.
 
-## 9. Tooling notes
+## 10. Where to touch it, and how
+
+Everything above is measurement. This is the map for changing it, so the next person does not have to
+re-derive the layout from the log.
+
+### The override — `PS2X_MCTEXT='line 1|line 2|line 3|line 4'`
+
+One file: **`ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp`**.
+
+| what | where | note |
+|---|---|---|
+| the hook itself | `ps2xMcTextApply(DrawCmd &)`, next to `mcIsFade` / `mcIsBody` | the whole feature is this one function |
+| the call site | just above `std::vector<DrawCmd> reorderBuf;` in the render function | **not** inside the draw loop — see below |
+| the message | `PS2X_MCTEXT`, `|`-separated | unset = the game's own text, byte for byte |
+| the measured arrays | `ps2xMcTextIdx()` | the 120 indices + the 5 line starts; these are measurements, not guesses |
+| the ink widths | `kGlyphInkW[95]` | measured off the dumped atlas; drives the layout pitch |
+
+**The call site is the one non-obvious part.** It goes on `cmds` *before* the reorder copy, not in the
+draw loop. The loop reads `const std::vector<DrawCmd> &DC`, and `reorderBuf` is built by copying from
+`cmds`, so a draw's UV is already frozen by the time the loop runs — editing it there would mean
+casting away const on the frame's reference buffer. `cmds` (which is `m_cmdsScratch`) is ours to
+mutate at that point, and applying before the reorder also means the override survives whichever
+branch the reorder takes.
+
+**Order of operations inside the function**, and it matters:
+
+1. bail unless `srcTbp0 == 10760 && srcPsm == 20 && 512x128` and not a transfer
+2. read `orig` from the game's UV — **before** anything rewrites it
+3. feed the message census (§8) — also before, or it logs our own replacement back at us
+4. count runs to get `slot`
+5. rebuild the per-slot plan if `PS2X_MCTEXT` changed since last time
+6. only now rewrite `su0/sv0/su1/sv1`, and `dx0/dx1` when the slot has a glyph
+
+### The atlas route — `data/Textures`
+
+No code at all. Drop
+`<exeDir>/data/Textures/1dd4c76113969303-6dfa844c9490b8ed-00001e54.png` (512×128 RGBA) and
+`ps2_texreplace.cpp` serves it in place of the game's atlas. The key is the **hash pair**; the third
+filename field is deliberately not part of the key, because the same texture appears as `…-00001e53`
+and `…-00005e53` depending on whether TEXA was in the dump, and keying on the full name loads nothing
+from a working pack. The pipeline decodes to RGBA8 with alpha, which is why a replacement whose
+shapes live in alpha works at all.
+
+`games/bt3/atlas_text.py` generates that file. `--pattern` prints the template a replacement has to
+fit without needing an atlas at all; `--message-file` reads one line per popup row.
+
+### What is deliberately NOT touched
+
+The fade, the box geometry, the clip, the Fs/Fd blend, the draw order and the count all stay the
+game's. The override changes which cell a quad samples and where it sits — nothing else. That is why
+it survives: the popup keeps animating and keeps blending exactly as it does without the feature.
+
+The duplication of §6 is a **separate** bug in stale command re-execution and is not fixed here. The
+override hides it in the text as a side effect (it places each draw itself, so each glyph is emitted
+once) but the box border still shows it. Fixing that means finding why the commands repeat, which is
+its own investigation.
+
+### The probes used, and what each one is for
+
+| probe | answers |
+|---|---|
+| `PS2X_MCLOG=1 PS2X_MCLOGMAX=0` | the whole save conversation, with `pc`/`ra`/`sp` per call |
+| `PS2X_DRAWLOG=1 PS2X_DRAWLOG_LIVE=0` | the first 3000 emitted draws — **the counter, not `DRAWLOG_AT`**; the time window is consumed before the popup starts and reports nothing |
+| `PS2X_TEXPNGD=<dir>` | complete texture dump, no cap, no dedupe. **F9 re-arms** and wipes the directory, which is how a dump is scoped to one screen |
+| `PS2X_FILEDUMP=<dir> [PS2X_FILEDUMP_ONLY=<substr>]` | the bytes the guest reads, per file, reassembled |
+| `PS2X_MCIDX=1` | the index array in RDRAM — reports `full pass N complete` so a silent scan is never mistaken for a clean one |
+| `PS2X_MCSTR=1` | the prompt words in RDRAM. Always 0 hits, by construction (§3) — kept only to prove that |
+| `PS2X_MCFADE=1` | per-frame census of the fade and body draws; this is what exposed the 12-executes-3-rectangles repetition and the box animation |
+| `PS2X_FE_AUTOPLAY=1 PS2X_FE_DELAY_MS=3000` | boots without a human clicking, for unattended runs |
+
+Rendering a dumped atlas: use the **alpha** channel when the RGB is flat. That is the rule that makes
+this atlas visible at all, and getting it wrong is what made it look empty (§2).
+
+## 11. Tooling notes
 
 Probes used, and the two mistakes worth not repeating.
 

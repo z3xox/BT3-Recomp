@@ -569,11 +569,18 @@ bool replacementAlphaMinMax(const std::vector<uint8_t> &data, int w, int h, int 
                 ramp[4] = (uint8_t)((4 * a0 + 3 * a1) / 7); ramp[5] = (uint8_t)((3 * a0 + 4 * a1) / 7);
                 ramp[6] = 0; ramp[7] = 255;
             }
-            // Every value the indices can address is what the GPU can output, so the range is the
-            // ramp's own min and max -- no need to look at a single index.
-            for (int k = 0; k < 8; ++k)
+            // Take the range over the alpha values this block's SIXTEEN INDICES actually address,
+            // not over the whole ramp. In the a0<=a1 mode the ramp's last two entries are the
+            // specials 0 and 255, which are AVAILABLE but need not be USED: a pack authored in PS2
+            // range tops out around 128, and scanning the ramp instead of the indices reported 255
+            // for it, so the derived scale came out 1.0 and every portrait read translucent. This is
+            // also what PCSX2 does -- it decompresses the block and takes the min/max of real
+            // texels, not of the palette.
+            uint64_t abits = 0;
+            for (int i = 0; i < 6; ++i) abits |= (uint64_t)blk[2 + i] << (8 * i);
+            for (int i = 0; i < 16; ++i)
             {
-                const unsigned v = ramp[k];
+                const unsigned v = ramp[(abits >> (3 * i)) & 7u];
                 if (v < mn) mn = v;
                 if (v > mx) mx = v;
             }

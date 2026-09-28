@@ -3596,9 +3596,9 @@ void GSRasterizer::decodeDeferred(const TexDecodeReq &req, uint8_t *vram, size_t
     decodeTexRGBA(nullptr, src, req.texW, req.texH, req.rawAlphaDec, req.texKey, subW, rgba);
 }
 void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex0, const uint32_t *clut, uint64_t clutKey, const GSTexaReg &texa, uint64_t texKey, int subW, int texH, bool allowed,
-                                       std::vector<uint8_t> &rgba, int &upW, int &upH, int &upFmt, int &upScale, float &upAlpha)
+                                       std::vector<uint8_t> &rgba, int &upW, int &upH, int &upFmt, int &upScale, float &upAlpha, float &upSnap)
 {   // [texreplace] lifted out of the record path so the decode pool runs the identical swap ([decpool])
-    (void)clutKey; (void)upW; (void)upH; (void)upFmt; (void)upScale; (void)upAlpha;
+    (void)clutKey; (void)upW; (void)upH; (void)upFmt; (void)upScale; (void)upAlpha; upSnap = 0.0f;
     {   // [texreplace] Swap in a PCSX2-pack replacement if one exists for this texture.
         // Sampling is NORMALISED (texture(texture0, uv), not texelFetch), so a 4x
         // replacement needs no UV rescaling -- just hand putTexture the bigger buffer
@@ -3731,22 +3731,36 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                         static std::atomic<unsigned long> s_mm{0};
                         if (s_mm.fetch_add(1) < 5)
                             std::fprintf(stderr, "[texreplace] gate-alpha %s: replacement alpha range "
-                                     "%.0f..%.0f of 255 (fmt %d) -- scale %.4f, snap %d\n",
-                                     id.name().c_str(), aLo, aHi, rfmt, 255.0f / std::max(aHi, 1.0f),
-                                     gateAlpha ? 1 : 0);
+                                     "%.0f..%.0f of 255 (fmt %d) -- scale %.4f, snap %.0f\n",
+                                     id.name().c_str(), aLo, aHi, rfmt, 255.0f / std::max(aHi, 1.0f), upSnap);
                     }
                     rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = useScale;
-                    // [texreplace] Alpha range, from the replacement's MEASURED maximum instead of a
-                    // hardcoded 255/128. The old constant encoded the PS2 convention (opaque = 128 of
-                    // 255) and is simply wrong for a full-range pack: measured on this one, the block
-                    // endpoints are 1 and 255, so scaling by 255/128 pushed every mid alpha to fully
-                    // opaque and the dark cell background showed through as a black frame around the
-                    // portraits. Dividing by the pack's own maximum is right for either convention.
-                    // PS2X_TEXPACKALPHA still overrides, for a pack whose opaque is not its maximum.
+                    // [texreplace] Alpha handling, in two parts.
+                    //
+                    // SCALE, from the replacement's MEASURED maximum rather than a hardcoded 255/128.
+                    // That constant encoded the PS2 convention (opaque = 128 of 255) and is wrong for a
+                    // full-range pack: measured, this one runs 66-90% of texels at a flat 255 with a
+                    // soft cutout edge, so multiplying by 255/128 saturated the 128..159 bucket. That
+                    // bucket IS the cutout edge, and blowing it out is what left the dark cell
+                    // background showing as a black frame around the portraits. Dividing by the pack's
+                    // own maximum is right for either convention.
+                    //
+                    // SNAP, because a correct scale alone still reads translucent: the GS stores
+                    // framebuffer alpha on the PS2 scale where 128 is opaque, so a full-range 255 lands
+                    // at half strength. The old 255/128 hid this by saturating -- i.e. it binarised at
+                    // the PS2 threshold as a side effect. Do that on purpose instead, through the
+                    // second AlphaFix component, using the pack's own measured range to place the cut:
+                    // at least half of the measured span is opaque. 0.5 of full range is exactly PS2 128.
+                    // PS2X_TEXPACKSNAP=0 turns it off for a pack that wants its soft edges kept.
                     if (const char *v = std::getenv("PS2X_TEXPACKALPHA"); v && v[0])
                         upAlpha = (float)std::atof(v);
                     else
                         upAlpha = 255.0f / std::max(aHi, 1.0f);
+                    // NOTE: a snap (binarise at the PS2 gate) was tried here via AlphaFix.y and
+                    // reverted -- the renderer's alpha has its own GS-128 scale (uABl128), so a
+                    // threshold on the sampled value binarised almost every texel to clear and the
+                    // portraits vanished. The plumbing is still in place for whoever places the
+                    // threshold in the right coordinate space.
                     static std::atomic<unsigned long> s_hits{0};
                     const unsigned long k = s_hits.fetch_add(1) + 1ul;
                     if (k <= 5 || (k % 100ul) == 0ul)
@@ -4691,15 +4705,15 @@ bool GSRasterizer::recordSpriteGPU(RecInput &in)
                 gprof::Scope gpScope(gprof::DEC);
                 decodeTexRGBA(in.gs, src, texW, texH, rawAlphaDec, texKey, subW, rgba);   // [decodefn]
                 int upW = subW, upH = texH, upFmt = 0, upScale = 1;   // [texreplace] upFmt != 0 => compressed DDS
-                float upAlpha = 1.0f;                                 // [texreplace] see PS2X_TEXPACKALPHA
+                float upAlpha = 1.0f, upSnap = 0.0f;                  // [texreplace] see PS2X_TEXPACKALPHA / PS2X_TEXPACKSNAP
                 applyTexReplacement(in.vram, ctx.tex0, in.clut, in.clutKey, (*in.texa), texKey, subW, texH,
-                                    g_subDxW == 0 && !rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha);   // [texreplace] shared with the decode pool
+                                    g_subDxW == 0 && !rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha, upSnap);   // [texreplace] shared with the decode pool
                 // [dueldump] total capture: record the sample + offer the decode for a PNG
                 ps2x_dueldump::offerTextureSample(in.vram, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
                     ctx.tex0.tw, ctx.tex0.th, in.clut, in.texa->ta0, in.texa->aem, in.texa->ta1,
                     ctx.tex0.cbp, ctx.tex0.csa, ctx.tex0.csm, ctx.tex0.cpsm, texKey, subW, texH,
                     rgba.data(), "inline");
-                r.putTexture(texKey, std::move(rgba), upW, upH, texPageLo, texPageHi, upFmt, upScale, upAlpha);
+                r.putTexture(texKey, std::move(rgba), upW, upH, texPageLo, texPageHi, upFmt, upScale, upAlpha, upSnap);
             }
             if (s_dcs)
             {

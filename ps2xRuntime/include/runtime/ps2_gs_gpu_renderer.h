@@ -386,7 +386,7 @@ public:
 
     bool revalidateTexture(uint64_t key, uint32_t pageLo, uint32_t pageHi,
                            const uint8_t *vram, uint32_t vramSize);
-    void putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt = 0, int texScale = 1, float alphaScale = 1.0f, int64_t seqAt = -1);   // [decpool] seqAt >= 0: a pool put, stamped with its record-time sequence
+    void putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt = 0, int texScale = 1, float alphaScale = 1.0f, float alphaSnap = 0.0f, int64_t seqAt = -1);   // [decpool] seqAt >= 0: a pool put, stamped with its record-time sequence
     uint32_t putTexturePending(uint64_t key, int w, int h, uint32_t pageLo, uint32_t pageHi);   // [decpool] placeholder entry; returns the stamp the pool's put must carry
     static bool decPoolWants(uint32_t psm);              // [decpool] this format's decode goes to the pool
     void decPoolPost(std::unique_ptr<DecPoolJob> job);   // [decpool] hand a record-time snapshot to the pool
@@ -476,9 +476,12 @@ private:
         // replacement uploaded with scale 1 makes the divisor 4x too large and only the top-left
         // quarter is sampled, magnified. Registering the scale is what makes hi-res line up.
         int texScale = 1;
-        // [texreplace] Alpha-range rescale handed to the shader (uAlphaRep). 255/128 for a
-        // pack replacement, whose bytes bypass the decoder's kAlpha128To255 expansion; else 1.
+        // [texreplace] Alpha handling handed to the shader as uAlphaFix = {scale, snap}. The scale
+        // comes from the replacement's measured maximum (its bytes bypass the decoder's
+        // kAlpha128To255 expansion); the snap is 1.0 to binarise at the PS2 gate, which is what the
+        // GS actually implements. Both 1.0/0.0 -- the default -- leave the sample alone.
         float alphaScale = 1.0f;
+        float alphaSnap = 0.0f;
         bool needsUpload = false;
         unsigned int glId = 0;      // GL texture id (present thread only)
         uint32_t decodeSeq = 0;     // m_writeSeq at decode time

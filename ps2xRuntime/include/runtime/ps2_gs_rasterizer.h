@@ -34,7 +34,7 @@ public:
     void decodeSnapshot(const DecPoolJob &job, uint8_t *scratch, size_t vramSize, int &subW, std::vector<uint8_t> &rgba);   // [decpool] pool thread
     // [texreplace] the pack-replacement swap, shared by the inline decode and the decode pool: on a hit rgba/upW/upH/upFmt/upScale/upAlpha become the replacement's
     static void applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex0, const uint32_t *clut, uint64_t clutKey, const GSTexaReg &texa, uint64_t texKey, int subW, int texH, bool allowed,
-                                    std::vector<uint8_t> &rgba, int &upW, int &upH, int &upFmt, int &upScale, float &upAlpha);
+                                    std::vector<uint8_t> &rgba, int &upW, int &upH, int &upFmt, int &upScale, float &upAlpha, float &upSnap);
     static bool decodeIsDeferrable(uint32_t psm);   // [deferdec] only the fast paths can run without the GS
     void drawPrimitive(GS *gs);
     // [recinput] everything recordSpriteGPU reads. Stage 1 of chunked recording: the wrapper below fills it from the

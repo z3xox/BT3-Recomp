@@ -4818,9 +4818,9 @@ void decPoolWorker()
             std::memcpy(scratch.data() + job->spanOff, job->span.data(), job->span.size());
         int subW = 0; std::vector<uint8_t> rgba;
         job->ras->decodeSnapshot(*job, scratch.data(), scratch.size(), subW, rgba);
-        int upW = subW, upH = job->texH, upFmt = 0, upScale = 1; float upAlpha = 1.0f;
+        int upW = subW, upH = job->texH, upFmt = 0, upScale = 1; float upAlpha = 1.0f, upSnap = 0.0f;
                 GSRasterizer::applyTexReplacement(scratch.data(), job->tex0, job->clut, job->clutKey, job->texa, job->texKey, subW, job->texH,
-                                                   job->subDxW == 0 && !job->rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha);
+                                                   job->subDxW == 0 && !job->rawAlphaDec, rgba, upW, upH, upFmt, upScale, upAlpha, upSnap);
                 // [dueldump] total capture: record the sample + offer the decode for a PNG
                 ps2x_dueldump::offerTextureSample(scratch.data(), job->tex0.tbp0, job->tex0.tbw, job->tex0.psm,
                     job->tex0.tw, job->tex0.th, job->clut, job->texa.ta0, job->texa.aem, job->texa.ta1,
@@ -4909,12 +4909,12 @@ uint32_t GsGpuRenderer::putTexturePending(uint64_t key, int w, int h, uint32_t p
     std::lock_guard<std::mutex> lk(m_mtx);
     g_texLastUse[key] = g_texUseGen;   // [evictnew]
     CachedTex &ct = m_texCache[key];
-    if (ct.w <= 0) { ct.w = w; ct.h = h; ct.needsUpload = false; ct.rgba.clear(); ct.fmt = 0; ct.texScale = 1; ct.alphaScale = 1.0f; }
+    if (ct.w <= 0) { ct.w = w; ct.h = h; ct.needsUpload = false; ct.rgba.clear(); ct.fmt = 0; ct.texScale = 1; ct.alphaScale = 1.0f; ct.alphaSnap = 0.0f; }
     ct.decodeSeq = m_writeSeq;
     return m_writeSeq;
 }
 
-void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt, int texScale, float alphaScale, int64_t seqAt)
+void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, int h, uint32_t pageLo, uint32_t pageHi, int fmt, int texScale, float alphaScale, float alphaSnap, int64_t seqAt)
 {
     g_texDecodeCount.fetch_add(1u, std::memory_order_relaxed);
     {   // [decodecensus] PS2X_DECCENSUS=1: which textures get re-decoded, by (first page, w, h); top 8 every 2 s
@@ -4994,6 +4994,7 @@ void GsGpuRenderer::putTexture(uint64_t key, std::vector<uint8_t> rgba, int w, i
     ct.h = h;
     ct.fmt = fmt;   // [texreplace] 0 = RGBA8; non-zero = a compressed DDS replacement
     ct.texScale = texScale;
+    ct.alphaSnap = alphaSnap;
     ct.alphaScale = alphaScale;   // [texreplace]
     ct.decodeSeq = (seqAt >= 0) ? (uint32_t)seqAt : m_writeSeq;   // [decpool]
     ct.putGen = __atomic_load_n(&g_publishGen, __ATOMIC_RELAXED) + 1u;   // [texclobber] the frame being built (swapFrame publishes it as g_publishGen+1)
@@ -7719,7 +7720,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             }
         }
     } segSwapBack{this, cmds, m_chunkMode ? m_chunk : m_building, m_segMode, m_segMode && !m_chunkMode};
-    struct PendingUp { uint64_t key = 0; std::vector<uint8_t> rgba; int w = 0, h = 0; int fmt = 0; int texScale = 1; float alphaScale = 1.0f; uint32_t gen = 0; };   // [uploadout] gen: [texclobber]
+    struct PendingUp { uint64_t key = 0; std::vector<uint8_t> rgba; int w = 0, h = 0; int fmt = 0; int texScale = 1; float alphaScale = 1.0f; float alphaSnap = 0.0f; uint32_t gen = 0; };   // [uploadout] gen: [texclobber]
     static std::vector<PendingUp> s_ups;
     ragStat.phase(1);
     std::vector<DrawCmd> prevCmds;
@@ -7849,7 +7850,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
                 if (!ct.needsUpload || ct.w <= 0 ||
                     (ct.fmt ? ct.rgba.empty() : ct.rgba.size() < (size_t)ct.w * ct.h * 4))
                     continue;   // duplicate queue entry or invalid: the flag is the truth
-                PendingUp u; u.key = qk; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.rgba.swap(ct.rgba); u.gen = ct.putGen;
+                PendingUp u; u.key = qk; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.alphaSnap = ct.alphaSnap; u.rgba.swap(ct.rgba); u.gen = ct.putGen;
                 ct.needsUpload = false;
                 spent += u.rgba.size();
                 s_ups.push_back(std::move(u));
@@ -7864,7 +7865,7 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
             if ((!ct.needsUpload && !s_reup) || ct.w <= 0 ||
                 (ct.fmt ? ct.rgba.empty() : ct.rgba.size() < (size_t)ct.w * ct.h * 4))
                 continue;
-            PendingUp u; u.key = kv.first; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.rgba.swap(ct.rgba); u.gen = ct.putGen;
+            PendingUp u; u.key = kv.first; u.w = ct.w; u.h = ct.h; u.fmt = ct.fmt; u.texScale = ct.texScale; u.alphaScale = ct.alphaScale; u.alphaSnap = ct.alphaSnap; u.rgba.swap(ct.rgba); u.gen = ct.putGen;
             ct.needsUpload = false;
             s_ups.push_back(std::move(u));
         }
@@ -8263,8 +8264,8 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
         {
             if (up.texScale > 1) g_rsTexScale[id] = up.texScale;
             else                 g_rsTexScale.erase(id);
-            if (up.alphaScale != 1.0f) g_texAlphaFix[id] = AlphaFix{up.alphaScale, 0.0f};
-            else                                             g_texAlphaFix.erase(id);
+            if (up.alphaScale != 1.0f || up.alphaSnap != 0.0f) g_texAlphaFix[id] = AlphaFix{up.alphaScale, up.alphaSnap};
+            else                                                                  g_texAlphaFix.erase(id);
         };
         {
             // [texreplace] bt3UpdateTexture (glTexSubImage2D) and the size-keyed pool below both

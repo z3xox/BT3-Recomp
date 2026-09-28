@@ -71,14 +71,24 @@ were mis-split.
 
 ## The fix
 
+**Applied and verified — both screens work.** Commit `e3493e7`.
+
 ```python
 MID_FUNCTION_ENTRIES = (0x341358, 0x34c0b0, 0x39aaa0, 0x36fbc0)
 ```
 
-in `games/bt3/gen_overlay.py`. Both new addresses already have their instruction
-line in `overlay_functions.cpp` (`// 0x39aaa0: 0x113940` at line 300658,
-`// 0x36fbc0: 0x3c04003b` at line 176585), so the generator finds them and does
-not trip its own guard:
+in `games/bt3/gen_overlay.py`. The generator confirms all four with their table
+indices:
+
+```
+registered mid-function entry 0x39aaa0 -> f_39aa20_0x39aa20 (idx 104360)
+registered mid-function entry 0x36fbc0 -> f_36fb48_0x36fb48 (idx 60400)
+```
+
+Both new addresses already have their instruction line in
+`overlay_functions.cpp` (`// 0x39aaa0: 0x113940` at line 300658, `// 0x36fbc0:
+0x3c04003b` at line 176585), so the generator finds them and does not trip its
+own guard:
 
 ```python
 i = next((n for n, l in enumerate(lines) if instr.match(l)), None)
@@ -87,13 +97,11 @@ if i is None:
 ```
 
 This is the same mechanism that fixed `0x34c0b0` when it was hit live on
-2026-09-05, and it should clear both screens at once.
+2026-09-05, and one list entry cleared both screens.
 
-Worth doing alongside it, though not required for the hang: register
-`0x334c00..0x3be71c` as a code region, so `isCodeAddress()` answers correctly and
-the error message stops pointing at the wrong thing.
-
-**Not yet implemented** — documented for review first.
+Note: `ps2xRuntime/src/runner_overlay/overlay_functions.cpp` is **generated** and
+untracked — `setup.py` regenerates it from `gen_overlay.py` plus the three CSVs, so
+the fix is only the one-line change to `MID_FUNCTION_ENTRIES`.
 
 ## What the symptom looks like
 

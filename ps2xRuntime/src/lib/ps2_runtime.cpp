@@ -8264,6 +8264,49 @@ void PS2Runtime::run()
             int dh = ps2GpuRenderer().displayHeight();
             if (dw > 0 && dw <= static_cast<int>(FB_WIDTH)) presentWidth = static_cast<uint32_t>(dw);
             if (dh > 0 && dh <= static_cast<int>(DEFAULT_DISPLAY_HEIGHT)) presentHeight = static_cast<uint32_t>(dh);
+            // [presentclamp] Force the present crop to the size the texture ACTUALLY has.
+            //
+            // displayWidth()/displayHeight() are the max scissor extents the frame's draws reached
+            // (see GsGpuRenderer::displayWidth), so they are only as stable as the frame's own draw
+            // mix. The FB_WIDTH guard above does not help: FB_WIDTH is 640, so a 640-wide extent
+            // passes while the presented texture is 512 wide -- measured on the character-select
+            // screen as `tex=512x512 src=640x448`, i.e. 128 columns sampled past the texture.
+            //
+            // Two things go wrong at once, which is why this looked like an aspect bug rather than
+            // a crop bug. [tv43] below stretches the present to authentic 4:3 TV proportions off
+            // srcWidth, so a frame that reports 640 gets stretched by 640/512 more than one that
+            // reports 512 -- the picture breathes between 4:3 and 16:9 as the draw mix changes.
+            // Rotating between character-select rows changes exactly that, which is when P1's
+            // preview visibly shrank and stretched while P2 (a steadier draw mix) never did.
+            //
+            // Clamping to the texture cannot be wrong: there is nothing outside it to present. It
+            // also makes the crop independent of which auxiliary passes a frame happens to run.
+            if (presentTex.width > 0 && presentWidth > static_cast<uint32_t>(presentTex.width))
+                presentWidth = static_cast<uint32_t>(presentTex.width);
+            if (presentTex.height > 0 && presentHeight > static_cast<uint32_t>(presentTex.height))
+                presentHeight = static_cast<uint32_t>(presentTex.height);
+            // [presentclamp] ...and the other direction too, which is the half that still moved.
+            //
+            // A scissor-derived crop that comes up SHORT is the visible one: the character-select
+            // preview stretched vertically when a frame's draw mix reported 384 rows instead of 448,
+            // because [tv43] then scales 384 rows up to the window height while the width still
+            // scales by its own factor -- the picture goes tall and thin. Clamping to the texture
+            // cannot see that (384 is inside a 512-tall texture), so the near-miss is snapped to
+            // the canonical frame instead. A difference of a row or two is an auxiliary pass, not a
+            // mode change; a genuinely smaller mode (splitscreen halves, atlas slots) is far larger
+            // than the tolerance and still passes through. PS2X_PRESENTNUDGE=0 restores the literal
+            // extent, PS2X_PRESENTCLAMP=0 restores the whole thing.
+            static const bool s_nudge = [](){ const char *v = std::getenv("PS2X_PRESENTNUDGE"); return !(v && v[0] && v[0] != '0'); }();
+            constexpr uint32_t kNudgeRows = 64;   // PS2 block/row granularity, well under any real mode delta
+            if (s_nudge && presentHeight > 0 && presentHeight < static_cast<uint32_t>(DEFAULT_DISPLAY_HEIGHT)
+                && static_cast<uint32_t>(DEFAULT_DISPLAY_HEIGHT) - presentHeight <= kNudgeRows)
+                presentHeight = static_cast<uint32_t>(DEFAULT_DISPLAY_HEIGHT);
+            // Same for the width, against the canonical BT3 mode. 512 and 640 are both real PS2
+            // widths, so only a NEAR-miss snaps -- a frame that reports 640-wide is a genuine mode
+            // and is left alone, while one that reports 448 (half of 896, a tall-surface artefact)
+            // is snapped back.
+            if (s_nudge && presentWidth > 0 && presentWidth < 512u && 512u - presentWidth <= kNudgeRows)
+                presentWidth = 512u;
             static bool s_dlog = false;
             if (!s_dlog && dw > 0 && std::getenv("PS2X_GPU_DIAG")) { s_dlog = true; std::cerr << "[gpupresent] disp=" << dw << "x" << dh << " -> present=" << presentWidth << "x" << presentHeight << std::endl; }
         }
@@ -8659,8 +8702,27 @@ void PS2Runtime::run()
         // sample stays inside the display region. PS2X_PRESENTEDGE=0 restores the old rect.
         static const bool s_pEdge = [](){ const char *v = std::getenv("PS2X_PRESENTEDGE"); return !(v && v[0] == '0'); }();
         const float inset = (s_pEdge && GsGpuRenderer::renderScale() > 1) ? 0.5f : 0.0f;
-        const float srcW2 = srcWidth  - 2.0f * inset;
-        const float srcH2 = srcHeight - 2.0f * inset;
+        float srcW2 = srcWidth  - 2.0f * inset;
+        float srcH2 = srcHeight - 2.0f * inset;
+        // [presentclamp] Last word on the crop: keep the whole source rect inside the presented
+        // texture. The clamp on presentWidth/Height above already bounds the extent; this bounds
+        // the ORIGIN too, so a frame that reports a source offset past the edge presents the part
+        // that exists instead of sampling whatever follows it. A crop that leaves the texture is
+        // what made the picture breathe between 4:3 and 16:9 as the draw mix changed.
+        if (presentTex.width > 0)
+        {
+            const float maxW = static_cast<float>(presentTex.width);
+            if (srcX >= maxW) srcW2 = 0.0f;
+            else if (srcX + srcW2 > maxW) srcW2 = maxW - srcX;
+        }
+        if (presentTex.height > 0)
+        {
+            const float maxH = static_cast<float>(presentTex.height);
+            if (srcY >= maxH) srcH2 = 0.0f;
+            else if (srcY + srcH2 > maxH) srcH2 = maxH - srcY;
+        }
+        if (srcW2 < 0.0f) srcW2 = 0.0f;
+        if (srcH2 < 0.0f) srcH2 = 0.0f;
         const bt3Rectangle srcRect{srcX + inset, srcY + inset, srcW2, flipY ? -srcH2 : srcH2};
         const bt3Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,

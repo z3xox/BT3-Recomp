@@ -1557,6 +1557,12 @@ namespace
     int g_locRegion = -1;   // [region]
     float g_curTexa[4] = {1.0f, 1.0f, 0.0f, 0.0f};   // [texacache] last uTexa pushed -- every writer must update it
     int g_locABl128 = -1;   // [ablend128]
+    // [animlog] P1-vs-P2 animation trace (PS2X_ANIMLOG=1). Only ever written from the draw loop,
+    // so a plain static pair is enough; the log prints on change, so these hold the last signature
+    // per half and the run reads as one line per animation step.
+    const bool s_animOn = [](){ const char *v = std::getenv("PS2X_ANIMLOG"); return v && v[0] && v[0] != '0'; }();
+    uint64_t s_animLast[2] = {};
+    int s_animN = 0;
     const GsGpuRenderer::DrawCmd *g_curDecalCmd = nullptr;
     bool g_decalUViz = false; float g_decalUVizMode = 1.f;   // [decaldbg 6/7]
     bt3RenderTexture2D g_decalSnap = {0}; unsigned g_decalSnapSrcTex = 0;   // [decalsync 3] silhouette snapshot
@@ -17690,6 +17696,44 @@ if (done.size() < 14 && !done.count(c.texKey))
                 src = bt3Rectangle{0, 0, 1, 1};
         if (c.destFbp == 224u && c.texKey != 0) g_f224Mark = 38;
             const bt3Rectangle dst{c.dx0 + offX, c.dy0 + offY, c.dx1 - c.dx0, c.dy1 - c.dy0};
+            // [animlog] P1-vs-P2 trace for the character-select cell animation (PS2X_ANIMLOG=1).
+            // Sits on the SPRITE path: the manual-quad path above is gated behind
+            // PS2X_SPR_MANUAL/sprDepth and never runs for UI sprites, so a logger there produces
+            // nothing at all. Prints on change per half, so an animation is a few lines.
+            //
+            // What to read off it: the sprite path takes its source rect from c.su0/sv0 RAW (the
+            // branch just above), while the manual-quad path normalises by texH/rsTexScale. So a
+            // 4x replacement here is sampled in NATIVE texel coordinates against a texture 4x
+            // larger -- the top-left quarter, magnified. div tells us whether that correction is
+            // in play: div=1 on a 4x-sized texture is the bug, and it would only bite P1 if P1's
+            // cell is the replaced one.
+            if (s_animOn && c.isTriangle && c.texKey != 0)
+            {
+                const int qx0 = (int)std::lround(c.dx0), qy0 = (int)std::lround(c.dy0);
+                const int qx1 = (int)std::lround(c.dx1), qy1 = (int)std::lround(c.dy1);
+                const int qsu = (int)std::lround(c.su1 - c.su0), qsv = (int)std::lround(c.sv1 - c.sv0);
+                const int qdv = (int)rsTexScale(tex.id);
+                const int half = ((qx0 + qx1) * 0.5f < 256.0f) ? 0 : 1;   // 512-wide GS frame
+                const uint64_t sig = ((uint64_t)(uint32_t)(qx1 - qx0) << 44)
+                                   ^ ((uint64_t)(uint32_t)(qy1 - qy0) << 26)
+                                   ^ ((uint64_t)(uint32_t)qsu << 13)
+                                   ^ ((uint64_t)(uint32_t)qsv << 3) ^ (uint64_t)qdv;
+                if (sig != s_animLast[half])
+                {
+                    s_animLast[half] = sig;
+                    if (s_animN < 3000)
+                    {
+                        ++s_animN;
+                        std::fprintf(stderr,
+                            "[anim] P%d fbp=%u dest=(%d,%d %dx%d) src=(%.0f,%.0f %dx%d) tex=%dx%d div=%d"
+                            " srcRect=(%.0f,%.0f %.0fx%.0f) blend=0x%02x tcc=%u key=%llu\n",
+                            half ? 2 : 1, (unsigned)c.destFbp, qx0, qy0, qx1 - qx0, qy1 - qy0,
+                            c.su0, c.sv0, qsu, qsv, tex.width, tex.height, qdv,
+                            (double)src.x, (double)src.y, (double)src.width, (double)src.height,
+                            (unsigned)c.blendMode, (unsigned)c.tcc, (unsigned long long)c.texKey);
+                    }
+                }
+            }
             {
                 static const bool s_hop = [](){ const char *v = std::getenv("PS2X_HOP336"); return v && v[0] && v[0] != '0'; }();
                 static int s_hn = 0;

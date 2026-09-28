@@ -70,6 +70,13 @@ namespace ps2x_settings
         // toggle applies the moment it is pressed, so it must not read as an unsaved change.
         bool musicMuted = false;
         bool forceBilinear = true;
+        // [ablend128] Full GS strength for texture-alpha blends (PS2X_ABLEND128). aBlend wants
+        // GS_As/128 while texture alpha arrives as GSbyte/255, so without it every texture-alpha
+        // blend runs at half strength (measured: a CLUT alpha-127 darkening applied at 0.498
+        // instead of 0.992). A replacement is uploaded byte-for-byte and never passes through the
+        // decoder's kAlpha128To255 expansion, so a full-range pack needs the full factor or every
+        // replaced sprite reads translucent. The env still wins.
+        bool ablend128 = true;
         bool texPack = false;
         bool introVideo = true;
             int buttonLayout = 1;

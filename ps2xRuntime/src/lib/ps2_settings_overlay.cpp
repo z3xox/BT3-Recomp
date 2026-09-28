@@ -665,6 +665,11 @@ static void exportRendererEnv(int renderer, bool texPack, bool forceBilinear)
     {
         setEnvDefault("PS2X_ALTGL", "1");
         setEnvDefault("PS2X_PGS", "0");
+        // [ablend128] Applied here rather than per family: a texture replacement is uploaded
+        // byte-for-byte and never gets the decoder's PS2->PC alpha expansion, so a full-range pack
+        // needs the full GS blend factor or every replaced sprite reads translucent. The narrower
+        // per-family scopes (PS2X_ABLEND128=2..5) stay reachable through the env.
+        setEnvDefault("PS2X_ABLEND128", "1");
         return;
     }
 #if defined(PS2X_HAVE_PGS)

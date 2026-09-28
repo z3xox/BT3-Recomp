@@ -173,6 +173,7 @@ namespace
     s.musicMuted = doc.getB("frontend.music_muted", s.musicMuted);
         s.windowH = doc.getI("video.window_h", s.windowH);
         s.forceBilinear = doc.getB("video.force_bilinear", s.forceBilinear);
+        s.ablend128 = doc.getB("video.ablend128", s.ablend128);
 
         s.fps60 = doc.getB("video.fps60", s.fps60);
         s.showPerf = doc.getB("video.show_perf", s.showPerf);
@@ -270,6 +271,7 @@ namespace
                 else if (key == "window_w") s.windowW = asInt(s.windowW);
                 else if (key == "window_h") s.windowH = asInt(s.windowH);
                 else if (key == "force_bilinear") s.forceBilinear = b;
+                else if (key == "ablend128") s.ablend128 = b;
                 else if (key == "texture_pack") s.texPack = b;
                 else if (key == "intro_video") s.introVideo = b;
                 else if (key == "button_layout") s.buttonLayout = asInt(s.buttonLayout);
@@ -328,7 +330,7 @@ namespace ps2x_settings
                a.inkColor == b.inkColor && a.shadows == b.shadows && a.dofBlur == b.dofBlur &&
                a.dofZFar == b.dofZFar && a.fullscreen == b.fullscreen && a.windowMode == b.windowMode &&
                a.monitor == b.monitor && a.gpu == b.gpu && a.widescreen == b.widescreen && a.windowW == b.windowW &&
-               a.windowH == b.windowH && a.forceBilinear == b.forceBilinear && a.texPack == b.texPack &&
+               a.windowH == b.windowH && a.forceBilinear == b.forceBilinear && a.ablend128 == b.ablend128 && a.texPack == b.texPack &&
                a.introVideo == b.introVideo &&
                a.buttonLayout == b.buttonLayout && a.fps60 == b.fps60 && a.showPerf == b.showPerf &&
                a.hudOffL == b.hudOffL && a.hudOffC == b.hudOffC && a.hudOffR == b.hudOffR &&
@@ -455,6 +457,7 @@ namespace ps2x_settings
         os << "window_w = " << fmtInt(s.windowW) << "\n";
         os << "window_h = " << fmtInt(s.windowH) << "\n";
         os << "force_bilinear = " << fmtBool(s.forceBilinear) << "\n";
+        os << "ablend128 = " << fmtBool(s.ablend128) << "\n";
         os << "fps60 = " << fmtBool(s.fps60) << "\n";
         os << "show_perf = " << fmtBool(s.showPerf) << "\n\n";
 
@@ -554,6 +557,7 @@ namespace ps2x_settings
         out.windowW = live.windowW;
         out.windowH = live.windowH;
         out.forceBilinear = live.forceBilinear;
+        out.ablend128 = live.ablend128;
         out.fps60 = live.fps60;
         out.showPerf = live.showPerf;
         out.hudLayout = live.hudLayout;

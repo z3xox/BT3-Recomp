@@ -8410,10 +8410,18 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
           for (size_t i = 0; i + 2 < v.size(); i += 64)
               if (v[i] > 14 || v[i + 1] > 14 || v[i + 2] > 14) { black = false; break; }
           g_texBlack[u.key] = black;
+          // [gateasset] A pack REPLACEMENT is an upscale, so its alpha edges interpolate and this
+          // census calls it non-binary -- and that census is the GATE on the DATE emulation (both
+          // readers below require binaryAlpha), so a non-binary replacement silently DISABLES the
+          // destination-alpha test. The health/ki fill then paints with no gate and the bar looks
+          // like it never drops. When the native decode this replacement stands in for is
+          // two-level, the alpha is STRUCTURAL, not shading: the pack's art still draws, but the
+          // alpha channel is asked to behave like the native's. PS2X_TEXGATE=0 restores the census.
           bool binA = true;
           for (size_t i = 3; i < v.size(); i += 64)
               if (v[i] > 32 && v[i] < 224) { binA = false; break; }
-          g_texAlphaBinary[u.key] = binA; }
+          static const bool s_gateAsset = [](){ const char *e = std::getenv("PS2X_TEXGATE"); return !(e && e[0] == '0'); }();
+          g_texAlphaBinary[u.key] = binA || (s_gateAsset && u.alphaSnap > 0.5f); }
         glUploadOne(u); g_glTexGen[u.key] = u.gen;   // [texclobber]
     }
     if (!s_ups.empty())

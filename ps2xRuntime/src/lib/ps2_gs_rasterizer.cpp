@@ -3735,6 +3735,18 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                                      id.name().c_str(), aLo, aHi, rfmt, 255.0f / std::max(aHi, 1.0f), upSnap);
                     }
                     rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = useScale;
+                    // [gateasset] Flag this key as a GATE ASSET so the renderer treats the
+                    // replacement as binary-alpha. The pack is an UPSCALE: its alpha edges are
+                    // interpolated, the renderer's binary-alpha census calls that non-binary, and
+                    // that census is the GATE on the DATE emulation (see g_texAlphaBinary's
+                    // readers). Non-binary => the emulation is skipped => the health/ki fill paints
+                    // with no gate at all and the bar never drops. The pack's art still draws on
+                    // top; only the alpha CHANNEL is asked to behave like the native's, which is
+                    // what the native two-level decode would have produced. Reuses alphaSnap, whose
+                    // shader component (uAlphaFix.y) is unused since the snap was reverted.
+                    // PS2X_TEXGATE=0 turns it off and restores the previous behaviour.
+                    if (gateAlpha)
+                        upSnap = 1.0f;
                     // [texreplace] Alpha handling, in two parts.
                     //
                     // SCALE, from the replacement's MEASURED maximum rather than a hardcoded 255/128.

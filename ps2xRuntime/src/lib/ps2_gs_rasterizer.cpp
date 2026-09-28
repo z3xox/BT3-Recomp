@@ -3734,6 +3734,46 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                                      "%.0f..%.0f of 255 (fmt %d) -- scale %.4f, snap %.0f\n",
                                      id.name().c_str(), aLo, aHi, rfmt, 255.0f / std::max(aHi, 1.0f), upSnap);
                     }
+                    // [texreplace] THE PACK LOST THE MASK -- keep the native texture.
+                    //
+                    // The health/ki bar's partial fill is not the DATE gate; it is a plain alpha
+                    // TEST (measured on the bar rect: at=1, ATST=NOTEQUAL, AREF=0 -- discard where
+                    // texture alpha is zero). The native texture carries the bar's SHAPE in its
+                    // alpha: 0 in the part that is not filled, opaque in the part that is. So the
+                    // drain is the test passing more texels as health drops.
+                    //
+                    // This pack's version of that texture is 100% alpha 128 (measured: 262158/262158
+                    // texels, min=max=128 -- not one clear texel in the file). With no zero left,
+                    // "alpha != 0" discards NOTHING and the bar renders completely full: the health
+                    // bar drew as a solid block, and the ki bar never drained either. No blend, gate
+                    // or shader change can recover it, because the data the test reads is simply not
+                    // in the file.
+                    //
+                    // So: when the texture is a gate asset (native two-level, decided above) AND
+                    // the replacement has NO clear texels at all, the pack has flattened the mask.
+                    // Keep the native decode -- correct bar, original art. This is deliberately
+                    // narrower than "gate asset": a replacement that still has both levels keeps
+                    // its art and is unaffected, which is the common case and the one that works.
+                    // PS2X_TEXMASK=0 disables.
+                    bool packLostMask = false;
+                    {
+                        static const bool s_maskOn = [](){ const char *v = std::getenv("PS2X_TEXMASK"); return !(v && v[0] == '0'); }();
+                        // A clear texel is one a `!= 0` alpha test would discard. Allow a little
+                        // slack for a DXT5 block's interpolated edge (the pack's soft edges land in
+                        // the low bucket), but a texture with no texel under it has no mask.
+                        packLostMask = gateAlpha && s_maskOn && (aLo >= 16.0f);
+                    }
+                    if (packLostMask)
+                    {
+                        static std::atomic<unsigned long> s_lost{0};
+                        if (s_lost.fetch_add(1) < 5)
+                            std::fprintf(stderr, "[texreplace] LOST-MASK %s: replacement alpha is %.0f..%.0f "
+                                     "-- no clear texel, the alpha test that drains the bar has nothing to "
+                                     "discard; keeping the native texture\n",
+                                     id.name().c_str(), aLo, aHi);
+                    }
+                    else
+                    {
                     rgba = std::move(rep); upW = rw; upH = rh; upFmt = rfmt; upScale = useScale;
                     // [gateasset] Flag this key as a GATE ASSET so the renderer treats the
                     // replacement as binary-alpha. The pack is an UPSCALE: its alpha edges are
@@ -3779,6 +3819,7 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                         std::fprintf(stderr, "[texreplace] hit #%lu %s -> %dx%d (%dx)\n",
                                      k, id.name().c_str(), rw, rh, useScale);
                     }
+                    }   // packLostMask
                 }
             }
             else

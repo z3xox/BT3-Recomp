@@ -210,7 +210,15 @@ def range_registrar(struct_name: str, csv_path: Path, comment: str) -> str:
 # 0x34c0b0: inside f_34bf60 (0x34bf60-0x34c0d8); hit live on 2026-09-05 ("No exact recompiled function for
 # guest PC 0x34c0b0", ~24k times in one session) and fixed by hand with fixgap.py in the dev tree only --
 # users regenerate from this file, so it lives here now.
-MID_FUNCTION_ENTRIES = (0x341358, 0x34c0b0)
+# 0x39aaa0: inside f_39aa20 (0x39aa20-0x39aae0) at `sll $a3, $s1, 5`, the middle of a straight-line
+# argument-setup sequence. Item Shop (state 0x32) black-screened and hung, dispatching here ~268k times
+# per session.
+# 0x36fbc0: inside f_36fb48 (0x36fb48-0x36fc00). Ultimate Battle's submenu (0xd->0xe->0xf) hung the same
+# way, ~300k iterations. Same mechanism, different screen -- which is why both are listed here rather
+# than chasing them one at a time.
+# See docs/ITEM-SHOP-CRASH.md. Note these addresses are inside DBZP.BIN (mapped 0x334c00..0x3be71c),
+# not the main ELF, so readelf on SLUS_216.78 alone will not show that they are code at all.
+MID_FUNCTION_ENTRIES = (0x341358, 0x34c0b0, 0x39aaa0, 0x36fbc0)
 
 
 def register_mid_function_entries(lines: list, reg: str, addrs) -> tuple:

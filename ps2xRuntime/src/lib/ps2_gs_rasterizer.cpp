@@ -3755,13 +3755,25 @@ void GSRasterizer::applyTexReplacement(const uint8_t *vram, const GSTex0Reg &tex
                     // narrower than "gate asset": a replacement that still has both levels keeps
                     // its art and is unaffected, which is the common case and the one that works.
                     // PS2X_TEXMASK=0 disables.
+                    //
+                    // ONLY WITH THE PACK ON. Without a replacement this correction is
+                    // meaningless -- the native texture already carries the mask -- and a run with
+                    // the pack off showed the health-bar frames coming apart, which this branch is
+                    // not entitled to cause. The block already sits under texPackEnabled(), but
+                    // uiFlag() lets the settings overlay outrank the env, so PS2X_TEXPACK=0 alone
+                    // does not reliably close it. Test the LIVE state here as well, so the
+                    // correction can only ever apply to a texture a pack actually replaced.
+                    const bool maskAllowed = [](){
+                        const char *v = std::getenv("PS2X_TEXMASK");
+                        if (v && v[0] == '0') return false;
+                        return GsGpuRenderer::texPackEnabled() && ps2tex::replacementsEnabled();
+                    }();
                     bool packLostMask = false;
                     {
-                        static const bool s_maskOn = [](){ const char *v = std::getenv("PS2X_TEXMASK"); return !(v && v[0] == '0'); }();
                         // A clear texel is one a `!= 0` alpha test would discard. Allow a little
                         // slack for a DXT5 block's interpolated edge (the pack's soft edges land in
                         // the low bucket), but a texture with no texel under it has no mask.
-                        packLostMask = gateAlpha && s_maskOn && (aLo >= 16.0f);
+                        packLostMask = gateAlpha && maskAllowed && (aLo >= 16.0f);
                     }
                     if (packLostMask)
                     {

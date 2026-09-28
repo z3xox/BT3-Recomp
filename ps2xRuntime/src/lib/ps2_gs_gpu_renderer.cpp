@@ -35,6 +35,7 @@
 #include "gfx/image_io.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"   // [crtcdisp] GSRegisters (the CRTC registers are memory-mapped)
+#include "runtime/ps2_texreplace.h"   // [texgate] replacementsEnabled(): the gate-asset override must be pack-only
 
 #if defined(_WIN32)
 // [d3d11] Native GS backend scaffolding. The shader HLSL port and the gfx layer exist; the
@@ -8420,7 +8421,13 @@ unsigned int GsGpuRenderer::renderAndGetTextureId(int fbWidth, int fbHeight)
           bool binA = true;
           for (size_t i = 3; i < v.size(); i += 64)
               if (v[i] > 32 && v[i] < 224) { binA = false; break; }
-          static const bool s_gateAsset = [](){ const char *e = std::getenv("PS2X_TEXGATE"); return !(e && e[0] == '0'); }();
+          static const bool s_gateAssetEnv = [](){ const char *e = std::getenv("PS2X_TEXGATE"); return !(e && e[0] == '0'); }();
+          // AND ONLY WITH THE PACK ON. alphaSnap is set by the replacement path, so a native
+          // texture never carries it -- but uiFlag() lets the settings overlay outrank
+          // PS2X_TEXPACK=0, so the pack can be live while the env says otherwise. Re-check the
+          // live state instead of trusting the marker: with the pack off this must be the plain
+          // census, or the health-bar frames come apart on native textures.
+          const bool s_gateAsset = s_gateAssetEnv && texPackEnabled() && ps2tex::replacementsEnabled();
           g_texAlphaBinary[u.key] = binA || (s_gateAsset && u.alphaSnap > 0.5f); }
         glUploadOne(u); g_glTexGen[u.key] = u.gen;   // [texclobber]
     }

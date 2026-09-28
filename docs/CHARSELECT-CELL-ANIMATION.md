@@ -1,102 +1,87 @@
-# Character-select cell animation — OPEN
+# Character-select cell "animation" — NOT an animation: the widescreen HUD squeeze
 
-The selected roster cell is drawn at the wrong vertical scale for a short run of frames after the
-screen changes. **It is still open.** It is cosmetic, it is pre-existing, and it only ever happens
-on the OpenGL present — paraLLEl-GS renders it correctly.
+**Status: root-caused and the roster-select half is FIXED. The fight half is unvalidated.**
+**Date: 2026-09-27/28.**
 
-## What it looks like
+## The short version
 
-`docs/img/celldeform-1p.png` — the cell under the cursor is drawn stretched, the X placeholders
-overflow their boxes.
+The "the cursor cell is drawn at the wrong scale for ~16 frames" artifact is **not the game's
+selected-cell grow animation** and **not a texture-replacement problem**. It is the **widescreen HUD
+squeeze** (`g_ps2xWsHudInv`, the `[wshud]` path in `ps2_gs_gpu_renderer.cpp`) running on the roster
+screen, where it has no business running. Roster select has a 3D sky/terrain background, so the
+squeeze's "this frame has a depth-compared 3D triangle" heuristic is TRUE there and squeezes the
+strip. The 1P label and the two cursor-adjacent cells get compressed 1.44x (`inv=0.694`) and the
+portraits fall out of their own cell borders.
 
-`docs/img/celldeform-ref.png` — the same frame index range once it has settled; this is what it
-should look like.
+The squeeze exists because in true widescreen the 3D scene is pre-squeezed by the projection patch
+and un-squeezed at the present, so the **fight HUD bars** — authored for 4:3 — must be squeezed
+back or they come out too wide (confirmed by the user: with the squeeze off the fight bars are
+"much wider"). Nothing else wants that. Roster select's strip is authored to the full 4:3 width.
 
-Both are frames out of a 60 fps capture of the roster strip
-(`Videocaptura de pantalla_20260927_212100.webm`, 1596x141, 72 frames after the first second).
-Frame 47 is inside the deformed run, frame 62 is the settled reference.
+## Evidence, measured not eyeballed
 
-## Measured, not eyeballed
+The user supplied two same-instant captures of the roster strip (`Captura de pantalla_20260927_233120`
+and `_233345`; portraits differ only because a different roster line was selected). Per-image
+measurements (so the different crop offsets do not matter — only within-image ratios):
 
-The vertical extent of the near-black cell box in each of the five roster cells, per frame:
+| | 233120 | 233345 | ratio |
+| --- | --- | --- | --- |
+| 1P label width | 74 px | 83 px | 1.12x |
+| 1P label height | 39 px | 48 px | 1.23x |
+| cell pitch | 157 px | 188 px | **1.20x** |
+| strip band height | 117 px | 117 px | 1.00x (unchanged) |
 
-| cell | frames 46-59 (deformed) | frame 62 (reference) |
-| --- | --- | --- |
-| 0 — the cursor cell | 116 px | 119 → 120 → **122 px** |
-| 1 | 116 | 116 |
-| 2 | 116 | 116 |
-| 3 | 122 | 122 |
-| 4 | 116 | 116 |
+The 1P glyphs grow, the cell pitch grows, the strip frame does not. `inv = 0.694` ⇒ the squeeze
+magnifies by `1/0.694 = 1.44x`, which is the scale of the defect.
 
-Cells 1-4 are pixel-stable across the whole capture; the cell **width** is a constant 273 px in all
-72 frames. Only cell 0 moves, and it grows into a 122 px box as the selection settles — which is
-the game's own selected-cell grow animation. So the artifact is not the grid deforming, it is the
-**cursor cell's animation** being drawn at the wrong scale, and it lasts ~16 frames (~260 ms) from
-the screen transition.
+## The fix (in `ps2_gs_gpu_renderer.cpp`, the `[wshud]` block)
 
-Note the run is 46-61, not a microsecond. The first reading of this ("a microsecond") came from
-eyeballing a crop; the per-frame measurement is what corrected it.
-
-## Ruled out
-
-- **The present.** `PS2X_PRESENTLOG=1` shows two geometry changes for an entire run:
-  `src=(0.0,64.0 512x448)` inside a 512-wide texture, then nothing. No alternation.
-- **`displayWidth`/`displayHeight` scissor extents.** Fixed in `6f5b8a6` — a 640-wide extent was
-  being presented from a 512-wide texture (128 columns past the end), and a short extent was
-  scaling tall. Both clamped now, and the oscillation is gone.
-- **Texture replacement.** Reproduces with the pack on and off, and with
-  `PS2X_ABLEND128=1`.
-
-## Where to look next
-
-The strongest lead, and the reason this file exists, is that **P1 has it and P2 does not** — which
-points at a difference between the two halves rather than at the animation itself.
-
-### 1. The integer UV divisor on the sprite path
-
-`ps2_gs_gpu_renderer.cpp`, the sprite branch of the draw:
+Gate the squeeze on the game's **own top-level state** instead of the draw-call heuristic:
 
 ```cpp
-else if (c.texKey != 0)
-    src = bt3Rectangle{c.su0, c.sv0, c.su1 - c.su0, c.sv1 - c.sv0};   // RAW
+extern std::atomic<uint32_t> g_bt3StateLive;              // existing, refreshed every tick by the run loop
+const uint32_t wsState = g_bt3StateLive.load(std::memory_order_relaxed);
+const bool wsInFight  = (wsState == 0x2du);              // 0x2D == IN_FIGHT
+...
+if (wsInFight && s_wsActive) wsHudInv = g_ps2xWsHudInv;
 ```
 
-The manual-quad path next door normalises by `texH / rsTexScale`; the sprite path does not. A 4x
-replacement sampled in native-texel coordinates against a texture 4x larger is the top-left quarter,
-magnified. `rsTexScale` is the flag to read: **`div=1` on a 4x-sized texture would be the bug**,
-and it would only bite P1 if P1's cell is the replaced one.
+`g_bt3StateLive` was already the established cross-file signal (this file already read it for the
+loading/0x2d probes). The 3D-frame heuristic is kept only as a *secondary arm* so unrecognised
+duellist states (training 0x2c, ultimate 0x0d) can still opt in, but the state gate must be true to
+apply the squeeze at all — so a menu can never be squeezed regardless of its 3D background.
 
-A diagnostic for this exists and is what the next step should run: `PS2X_ANIMLOG=1` logs, per half
-of the screen, the dest rect, the source extent, the texture size and the divisor, on change.
-**It has not produced output yet** — see the note below.
+State names come from the one canonical table in `game_overrides.cpp` (`bt3StateName`):
+`0x27 = CHARACTER_SELECT`, `0x2D = IN_FIGHT`, `0x2C = ULTIMATE_TRAINING`, `0x0D = ULTIMATE_BATTLE`.
+The comment at `game_overrides.cpp:2990` warns there used to be two disagreeing tables; this is that
+one table.
 
-### 2. The gate build is not separated in the cache (paraLLEl-GS's answer)
+## What is verified and what is not
 
-paraLLEl-GS identifies an alpha-only write — a gate build, `FBMSK`'s RGB mask at `0xffffff`:
+- **Roster select: FIXED.** With the state gate, the 1P and the cell row render at correct
+  proportions, no 1.20x pitch, no 1.23x 1P. User-confirmed.
+- **Fight: NOT yet validated.** The verification run never reached a fight — `PS2X_MENU_JUMP=39`
+  stops at roster select, and the `[wsstate]` log shows only `0x01` (BOOT) and `0x27`
+  (CHARACTER_SELECT). `0x2D` never appeared, so the squeeze stayed OFF the whole run and the bars
+  were unsqueezed. **This is a test-harness gap, not a code failure.** The next step is a run that
+  actually enters a duel, and confirm the state flips to `0x2D` in `[wsstate]` and the bars regain
+  correct proportions.
 
-```cpp
-// parallel-gs/gs/gs_interface.cpp:1289
-desc.alpha_only_write = ((ctx.frame.desc.FBMSK & 0x00ffffffu) == 0x00ffffffu) ? 1u : 0u;
-// parallel-gs/gs/gs_renderer.cpp:1391
-if (replacement_iface && desc.samples == 1 && !desc.alpha_only_write)
-// parallel-gs/gs/gs_interface.cpp:1622
-hasher.u32(desc.alpha_only_write);   // gate builds cache separately from colour uses
-```
+A first attempt used a call-count disarm (turn the squeeze off after N render calls with no 3D)
+instead of the state gate. The user caught that it made the artifact reappear during a
+cell over-expand. That approach is **reverted**; the state gate is the fix.
 
-It excludes the gate from replacement **and keys the texture cache on the flag**, so a gate build
-and a colour use can never share a cache entry. That is why the cell's gate always carries the
-game's own current shape and the animation never lags on Vulkan.
+## Diagnostic
 
-The OpenGL path has the replacement half of this — `rawAlphaDec`, and
-`allowed = g_subDxW == 0 && !rawAlphaDec` — but **no cache key on the gate/colour distinction**.
-The cell highlight is exactly a gate build plus colour fills drawn through it, which is the shape
-of the bug.
+- `PS2X_WSNOHUD=<existing-file>` forces the squeeze off (renderer half). With it, roster select was
+  clean — that is how the squeeze was identified as the cause.
+- `[wsstate]` (new, in this fix) logs the state and whether the squeeze is a candidate.
 
-## Note on the diagnostic
+## Notes / prior history still valid
 
-`PS2X_ANIMLOG` was placed twice in the wrong branch and logged nothing before that was found, so
-its output has not been trusted yet. It is now on the sprite path, but **it has not been seen to
-print a single line** even on the character-select screen — so either the sprite branch is itself
-gated away for these draws, or the draws do not satisfy the `isTriangle && texKey != 0` filter.
-That is the first thing to settle, and it needs no new logging: widen the filter to unconditional
-and confirm the path emits at all before reading anything into the numbers.
+- The present crop oscillation was already fixed separately (`6f5b8a6`, `[presentclamp]`) and is not
+  this bug.
+- Texture replacement is ruled out: reproduces with the pack on and off.
+- The doc's earlier "cell width is a constant 273 px" figure was measured on a differently-scaled
+  capture; the invariant that matters is **equal pitch within a frame**, which holds in the good
+  frames and breaks in the bad ones (157→188).

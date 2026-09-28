@@ -10188,6 +10188,25 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             static bool s_wsFrameHad3d = false, s_wsActive = false;
             static int s_wsNo3dRun = 0;
             const uint64_t gen = m_segMode ? g_publishGen : (uint64_t)(++s_wsCallGen);
+            // [wsstate] THE SQUEEZE IS A FIGHT-ONLY FIX. In true widescreen the 3D scene is
+            // pre-squeezed by the projection patch and un-squeezed at present; the fight HUD bars
+            // are authored for 4:3 and must be squeezed back or they come out too wide. Nothing
+            // else wants that. Roster select (state 0x27 CHARACTER_SELECT) is the counter-example:
+            // its strip -- the 1P label and the cell row -- is authored to the full 4:3 width, and
+            // squeezing it is the P1 cell-animation artifact (the 1P and the two cursor-adjacent
+            // cells measured ~1.2x with the portraits out of their own borders). Roster select has
+            // a 3D sky/terrain background, so the old "a depth-compared triangle is present" test
+            // is TRUE there and ran the squeeze on the menu strip. Gate on the game's OWN
+            // top-level state instead: 0x2D is IN_FIGHT. g_bt3StateLive is the existing atomic the
+            // run loop refreshes every tick and that this file already reads (loading/0x2d probes
+            // below), so the squeeze now follows the game, not a heuristic over draw calls.
+            extern std::atomic<uint32_t> g_bt3StateLive;
+            const uint32_t wsState = g_bt3StateLive.load(std::memory_order_relaxed);
+            const bool wsInFight = (wsState == 0x2du);
+            // Keep the draw-call heuristic as a SECONDARY arm so an unrecognised/unprobed state
+            // (0x2d is not the only duellist state; training 0x2c, ultimate 0x0d) still gets the
+            // squeeze from real 3D frames, but require the state gate to be true to apply it at
+            // all -- so a menu can never be squeezed regardless of its background.
             if (s_wsGen != gen)
             {   // frame boundary: fold the finished frame's verdict into the sticky state
                 if (s_wsGen != ~0ull)
@@ -10200,7 +10219,12 @@ static const unsigned g_zpassPsm = [](){ const char *v = std::getenv("PS2X_ZPASS
             if (!s_wsFrameHad3d)
                 for (const DrawCmd &pc : DC)
                     if (pc.isTriangle && !pc.isTransfer && pc.depthTest && pc.depthFunc >= 2u) { s_wsFrameHad3d = true; break; }
-            if (s_wsActive) wsHudInv = g_ps2xWsHudInv;
+            if (wsInFight && s_wsActive) wsHudInv = g_ps2xWsHudInv;
+            { static uint32_t s_wsLastState = 0xffffffffu;
+              if (wsState != s_wsLastState)
+              { s_wsLastState = wsState;
+                std::fprintf(stderr, "[wsstate] state=0x%02X squeeze=%s\n",
+                             (unsigned)wsState, wsInFight ? "candidate" : "OFF"); } }
         }
     }
     const size_t ciEnd = std::min(DC.size(), m_stopAt);   // [deferdec] split point
@@ -17707,8 +17731,16 @@ if (done.size() < 14 && !done.count(c.texKey))
             // larger -- the top-left quarter, magnified. div tells us whether that correction is
             // in play: div=1 on a 4x-sized texture is the bug, and it would only bite P1 if P1's
             // cell is the replaced one.
-            if (s_animOn && c.isTriangle && c.texKey != 0)
-            {
+            if (s_animOn)
+            {   // UNCONDITIONAL. The old `&& c.isTriangle && c.texKey != 0` printed nothing on any
+                // screen, so the numbers could never be trusted. An unfiltered tracer plus the
+                // liveness counter below separates "this branch never runs for UI sprites" from
+                // "it runs and the filter never matched" -- the two were indistinguishable before.
+                static unsigned long s_animReach = 0, s_animTri = 0, s_animTex = 0;
+                ++s_animReach; if (c.isTriangle) ++s_animTri; if (c.texKey != 0) ++s_animTex;
+                if ((s_animReach % 400) == 0)
+                    std::fprintf(stderr, "[anim] sprite branch reached %lu draws (isTriangle %lu, texKey!=0 %lu)\n",
+                                 s_animReach, s_animTri, s_animTex);
                 const int qx0 = (int)std::lround(c.dx0), qy0 = (int)std::lround(c.dy0);
                 const int qx1 = (int)std::lround(c.dx1), qy1 = (int)std::lround(c.dy1);
                 const int qsu = (int)std::lround(c.su1 - c.su0), qsv = (int)std::lround(c.sv1 - c.sv0);
@@ -19996,9 +20028,14 @@ if (done.size() < 14 && !done.count(c.texKey))
                                     (unsigned char)((v >> 8) & 0xFF), (unsigned char)((v >> 16) & 0xFF), 255});
                             }
                         gsFlipVertical(ia); gsFlipVertical(ic);
-                        char pa[192], pc[192];
-                        std::snprintf(pa, sizeof pa, "/home/z3/Desktop/bt3/work/shots/alpha_fbp%u.png", fbp);
-                        std::snprintf(pc, sizeof pc, "/home/z3/Desktop/bt3/work/shots/rgb_fbp%u.png", fbp);
+                        // Dump into PS2X_SHOT_DIR when it is set. The hardcoded path below only
+                        // exists on the machine this was last developed on, so on any other box
+                        // every write silently failed and only the stderr line came out.
+                        static const char *s_dmpDir = std::getenv("PS2X_SHOT_DIR");
+                        const char *dmpDir = (s_dmpDir && s_dmpDir[0]) ? s_dmpDir : "/home/z3/Desktop/bt3/work/shots";
+                        char pa[320], pc[320];
+                        std::snprintf(pa, sizeof pa, "%s/alpha_fbp%u.png", dmpDir, fbp);
+                        std::snprintf(pc, sizeof pc, "%s/rgb_fbp%u.png", dmpDir, fbp);
                         gsExportImage(ia, pa); gsExportImage(ic, pc);
                         gsUnloadImage(ia); gsUnloadImage(ic);
                         std::fprintf(stderr, "[alphadump] wrote alpha_fbp%u.png / rgb_fbp%u.png\n", fbp, fbp);

@@ -8683,11 +8683,27 @@ void PS2Runtime::run()
             if (inv < 0.4f) inv = 0.4f; if (inv > 1.0f) inv = 1.0f;
             if (wsNoHud()) inv = 1.0f;       // [wslever] renderer half off
             g_ps2xWsHudInv = inv;
+            // [wsinv] The renderer reads g_ps2xWsHudInv during the draws, which happen BEFORE this
+            // point in the same call (renderAndGetTextureId). So a change here lands on the NEXT
+            // frame's draws -- the frame that presents with the new stretch was drawn with the old
+            // one. Log on change so the transition (and its one-frame lag) is visible.
+            { static float s_invLast = -1.0f;
+              if (inv != s_invLast)
+              {
+                  std::fprintf(stderr, "[wsinv] %.4f -> %.4f  (src %ux%u dst %ux%u win %dx%d)\n",
+                               s_invLast, inv, (unsigned)srcWidth, (unsigned)srcHeight,
+                               (unsigned)dstWidth, (unsigned)dstHeight,
+                               bt3GetScreenWidth(), bt3GetScreenHeight());
+                  s_invLast = inv;
+              } }
         }
         else
         {
             extern float g_ps2xWsHudInv;
             g_ps2xWsHudInv = 1.0f;   // letterbox mode: no HUD squeeze
+            { static float s_invLast = -1.0f;
+              if (s_invLast != 1.0f)
+              { s_invLast = 1.0f; std::fprintf(stderr, "[wsinv] %.4f -> 1.0000  (letterbox)\n", 1.0f); } }
         }
 #endif
         // Atlas mode presents a sub-rect of the big atlas texture -> crop from the display slot origin.

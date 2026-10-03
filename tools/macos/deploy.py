@@ -114,6 +114,27 @@ def dylib_closure(binary, frameworks):
             run("install_name_tool", "-change", dep, f"@rpath/{name}", cur)
 
 
+def bundle_moltenvk(build, frameworks):
+    """[moltenvk] The native Vulkan renderer dlopens MoltenVK at run time, so the link closure never sees it.
+    Copy the library the build found (PS2X_MOLTENVK_LIBRARY in the CMake cache); without it the runner
+    still works, on OpenGL only."""
+    cache = build / "CMakeCache.txt"
+    lib = None
+    if cache.is_file():
+        for line in cache.read_text(errors="replace").splitlines():
+            if line.startswith("PS2X_MOLTENVK_LIBRARY:"):
+                value = line.split("=", 1)[1].strip()
+                if value and not value.endswith("-NOTFOUND"):
+                    lib = Path(value).resolve()
+    if not lib or not lib.is_file():
+        print("MoltenVK not bundled: the native Vulkan renderer will be unavailable")
+        return
+    dst = frameworks / "libMoltenVK.dylib"
+    shutil.copy2(lib, dst)
+    dst.chmod(0o755)
+    run("install_name_tool", "-id", "@rpath/libMoltenVK.dylib", dst)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iso", type=Path, help="BT3 USA ISO (SLUS-21678)")
@@ -170,6 +191,7 @@ def main():
         (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
         make_icns(resources / "assets/icon.png", resources / "BT3-Recomp.icns", Path(tmp))
         dylib_closure(bundled_runner, app / "Contents/Frameworks")
+        bundle_moltenvk(build, app / "Contents/Frameworks")
         binaries = audit(app, args.deployment_target)
         # Sign inside out: the runner and every deployed dylib.
         for binary in sorted(binaries, key=lambda p: len(p.parts), reverse=True):

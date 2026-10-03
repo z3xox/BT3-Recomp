@@ -1128,8 +1128,37 @@ if (NOT PS2X_GRANITE_DIR)
     endif()
 endif()
 set(_seamvk OFF)
-if (NOT PS2X_DISABLE_SEAMVK AND EXISTS "${PS2X_GRANITE_DIR}/CMakeLists.txt" AND EXISTS "${PS2X_GRANITE_DIR}/third_party/volk/volk.c" AND NOT (APPLE AND NOT PS2X_FORCE_PGS))
+# [moltenvk] On macOS the native renderer runs on MoltenVK (Vulkan over Metal). It renders off-screen and
+# hands the frame to the OpenGL present, so no Vulkan surface is involved. Granite dlopens the library at
+# run time (seamvk points GRANITE_VULKAN_LIBRARY at the bundled copy); here it only has to exist so the
+# deploy step can bundle it. brew install molten-vk.
+set(_seamvk_platform_ok ON)
+if (APPLE)
+    find_library(PS2X_MOLTENVK_LIBRARY NAMES MoltenVK HINTS /opt/homebrew/lib /usr/local/lib)
+    if (NOT PS2X_MOLTENVK_LIBRARY)
+        set(_seamvk_platform_ok OFF)
+        message(STATUS "[seamvk] MoltenVK not found (brew install molten-vk): no Vulkan renderer on macOS")
+    endif()
+endif()
+if (NOT PS2X_DISABLE_SEAMVK AND _seamvk_platform_ok AND EXISTS "${PS2X_GRANITE_DIR}/CMakeLists.txt" AND EXISTS "${PS2X_GRANITE_DIR}/third_party/volk/volk.c")
     set(_seamvk ON)
+endif()
+if (_seamvk AND APPLE)
+    # [moltenvk] Granite's sleep_until_nsecs() uses clock_nanosleep/TIMER_ABSTIME, which macOS lacks.
+    # Same scheme as the [pgs patches] above: detect the marker, apply once, never reset.
+    file(READ "${PS2X_GRANITE_DIR}/util/timer.cpp" _tsrc)
+    string(FIND "${_tsrc}" "PS2X_MACOS_SLEEP" _thas)
+    unset(_tsrc)
+    if (_thas EQUAL -1)
+        execute_process(COMMAND git -c safe.directory=* -C "${PS2X_GRANITE_DIR}" apply --ignore-whitespace
+                                "${CMAKE_CURRENT_SOURCE_DIR}/patches/granite-macos-sleep.patch"
+                        RESULT_VARIABLE _tres ERROR_VARIABLE _terr)
+        if (NOT _tres EQUAL 0)
+            message(FATAL_ERROR "[moltenvk] granite-macos-sleep.patch did not apply to ${PS2X_GRANITE_DIR}:\n${_terr}")
+        endif()
+        message(STATUS "[moltenvk] granite-macos-sleep patch applied")
+    endif()
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_MOLTENVK_LIBRARY="${PS2X_MOLTENVK_LIBRARY}")
 endif()
 if (_seamvk)
     if (NOT TARGET granite-vulkan)

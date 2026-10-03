@@ -25,6 +25,7 @@
 #include "sampler.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <deque>
 #include <thread>
 #include <condition_variable>
@@ -1301,6 +1302,9 @@ namespace seamvk
         uint64_t g_streamDispfb1 = 0; bool g_haveStreamFlip = false;
         std::atomic<uint32_t> g_presentW{0}, g_presentH{0};
         extern "C" bool ps2xStage1FenceC();
+#if defined(__APPLE__)
+        extern "C" const char *ps2xExeDirC();   // main.cpp: resolved executable dir (honors PS2X_EXEDIR)
+#endif
         bool ensureOwnDevice()
         {
             static thread_local bool t_reg = false;
@@ -1310,6 +1314,21 @@ namespace seamvk
             if (!g_own) g_own = new OwnDevice();
             g_own->failed = true;
             auto fail = [](const char *why) { std::fprintf(stderr, "[seamvk] %s -- native renderer unavailable\n", why); return false; };
+#if defined(__APPLE__)
+            // [moltenvk] Granite dlopens a leaf name, which never searches the bundle. Point it at MoltenVK
+            // directly (no loader, no ICD manifest): the .app's copy, else the one the build found.
+            if (!std::getenv("GRANITE_VULKAN_LIBRARY"))
+            {
+                std::error_code ec;
+                const std::filesystem::path bundled = std::filesystem::path(ps2xExeDirC()) / ".." / "Frameworks" / "libMoltenVK.dylib";
+                std::string lib = std::filesystem::exists(bundled, ec) ? bundled.string() : std::string();
+#  if defined(PS2X_MOLTENVK_LIBRARY)
+                if (lib.empty()) lib = PS2X_MOLTENVK_LIBRARY;
+#  endif
+                if (!lib.empty()) setenv("GRANITE_VULKAN_LIBRARY", lib.c_str(), 0);
+                std::fprintf(stderr, "[seamvk] MoltenVK: %s\n", lib.empty() ? "(not found)" : lib.c_str());
+            }
+#endif
             if (!Vulkan::Context::init_loader(nullptr)) return fail("Vulkan loader init failed");
             g_own->ctx.set_num_thread_indices(1);
             g_own->ctx.set_device_factory(&g_own->factory);   // [seamfeat]

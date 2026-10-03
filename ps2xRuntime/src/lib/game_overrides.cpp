@@ -4455,10 +4455,14 @@ namespace
     // func_121A10(poly, plane, count) -> new count: one clip pass. With NaN vertices every edge "crosses" and the
     // count can double per pass (5 passes), overflowing the caller's stack polygon before the transform ever runs.
     PS2Runtime::RecompiledFunction g_orig121a10 = nullptr;
+    // [vstepenv] read PS2X_VSTEP once. With 60 fps off (the default) the three guards below asked getenv on every
+    // call, and the UCRT getenv compares the name with each environment variable (_strnicoll) every time.
+    // 2026-10-02, COM vs COM fight at 30 fps on Windows: ~4.5% of the game thread's samples, 208 -> 171 ms/s CPU.
+    static bool ps2xVStepEnvSet() { static const bool s = std::getenv("PS2X_VSTEP") != nullptr; return s; }
     void bt3ClipPassGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121A10
     {
         // [fps60] inert at 30 fps: these guards exist for step-1 pathologies, so stock play stays byte-identical.
-        if (!ps2VStepActive() && std::getenv("PS2X_VSTEP") == nullptr) { if (g_orig121a10) g_orig121a10(rdram, ctx, runtime); return; }
+        if (!ps2VStepActive() && !ps2xVStepEnvSet()) { if (g_orig121a10) g_orig121a10(rdram, ctx, runtime); return; }
         const uint32_t nin = getRegU32(ctx, 6); const uint32_t poly = getRegU32(ctx, 4);
         // LOG ONLY: guard3 showed the recompiled clipper re-entering itself through the function table (ra inside
         // 0x121a10..0x121d48) with registers that are not this function's arguments -- clamping there would corrupt it.
@@ -4535,7 +4539,7 @@ namespace
     void bt3ClipXformGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_121D48
     {
         // [fps60] inert at 30 fps: these guards exist for step-1 pathologies, so stock play stays byte-identical.
-        if (!ps2VStepActive() && std::getenv("PS2X_VSTEP") == nullptr) { if (g_orig121d48) g_orig121d48(rdram, ctx, runtime); return; }
+        if (!ps2VStepActive() && !ps2xVStepEnvSet()) { if (g_orig121d48) g_orig121d48(rdram, ctx, runtime); return; }
         const uint32_t n = getRegU32(ctx, 7);
         if (n > 9u)
         {
@@ -4555,7 +4559,7 @@ namespace
     void bt3AngleWrapGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) // func_11F548(f12 angle, f13 half-range) -> f0
     {
         // [fps60] inert at 30 fps: these guards exist for step-1 pathologies, so stock play stays byte-identical.
-        if (!ps2VStepActive() && std::getenv("PS2X_VSTEP") == nullptr) { if (g_orig11f548) g_orig11f548(rdram, ctx, runtime); return; }
+        if (!ps2VStepActive() && !ps2xVStepEnvSet()) { if (g_orig11f548) g_orig11f548(rdram, ctx, runtime); return; }
         const float a = ctx->f[12], r = ctx->f[13];
         if (!(std::fabs(a) < 1.0e6f) || !(r > 1.0e-6f))
         {

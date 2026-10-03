@@ -189,7 +189,15 @@ namespace
 
         if (!elfs.empty())
         {
-            std::sort(elfs.begin(), elfs.end());
+            // Shallowest first: the install puts the boot ELF at the top of data/ (or data/Modules/BOOT), and a
+            // leftover tree such as another region's data/SLES_549.45/BIN/*.elf sorted ahead of SLUS_216.78 by name,
+            // failed the hash check and opened the installer over a complete install.
+            std::sort(elfs.begin(), elfs.end(), [&root](const std::filesystem::path &a, const std::filesystem::path &b) {
+                std::error_code e;
+                const std::filesystem::path ra = std::filesystem::relative(a, root, e), rb = std::filesystem::relative(b, root, e);
+                const auto da = std::distance(ra.begin(), ra.end()), db = std::distance(rb.begin(), rb.end());
+                return da != db ? da < db : a < b;
+            });
             out.elf = elfs.front().string();
         }
         return out;

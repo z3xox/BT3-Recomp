@@ -1,4 +1,10 @@
 // [fibers] See include/runtime/ps2_fiber.h for why this exists.
+// Darwin's ucontext_t only carries its mcontext storage (__mcontext_data) under _XOPEN_SOURCE, and
+// getcontext writes there regardless; it must be set before the first system header.
+#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
+#  define _XOPEN_SOURCE 700
+#  define _DARWIN_C_SOURCE 1
+#endif
 #include "runtime/ps2_fiber.h"
 
 #include <cstdio>
@@ -13,10 +19,7 @@
 #  define PS2X_FIBER_WIN 1
 #elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
 // ucontext is deprecated on macOS but still present and functional; silence the deprecation there
-// rather than carrying a third backend.
-#  ifdef __APPLE__
-#    define _XOPEN_SOURCE 700
-#  endif
+// rather than carrying a third backend. _XOPEN_SOURCE is defined at the top of the file.
 #  include <ucontext.h>
 #  include <sys/mman.h>
 #  include <unistd.h>
@@ -249,10 +252,14 @@ bool ps2xFiberRestore(Ps2xFiber *f, const void *buf, size_t size)
     ucontext_t ctx; std::memcpy(&ctx, i, sizeof ctx);       i += sizeof ctx;
     uint64_t n = 0; std::memcpy(&n, i, sizeof n);           i += sizeof n;
     if (size < sizeof(ucontext_t) + sizeof(uint64_t) + n || n > f->stackSize) return false;
-    // The context's fpregs pointer refers into the ucontext_t itself; restoring into the same
+    // The context's fpregs (glibc) / uc_mcontext (Darwin) pointer refers into the ucontext_t itself; restoring into the same
     // object keeps it valid. The stack goes back to the same addresses it was copied from.
     std::memcpy(&f->ctx, &ctx, sizeof ctx);
+#  if defined(__APPLE__)
+    f->ctx.uc_mcontext = &f->ctx.__mcontext_data;
+#  elif defined(__GLIBC__)
     f->ctx.uc_mcontext.fpregs = &f->ctx.__fpregs_mem;
+#  endif
     std::memcpy(f->stack + f->stackSize - n, i, n);
     return true;
 #else

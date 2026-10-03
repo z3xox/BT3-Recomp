@@ -10,7 +10,12 @@ extern "C" bool ps2xFrameStepOn();               // frame-stepped mode (defined 
 extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defined with the scheduler)
 #if !defined(_WIN32)
 #include <dlfcn.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#else
 #include <link.h>
+#endif
 #include <sys/mman.h>   // [r3000] sparse IOP guest address space
 #include <csignal>
 #include <unistd.h>
@@ -6506,7 +6511,25 @@ static std::string ps2xBuildId()
 {
     static std::string s_id;
     if (!s_id.empty()) return s_id;
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+    // Mach-O carries an LC_UUID instead of a GNU build-id note.
+    if (const mach_header_64 *mh = reinterpret_cast<const mach_header_64 *>(_dyld_get_image_header(0)))
+    {
+        const uint8_t *p = reinterpret_cast<const uint8_t *>(mh + 1);
+        for (uint32_t i = 0; i < mh->ncmds; ++i)
+        {
+            const load_command *lc = reinterpret_cast<const load_command *>(p);
+            if (lc->cmd == LC_UUID)
+            {
+                const uuid_command *u = reinterpret_cast<const uuid_command *>(lc);
+                char hex[3];
+                for (uint8_t b : u->uuid) { std::snprintf(hex, sizeof hex, "%02x", b); s_id += hex; }
+                break;
+            }
+            p += lc->cmdsize;
+        }
+    }
+#elif !defined(_WIN32)
     dl_iterate_phdr([](struct dl_phdr_info *info, size_t, void *out) -> int
     {
         std::string &id = *static_cast<std::string *>(out);

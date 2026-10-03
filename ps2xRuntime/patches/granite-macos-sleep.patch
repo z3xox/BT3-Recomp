@@ -1,0 +1,20 @@
+diff --git a/util/timer.cpp b/util/timer.cpp
+index a1408352..9c0e2205 100644
+--- a/util/timer.cpp
++++ b/util/timer.cpp
+@@ -138,6 +138,15 @@ void sleep_until_nsecs(int64_t timepoint)
+ 		_mm_pause();
+ #endif
+ 	}
++#elif defined(__APPLE__)
++	// PS2X_MACOS_SLEEP: macOS has no clock_nanosleep/TIMER_ABSTIME; sleep the remaining delta instead.
++	int64_t d = timepoint - get_current_time_nsecs();
++	if (d <= 0)
++		return;
++	struct timespec ts = {};
++	ts.tv_sec = d / 1000000000ll;
++	ts.tv_nsec = d % 1000000000ll;
++	while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+ #else
+ 	constexpr auto timebase = CLOCK_MONOTONIC;
+ 	struct timespec ts = {};
